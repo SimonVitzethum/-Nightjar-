@@ -36,6 +36,8 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #endif
 #include "st.h"
+#include "kquant.h"                               /* decoder k-quant/i-quant (GGUF Unsloth) */
+#include "gguf.h"                                 /* reader GGUF v3, shard split, slice expert */
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
@@ -92,9 +94,20 @@ typedef struct {
  *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed.
+ *
+ * fmt=4 GGML: pesi di un GGUF (Unsloth Dynamic). Il blob quantizzato sta in q4 e il tipo
+ * ggml vero (Q2_K/Q4_K/Q5_K/Q6_K/Q8_0/IQ2_XS/IQ3_XXS) sta in `gtype`. NON c'e' `s`: le
+ * scale dei k/i-quant vivono DENTRO i super-blocchi, quindi niente tensore .qs separato
+ * e niente fslab. La riga non viene mai dequantizzata: kq_dot() contrae direttamente sul
+ * blob (vedi kquant.h).
+ * EN: fmt=4 GGML: GGUF weights (Unsloth Dynamic). The quantized blob lives in q4, the real
+ * ggml type in `gtype`. There is no `s`: k/i-quant scales live inside the super-blocks, so
+ * no separate .qs tensor and no fslab. Rows are never dequantized — kq_dot() contracts
+ * straight against the blob. */
+#define QT_GGML 4
 typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+    int fmt; int gtype; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -104,6 +117,7 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
+    if(t->fmt==QT_GGML) return kq_row_bytes(t->gtype,n);   /* scale incluse nei blocchi */
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;
 }
@@ -392,6 +406,26 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
 }
 
 static void matmul_qt(float *y,const float *x,QT *w,int S);
+
+/* y[S,O] = x[S,I] @ W^T con W in un quant ggml (k-quant o i-quant, da un GGUF Unsloth).
+ * La riga `o` non viene MAI ricostruita: kq_dot contrae il super-blocco direttamente
+ * contro x. Per un expert appena arrivato da NVMe questo evita sia il buffer di dequant
+ * sia un secondo passaggio in memoria — ed e' il motivo per cui gli expert non hanno
+ * bisogno di essere residenti.
+ * EN: row `o` is NEVER reconstructed; kq_dot contracts the super-block straight against x.
+ * For an expert fresh off NVMe that saves both the dequant buffer and a second pass over
+ * memory — which is exactly why experts never need to be resident. */
+static void matmul_gg(float *y,const float *x,const uint8_t *q,int gtype,int S,int I,int O){
+    if(omp_in_parallel()){ kq_gemm(y,x,q,gtype,S,I,O); return; }   /* gia' dentro il moe() */
+    int nth=omp_get_max_threads();
+    #pragma omp parallel for schedule(static) num_threads(nth)
+    for(int o=0;o<O;o++){
+        int64_t rb=kq_row_bytes(gtype,I);
+        const uint8_t *w=q+(int64_t)o*rb;
+        for(int s=0;s<S;s++)
+            y[(int64_t)s*O+o]=kq_dot(gtype,w,x+(int64_t)s*I,I);
+    }
+}
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
@@ -721,6 +755,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
             w->O,w->I,w->cuda_device);
     }
 #endif
+    if(w->fmt==QT_GGML){ matmul_gg(y,x,w->q4,w->gtype,S,w->I,w->O); return; }
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /

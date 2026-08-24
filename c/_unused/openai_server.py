@@ -358,6 +358,23 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- fill-in-the-middle --------------------------------------------------------------
+# GLM-5.2 carries three tokens for this (they are in the tokenizer, alongside <tool_call>
+# and <think>):
+#
+#   <|code_prefix|>{before the cursor}<|code_suffix|>{after it}<|code_middle|>
+#
+# The order matters and is not the intuitive one: prefix, then SUFFIX, then the middle
+# marker last. The model reads both sides of the hole before it is asked to fill it —
+# writing them in source order (prefix, middle, suffix) would ask it to continue text it
+# has not been shown the end of, which is exactly the weaker behaviour FIM exists to avoid.
+FIM_PREFIX, FIM_SUFFIX, FIM_MIDDLE = "<|code_prefix|>", "<|code_suffix|>", "<|code_middle|>"
+
+
+def fim_prompt(prefix, suffix):
+    return f"{FIM_PREFIX}{prefix}{FIM_SUFFIX}{suffix}{FIM_MIDDLE}"
+
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -962,6 +979,22 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+
+        # Fill-in-the-middle. OpenAI's completions API already carries the field an editor
+        # needs for this — `suffix` — and GLM-5.2 ships the tokens for it, so an IDE that
+        # speaks plain /v1/completions gets code completion with no new endpoint:
+        #
+        #   prompt = the text before the cursor, suffix = the text after it
+        #
+        # The model is trained to see the WHOLE file (both sides) and then be asked for the
+        # middle, which is why a FIM completion is so much better than plain left-to-right
+        # continuation: it knows what it has to join back up with.
+        suffix = body.get("suffix")
+        if suffix is not None:
+            if not isinstance(suffix, str):
+                raise APIError(400, "`suffix` must be a string.", "suffix")
+            prompt = fim_prompt(prompt, suffix)
+
         self.generation(body, prompt, request_id, False)
 
 
