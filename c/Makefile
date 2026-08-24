@@ -16,6 +16,7 @@
 #   make gates      the checks that decide correctness, against the real model
 #   make run        an interactive chat in the terminal
 #   make serve      the web UI + OpenAI-compatible API on :8080 (this is what opencode uses)
+#   make tools      just the agent tool layer: policy gate, confinement, output budget
 #   make bench      bandwidth benchmarks
 #
 ifeq ($(OS),Windows_NT)
@@ -46,11 +47,13 @@ MODEL ?= /home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M
 KV_SPILL ?= $(CURDIR)/../../kvspill
 
 HDRS = qwen35.h qwen35_plan.h qwen35_cpu.h qwen35_batch.h qwen35_mtp.h kv_tier.h kv_tier_simd.h \
-       kquant_simd.h kquant.h gguf.h iq_grids.h tok.h tok_gguf.h tok_unicode.h
+       kquant_simd.h kquant.h gguf.h iq_grids.h tok.h tok_gguf.h tok_unicode.h \
+       json.h strbuf.h harness.h
 CUHDRS = qwen35_cuda.h qwen35_hetero.h qwen35_cu_spec.h
 
 CPU_TESTS = tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
-            tests/qwen35_batch_test tests/qwen35_mtp_test tests/qwen35_sparsity_test
+            tests/qwen35_batch_test tests/qwen35_mtp_test tests/qwen35_sparsity_test \
+            tests/harness_test
 CU_TESTS  = tests/qwen35_cuda_test tests/qwen35_hetero_test tests/qwen35_cu_fwd_test \
             tests/qwen35_cu_spec_test tests/qwen35_cu_split_test
 
@@ -75,12 +78,12 @@ $(CU_TESTS): tests/%: tests/%.c $(HDRS) $(CUHDRS) qwen35_cuda.o
 ifeq ($(HAVE_CUDA),1)
 qwen35_run: qwen35_run.c $(HDRS) $(CUHDRS) qwen35_cuda.o
 	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
-qwen35_server: qwen35_server.c $(HDRS) $(CUHDRS) json.h qwen35_cuda.o
+qwen35_server: qwen35_server.c $(HDRS) $(CUHDRS) qwen35_cuda.o
 	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
 else
 qwen35_run: qwen35_run.c $(HDRS)
 	$(CC) $(CFLAGS) -DCOLIBRI_NO_CUDA -I. -o $@ $< $(LDFLAGS)
-qwen35_server: qwen35_server.c $(HDRS) json.h
+qwen35_server: qwen35_server.c $(HDRS)
 	$(CC) $(CFLAGS) -DCOLIBRI_NO_CUDA -I. -o $@ $< $(LDFLAGS)
 endif
 
@@ -88,6 +91,7 @@ endif
 test: all
 	@echo "=== geometry + placement plan ===" && ./tests/qwen35_test "$(MODEL)"
 	@echo "=== k-quant SIMD kernels ==="      && ./tests/kquant_simd_test
+	@echo "=== agent tools: gate, confinement, budget ===" && ./tests/harness_test | tail -3
 	@echo "=== KV tier, 64k ctx ==="          && mkdir -p "$(KV_SPILL)" && \
 	    ./tests/kvtier_test 65536 0.3 4096 "$(KV_SPILL)" 8
 
@@ -118,13 +122,18 @@ run: qwen35_run
 # a previous instance to actually release the port and the CUDA context — a fixed sleep races
 # the teardown and the new process then dies on "address already in use" with its VRAM already
 # half-claimed by the old one.
+# WORKSPACE is the directory the agent may touch. It defaults to the repository root rather
+# than to c/, because an agent confined to the directory holding its own source is not useful.
 serve: qwen35_server webui.html
-	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) ./serve.sh
+	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) ./serve.sh --workspace "$(WORKSPACE)" --tools $(TOOLS)
 
 # -x matches the process NAME. The -f form matches any command line CONTAINING
 # "qwen35_server", which includes the shell running this rule.
 stop:
 	@pkill -x qwen35_server && echo "stopped" || echo "not running"
+
+tools: tests/harness_test
+	./tests/harness_test
 
 bench: tests/kvtier_test tests/kquant_simd_test
 	@mkdir -p "$(KV_SPILL)"
@@ -143,7 +152,9 @@ mtp: tests/qwen35_mtp_test
 clean:
 	rm -f $(CPU_TESTS) $(CU_TESTS) qwen35_cuda.o qwen35_run qwen35_server
 
-PORT ?= 8080
-CTX  ?= 8192
+PORT      ?= 8080
+CTX       ?= 8192
+WORKSPACE ?= $(CURDIR)/../..
+TOOLS     ?= workspace
 
-.PHONY: all test gates run serve stop bench fwd batch mtp clean
+.PHONY: all test gates run serve stop tools bench fwd batch mtp clean
