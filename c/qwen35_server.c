@@ -728,11 +728,60 @@ done:
 
 /* ---------------- routing ----------------
  *
- * A connection gets its own thread, but only ONE may be inside the engine at a time — there
- * is a single recurrent state and a single KV cache. Everything else (the page, /health,
- * /v1/models) touches neither and answers immediately, which is the whole point: without the
- * split, loading the UI while a generation runs simply times out. */
-static pthread_mutex_t g_engine = PTHREAD_MUTEX_INITIALIZER;
+ * A connection gets its own thread so the page and /health answer while a generation runs —
+ * without that, loading the UI mid-generation simply times out.
+ *
+ * But the ENGINE never runs on a connection thread. It runs on ONE dedicated thread, always
+ * the same one, and connection threads hand it the request.
+ *
+ * A mutex alone was not enough, and the failure was not the one a mutex prevents. Only one
+ * request was ever inside the engine, but each arrived on a DIFFERENT pthread, and the engine
+ * enters `omp parallel` regions a few thousand times per request. libgomp builds a fresh
+ * thread team per encountering thread; churning teams across short-lived pthreads segfaulted
+ * inside libc on an OpenMP worker after ~1300 tokens of prefill. The same prompt through the
+ * single-threaded CLI was fine, which is what localized it.
+ *
+ * One engine thread also means the OpenMP team is built once and reused for the life of the
+ * process, which is what the active-wait tuning assumes anyway. */
+typedef struct { int fd; char *body; size_t len; } Job;
+
+static pthread_mutex_t g_qmu  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_qcv  = PTHREAD_COND_INITIALIZER;
+static Job             g_job;
+static int             g_job_pending = 0;
+
+static void *engine_thread(void *arg){
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&g_qmu);
+        while(!g_job_pending) pthread_cond_wait(&g_qcv, &g_qmu);
+        Job j = g_job;
+        g_job_pending = 0;
+        pthread_mutex_unlock(&g_qmu);
+
+        handle_chat(j.fd, j.body, j.len);
+        close(j.fd);
+        free(j.body);
+    }
+    return NULL;
+}
+
+/* Hands the request over and returns; the engine thread owns the fd from here. */
+static void engine_submit(int fd, const char *body, size_t len){
+    char *copy = (char*)malloc(len + 1);
+    if(!copy){ http_err(fd, 503, "Service Unavailable", "out of memory"); close(fd); return; }
+    memcpy(copy, body, len); copy[len] = 0;
+    pthread_mutex_lock(&g_qmu);
+    while(g_job_pending){                    /* one at a time: one engine, one state */
+        pthread_mutex_unlock(&g_qmu);
+        usleep(2000);
+        pthread_mutex_lock(&g_qmu);
+    }
+    g_job.fd = fd; g_job.body = copy; g_job.len = len;
+    g_job_pending = 1;
+    pthread_cond_signal(&g_qcv);
+    pthread_mutex_unlock(&g_qmu);
+}
 
 static void handle_models(int fd){
     Str b = {0};
@@ -766,19 +815,19 @@ static int path_is(const char *p, const char *want){
     return !strncmp(p, want, n) && (p[n] == 0 || p[n] == '?' || p[n] == ' ');
 }
 
-static void serve(int fd){
+static int serve(int fd){   /* returns 1 if the fd was handed off and must not be closed */
     Str req = {0};
     char buf[16384];
     size_t hdr_end = 0;
     /* headers first */
     for(;;){
         const ssize_t r = recv(fd, buf, sizeof buf, 0);
-        if(r <= 0){ s_free(&req); return; }
+        if(r <= 0){ s_free(&req); return 0; }
         s_add(&req, buf, (size_t)r);
         const char *e = memmem(req.p, req.n, "\r\n\r\n", 4);
         if(e){ hdr_end = (size_t)(e - req.p) + 4; break; }
         if(req.n > (1u<<20)){ http_err(fd, 431, "Request Header Fields Too Large", "headers too long");
-                              s_free(&req); return; }
+                              s_free(&req); return 0; }
     }
     /* body, if Content-Length says so */
     size_t clen = 0;
@@ -799,12 +848,12 @@ static void serve(int fd){
 
     if(!strcmp(method, "OPTIONS")){
         sock_str(fd, "HTTP/1.1 204 No Content\r\n" CORS "Content-Length: 0\r\nConnection: close\r\n\r\n");
-        s_free(&req); return;
+        s_free(&req); return 0;
     }
     if(g_api_key){
         const char *a = memmem(req.p, hdr_end, "Bearer ", 7);
         if(!a || strncmp(a + 7, g_api_key, strlen(g_api_key))){
-            http_err(fd, 401, "Unauthorized", "invalid api key"); s_free(&req); return;
+            http_err(fd, 401, "Unauthorized", "invalid api key"); s_free(&req); return 0;
         }
     }
 
@@ -816,23 +865,24 @@ static void serve(int fd){
         else if(path_is(path, "/v1/models") || path_is(path, "/models")) handle_models(fd);
         else if(path_is(path, "/health") || path_is(path, "/v1/health"))  handle_health(fd);
         else http_err(fd, 404, "Not Found", "no such path");
-        s_free(&req); return;
+        s_free(&req); return 0;
     }
     if(!strcmp(method, "POST")){
         if(path_is(path, "/v1/chat/completions") || path_is(path, "/chat/completions")
            || path_is(path, "/api/chat/completions")){
             if(g_verbose) fprintf(stderr, "[%s] %s %s (%zu B)\n",
                                   g_api_key ? "auth" : "open", method, path, clen);
-            pthread_mutex_lock(&g_engine);
-            handle_chat(fd, req.p + hdr_end, clen);
-            pthread_mutex_unlock(&g_engine);
+            engine_submit(fd, req.p + hdr_end, clen);
+            s_free(&req);
+            return 1;                    /* the engine thread owns fd now */
         } else {
             http_err(fd, 404, "Not Found", "only /v1/chat/completions is implemented");
         }
-        s_free(&req); return;
+        s_free(&req); return 0;
     }
     http_err(fd, 405, "Method Not Allowed", "use GET or POST");
     s_free(&req);
+    return 0;
 }
 
 /* ---------------- startup ---------------- */
@@ -841,8 +891,7 @@ static void on_sig(int s){ (void)s; g_abort = 1; }
 
 static void *conn_thread(void *arg){
     const int fd = (int)(intptr_t)arg;
-    serve(fd);
-    close(fd);
+    if(!serve(fd)) close(fd);        /* a handed-off fd belongs to the engine thread */
     return NULL;
 }
 
@@ -873,6 +922,10 @@ static char *read_file(const char *p, size_t *len){
 
 int main(int argc, char **argv){
     const char *path = NULL, *host = "127.0.0.1", *www = NULL;
+    /* 8192, not 32768. The KV tier is sized from n_ctx and the engine already holds 9.3 GiB
+     * of resident weights; at 32768 the process reached 14.5 GiB RSS on a 31 GiB machine and
+     * was OOM-killed mid-request. The context still GROWS past this — kvt_grow raises it on
+     * demand and stops at the memory floor — so this is a starting point, not a ceiling. */
     int port = 8080, cpu_only = 0;
     for(int i = 1; i < argc; i++){
         const char *a = argv[i];
@@ -988,6 +1041,8 @@ int main(int argc, char **argv){
 #endif
         host, port, host, port, g_api_key ? " except this one, which is required" : "");
 
+    { pthread_t eng; pthread_create(&eng, NULL, engine_thread, NULL); pthread_detach(eng); }
+
     while(!g_abort){
         struct sockaddr_in ca; socklen_t cl = sizeof ca;
         const int fd = accept(srv, (struct sockaddr*)&ca, &cl);
@@ -997,7 +1052,7 @@ int main(int argc, char **argv){
         pthread_t th;
         if(pthread_create(&th, NULL, conn_thread, (void*)(intptr_t)fd) == 0)
             pthread_detach(th);
-        else { serve(fd); close(fd); }
+        else { if(!serve(fd)) close(fd); }
     }
     fprintf(stderr, "\n  shutting down\n");
     close(srv);

@@ -6,7 +6,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${MODEL:-/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf}"
 PORT="${PORT:-8080}"
-CTX="${CTX:-32768}"
+CTX="${CTX:-8192}"      # the context still grows past this; see qwen35_server.c
 LOG="${LOG:-$HERE/server.log}"
 
 pkill -x qwen35_server 2>/dev/null   # -x: match the process NAME, not any command line containing it
@@ -25,7 +25,7 @@ setsid env COLIBRI_KV_SPILL="$HERE/../../kvspill" COLIBRI_RESERVE_GB="${RESERVE:
     >> "$LOG" 2>&1 < /dev/null &
 
 echo -n "loading"
-for i in $(seq 1 180); do   # pinning gigabytes of cache takes a while
+for i in $(seq 1 400); do   # a cold page cache makes residency take minutes, not seconds
     sleep 2
     if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
         echo " ready after $((i*2))s"

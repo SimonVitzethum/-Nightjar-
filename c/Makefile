@@ -142,6 +142,6 @@ clean:
 	rm -f $(CPU_TESTS) $(CU_TESTS) qwen35_cuda.o qwen35_run qwen35_server
 
 PORT ?= 8080
-CTX  ?= 32768
+CTX  ?= 8192
 
 .PHONY: all test gates run serve stop bench fwd batch mtp clean

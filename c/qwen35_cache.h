@@ -219,6 +219,7 @@ static void q35_cache_kv(Q35Cache *C, Q35Ckpt *k, int save){
 }
 
 static void q35_cache_grab(Q35Cache *C, Q35Ckpt *k){
+    if(k->pos <= 0 || (C->kv_win && k->pos > C->kv_win)) return;   /* caller must set pos first */
     const double t0 = q35_clk();
 #ifndef COLIBRI_NO_CUDA
     if(C->gpu){
@@ -291,8 +292,13 @@ static void q35_cache_mark(Q35Cache *C, int pos){
     C->next_mark = pos + C->spacing;
     for(int i = 0; i < C->n_slots; i++) if(C->ck[i].pos == pos) return;
     const int s = q35_cache_slot_for(C, pos);
-    q35_cache_grab(C, &C->ck[s]);
+    /* pos FIRST. q35_cache_grab reads k->pos to size both the KV copy and the token memcpy,
+     * and a fresh slot holds -1 — which as a size_t is 18 exabytes. It segfaulted inside libc
+     * on whichever thread happened to be running, ~512 tokens into a prefill, with no message
+     * of any kind. Prompts shorter than the checkpoint spacing never reached it, which is why
+     * every short test passed. */
     C->ck[s].pos = pos;
+    q35_cache_grab(C, &C->ck[s]);
     C->ck[s].stamp = ++C->clock;
 }
 
