@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -896,6 +897,10 @@ static void *conn_thread(void *arg){
 }
 
 static void fix_omp_env(char **argv){
+    /* execv("/proc/self/exe") renames the process to "exe" — that is the basename of the path
+     * handed to execve, not of the binary. pgrep, pkill, ps and every "is it running" check
+     * then miss it, including this project's own `make stop`. Say the name explicitly. */
+    prctl(PR_SET_NAME, "qwen35_server", 0, 0, 0);
     if(getenv("COLIBRI_ENV_SET")) return;
     setenv("COLIBRI_ENV_SET", "1", 1);
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "active", 1);

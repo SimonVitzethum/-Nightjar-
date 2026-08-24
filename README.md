@@ -17,6 +17,208 @@ $ ./coli chat
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
 
+---
+
+## Second engine: Qwen3.5-27B (`qwen35`)
+
+The same tree now holds a second engine, for a model with nothing architecturally in common
+with GLM-5.2. Qwen3.5-27B is **dense, not MoE** — there is no expert to stream — and 48 of its
+64 layers are **Gated DeltaNet**, a recurrent linear-attention block whose state is constant in
+context length. So the streaming idea does not apply and a different one does: split every
+layer across GPU and CPU and run both sides at once.
+
+It shares only the GGUF reader, the k-quant kernels and the tokenizer with the GLM engine —
+about 17% of its 11.5k lines. Everything else is new: `c/qwen35*.{h,cu,c}`, `c/kv_tier*.h`,
+`c/kquant_simd.h`, `c/qwen35_cache.h`.
+
+**Measured on an RTX 5070 Laptop (8 GB) + 10-core CPU + 31 GB RAM, Q4_K_M:**
+
+| | tok/s |
+|---|---|
+| CPU only (where this started) | 2.33 |
+| + gdn/attn/output resident in VRAM | 3.49 |
+| + FFN split, CPU in place and GPU over PCIe **at the same time** | 4.84 |
+| + MTP speculative decode | **6.1 – 6.7** |
+| prefill, batched | **10.4** |
+| prefix-cache hit (1349-token prompt) | 129 s → **32.5 s** |
+
+The full design record, including everything that was measured and rejected, is in
+[`Plan.md`](../Plan.md).
+
+### Build
+
+```bash
+cd c
+make                 # everything; CUDA is detected, not assumed
+make -j8             # faster
+```
+
+Without `nvcc` on PATH the same sources build a CPU-only engine (`-DCOLIBRI_NO_CUDA`); nothing
+else changes. Override the GPU target if you are not on Blackwell:
+
+```bash
+make CUDA_ARCH=sm_86        # RTX 30xx      (sm_89 = 40xx, sm_120 = 50xx, the default)
+make CUDA_HOME=/usr/local/cuda
+```
+
+### The server: web UI + OpenAI-compatible API
+
+```bash
+make serve                              # http://127.0.0.1:8080/ , 8k context
+make serve PORT=9000                    # another port
+make serve CTX=16384                    # larger starting context (it grows on demand anyway)
+make serve MODEL=/path/to/other.gguf    # another model — see below
+make stop                               # stop it
+make serve                              # restarting is just serve again; it waits for the
+                                        # old instance to release the port AND the CUDA context
+```
+
+`make serve` calls `./serve.sh`, which you can also run directly with the same variables:
+
+```bash
+MODEL=/models/qwen35-27b-Q4_K_M.gguf PORT=8080 CTX=8192 ./serve.sh
+```
+
+Startup takes 45 s to a few minutes: 5.1 GiB of weights go to VRAM, 9.3 GiB become resident in
+RAM and get pinned for DMA. `serve.sh` polls until `/health` answers and prints the placement
+it chose. Logs go to `c/server.log`.
+
+For anything beyond localhost, bind explicitly **and set a key** — without one the endpoint is
+open:
+
+```bash
+./qwen35_server "$MODEL" --host 0.0.0.0 --port 8080 --api-key "$(openssl rand -hex 16)"
+```
+
+| | |
+|---|---|
+| `GET /` | the chat UI |
+| `GET /v1/models` | model list |
+| `POST /v1/chat/completions` | OpenAI-compatible, streaming (SSE) and not, with tool calls |
+| `GET /health` | device, context, VRAM, cache state |
+
+```bash
+curl localhost:8080/health
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}'
+```
+
+### Terminal chat
+
+```bash
+make run                                        # interactive
+make run ARGS='-p "Explain gated delta nets." -n 200'
+./qwen35_run "$MODEL" -p "..." --temp 0.7 --top-p 0.95 --no-think --stats
+./qwen35_run "$MODEL" --cpu                     # no GPU at all
+./qwen35_run --help
+```
+
+### Other models
+
+The engine reads its whole geometry from GGUF metadata, so **any Qwen3.5 GGUF works** —
+different sizes, different quantizations, different context settings. It refuses anything else
+by design and says so:
+
+```
+qwen35: architecture is "glm-dsa", not qwen35
+```
+
+(that is the GLM-5.2 file from the other engine, refused by the qwen35 loader.)
+
+The check is deliberate: this engine implements Gated DeltaNet, partial NeoX rope over 64 of
+256 head dims, and an interleaved q/gate projection. Loading a Llama or Qwen2 file with those
+assumptions would not crash — it would produce fluent, wrong text.
+
+```bash
+make serve MODEL=/models/Qwen3.5-27B-Q4_K_M.gguf
+make serve MODEL=/models/Qwen3.5-27B-Q6_K.gguf     # needs more VRAM+RAM; the planner adapts
+MODEL=/models/other-qwen35.gguf make gates          # check it before trusting it
+```
+
+Quantization support on the GPU path is **F32, F16, Q8_0, Q4_K, Q6_K**. A tensor in any other
+type is refused at upload with the tensor name and its type, rather than silently falling back
+to something slower. The CPU path additionally decodes Q2_K/Q3_K/Q5_K/IQ2_XS/IQ3_XXS/IQ4_XS.
+
+### Tests, and which of them decide correctness
+
+```bash
+make test      # fast: geometry, SIMD kernels vs a double reference, the KV tier
+make gates     # the ones that decide whether the engine is right — needs the model
+make bench     # bandwidth benchmarks, 250k-token KV
+```
+
+`make gates` runs five checks in order, and every one of them exists because something got
+through:
+
+1. every device kernel against its CPU counterpart, scored against the **population RMS** and
+   never per row — per-row relative error has produced three false negatives here;
+2. every layer kind against the CPU reference, including the recurrent state, run twice so a
+   wrong conv ring cannot hide;
+3. the whole model, CPU and GPU, must both print `11751 ' Paris'` at p ≈ 0.606;
+4. a batch must reproduce sequential decode at **every** batch width the engine emits;
+5. greedy speculation must reproduce greedy decode **token for token**.
+
+### opencode
+
+`~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "provider": {
+    "colibri": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "local" },
+      "models": { "qwen3.5-27b": { "tool_call": true, "reasoning": true,
+                                   "limit": { "context": 32768, "output": 8192 } } }
+    }
+  },
+  "model": "colibri/qwen3.5-27b"
+}
+```
+
+One step is needed once, and opencode hangs silently without it — it does not fetch the
+provider itself:
+
+```bash
+npm install --prefix ~/.config/opencode @ai-sdk/openai-compatible
+opencode models | grep colibri      # confirms it resolves
+opencode run "Read hello.py and say whether add() is correct."
+```
+
+Tool calling works: the model emits its own XML form and the server converts it to OpenAI
+`tool_calls`, with types preserved. **The honest limitation is prefill**: opencode's agent
+prompt is ~7700 tokens, so the first command of a session costs minutes. Later turns in the
+same session are cheap because the prefix cache reuses the KV.
+
+### Knobs
+
+| Variable | Default | |
+|---|---|---|
+| `COLIBRI_CUDA_STREAM` | `0.60` | share of each non-resident FFN layer the GPU pulls over PCIe while **decoding** |
+| `COLIBRI_CUDA_STREAM_PREFILL` | `0.85` | the same for **batch** work — higher, because a batch reuses each weight S times |
+| `COLIBRI_CUDA_KV_TOK` | `8192` | cap on the VRAM KV window. Larger only pays past ~24k context; below that, resident FFN layers are worth more |
+| `COLIBRI_CUDA_FFN_GB` | auto | cap on resident FFN layers |
+| `COLIBRI_CACHE_GB` | `1.5` | prefix-checkpoint budget. `0` disables |
+| `COLIBRI_CACHE_SPACING` | `512` | tokens between checkpoints — the worst-case recompute |
+| `COLIBRI_KV_SPILL` | `../../kvspill` | cold KV tier. **Never point it at tmpfs** — that puts the "disk" tier back in the RAM it exists to free |
+| `COLIBRI_RESERVE_GB` | `4` | RAM the engine never touches |
+| `COLIBRI_KERNEL_LOG` | off | prints which device each component actually ran on |
+
+`qwen35_run` and `qwen35_server` set `OMP_WAIT_POLICY`, `OMP_PROC_BIND`, `OMP_PLACES` and
+`OMP_NUM_THREADS` themselves and re-exec once — libgomp reads those before `main()` could, and
+they are worth 20% here.
+
+### Where the GLM-5.2 engine went
+
+Everything below this section still describes the GLM-5.2/OLMoE engine, and its sources moved
+to `c/_unused/` so it is obvious which files the Qwen3.5 build reaches. Nothing was deleted:
+
+```bash
+cd c/_unused && make -f Makefile.legacy      # the original build, unchanged
+```
+
+---
+
 ## The idea
 
 A 744B Mixture-of-Experts model activates only ~40B parameters per token — and only ~11 GB of those change from token to token (the routed experts). So:

@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 
 #include "qwen35_cpu.h"
 #ifndef COLIBRI_NO_CUDA
@@ -42,6 +43,10 @@ static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * threads sleep between layers and every FFN pays a wake-up. So set them and re-exec once.
  * COLIBRI_ENV_SET marks that we already did, so this cannot loop. */
 static void q35_fix_omp_env(char **argv){
+    /* execv("/proc/self/exe") renames the process to "exe" — that is the basename of the path
+     * handed to execve, not of the binary. pgrep, pkill, ps and every "is it running" check
+     * then miss it, including this project's own `make stop`. Say the name explicitly. */
+    prctl(PR_SET_NAME, "qwen35_run", 0, 0, 0);
     if(getenv("COLIBRI_ENV_SET")) return;
     setenv("COLIBRI_ENV_SET", "1", 1);
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "active", 1);

@@ -121,8 +121,10 @@ run: qwen35_run
 serve: qwen35_server webui.html
 	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) ./serve.sh
 
+# -x matches the process NAME. The -f form matches any command line CONTAINING
+# "qwen35_server", which includes the shell running this rule.
 stop:
-	pkill -f "qwen35_server .*--port $(PORT)" || true
+	@pkill -x qwen35_server && echo "stopped" || echo "not running"
 
 bench: tests/kvtier_test tests/kquant_simd_test
 	@mkdir -p "$(KV_SPILL)"
