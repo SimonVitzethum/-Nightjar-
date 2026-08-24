@@ -13,6 +13,7 @@
 #include "json.h"
 #include "strbuf.h"
 #include "harness.h"
+#include "chatstore.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -551,6 +552,48 @@ int main(void){
       }
       web_stop();
     }
+
+    /* ---- 6e. THE CHAT STORE. It holds the thing the KV cache is keyed on, so a truncated
+     *          write does not lose the last turn — it loses the prefix and with it a hundred
+     *          seconds of prefill. ---- */
+    puts("\n6e. chats");
+    { char cr[PATH_MAX]; snprintf(cr, sizeof cr, "%s/chats", g_root);
+      mkdir(cr, 0700); realpath(cr, g_chat_root); }
+    ok(cs_save("proj", "c1", "Erster Chat", 2,
+               "[{\"role\":\"user\",\"content\":\"hallo\"}]"), "a chat is stored");
+    ok(cs_save("proj", "c2", "Zweiter", 1, "[]"), "and a second one");
+    { Str t = {0}; cs_list_json(&t, "proj");
+      char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      jval *d = j ? json_get(j, "data") : NULL;
+      ok(d && d->t == J_ARR && d->len == 2, "the listing finds both");
+      /* the title and count are read from the HEAD of the file, not by parsing a 2 MB
+       * transcript per row — a sidebar that costs more than the answer it lists is a sidebar
+       * nobody opens */
+      ok(d && d->len == 2 && !strcmp(a_str(d->kids[0], "title", ""), "Zweiter"),
+         "newest first, with its title");
+      ok(d && d->len == 2 && (int)a_num(d->kids[1], "n", 0) == 2, "and its message count");
+      free(a2); s_free(&t); }
+    { Str t = {0};
+      ok(cs_get(&t, "proj", "c1"), "a chat reads back");
+      char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      jval *m = j ? json_get(j, "messages") : NULL;
+      ok(m && m->t == J_ARR && m->len == 1, "with its messages intact as JSON");
+      ok(j && !strcmp(a_str(j, "project", ""), "proj"), "and the project it belongs to");
+      free(a2); s_free(&t); }
+    /* an id becomes a path component, so it gets the same whitelist as a project name */
+    ok(!cs_save("proj", "../../../etc/passwd", "x", 0, "[]"), "a traversing id is refused");
+    ok(!cs_save("proj", "a/b", "x", 0, "[]"), "an id with a slash is refused");
+    ok(!cs_save("proj", ".hidden", "x", 0, "[]"), "a dotfile id is refused");
+    ok(!cs_save("../../etc", "c1", "x", 0, "[]"), "and so is a traversing project");
+    { /* nothing may be left behind by a refused save */
+      char probe[PATH_MAX]; snprintf(probe, sizeof probe, "%s/chats/proj/c1.json.tmp", g_root);
+      struct stat st;
+      ok(stat(probe, &st) != 0, "a save leaves no temporary file behind"); }
+    ok(cs_delete("proj", "c1"), "a chat deletes");
+    { Str t = {0};
+      ok(!cs_get(&t, "proj", "c1"), "and is then gone");
+      s_free(&t); }
+    g_chat_root[0] = 0;
 
     /* ---- 7. the escaper: a tool result goes into a JSON body ---- */
     puts("\n7. escaping");
