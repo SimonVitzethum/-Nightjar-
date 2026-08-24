@@ -1,5 +1,5 @@
-#ifndef COLIBRI_KQUANT_CUDA_H
-#define COLIBRI_KQUANT_CUDA_H
+#ifndef QWEN_KQUANT_CUDA_H
+#define QWEN_KQUANT_CUDA_H
 /* kquant_cuda.h — host interface to the GPU GEMV that runs on GGUF quant bytes.
  *
  * The contract: quantized expert bytes go to the device exactly as they came off NVMe.

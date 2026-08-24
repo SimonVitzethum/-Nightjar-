@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_BATCH_H
-#define COLIBRI_QWEN35_BATCH_H
+#ifndef QWEN_QWEN35_BATCH_H
+#define QWEN_QWEN35_BATCH_H
 /* qwen35_batch.h — prefill S tokens at a time.
  *
  * WHY THIS IS THE GATE FOR EVERYTHING ELSE

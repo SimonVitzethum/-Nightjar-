@@ -28,7 +28,7 @@ int main(int argc,char**argv){
     const char *path = argc>1?argv[1]:"/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
     Q35Model M; if(!q35_open(&M,path)) return 1;
     Q35State R; const int n_ctx=4096;
-    q35_state_init_ex(&R,&M,n_ctx,Q35_KV_Q8_0,q35_kv_bytes_per_token(&M.c,Q35_KV_Q8_0)*n_ctx+(32<<20),getenv("COLIBRI_KV_SPILL"),4096);
+    q35_state_init_ex(&R,&M,n_ctx,Q35_KV_Q8_0,q35_kv_bytes_per_token(&M.c,Q35_KV_Q8_0)*n_ctx+(32<<20),getenv("QWEN_KV_SPILL"),4096);
     Q35Cu G; if(!q35cu_model_init(&G,&M,n_ctx,R.kv.fmt)) return 77;
     q35cu_align_win(&G,R.kv.chunk); q35cu_mark_resident_elsewhere(&G);
     Q35Resident RES; q35_reside_anon(&M,&RES,Q35_RES_FFN); q35cu_pin_weights(&G,&M);

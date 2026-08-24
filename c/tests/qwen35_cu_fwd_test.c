@@ -6,7 +6,7 @@
  * the wrong device, a residual added twice, a KV slot shared between the trunk and the draft
  * head. All of those produce fluent, wrong text.
  *
- * COLIBRI_KERNEL_LOG=1 prints where each component actually ran. "CUDA didn't help" and
+ * QWEN_KERNEL_LOG=1 prints where each component actually ran. "CUDA didn't help" and
  * "CUDA didn't run" look identical from the outside; that has already cost 1.84x once.
  */
 #define _GNU_SOURCE
@@ -55,7 +55,7 @@ int main(int argc, char **argv){
 
     Q35State R;
     const int64_t kvb = q35_kv_bytes_per_token(&M.c, Q35_KV_Q8_0)*(int64_t)n_ctx + (16<<20);
-    const char *spill = getenv("COLIBRI_KV_SPILL");
+    const char *spill = getenv("QWEN_KV_SPILL");
     if(!q35_state_init_ex(&R, &M, n_ctx, Q35_KV_Q8_0, kvb, spill, 4096)){
         printf("state init failed\n"); return 1; }
     q35_state_reset(&R);

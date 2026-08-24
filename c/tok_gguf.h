@@ -1,5 +1,5 @@
-#ifndef COLIBRI_TOK_GGUF_H
-#define COLIBRI_TOK_GGUF_H
+#ifndef QWEN_TOK_GGUF_H
+#define QWEN_TOK_GGUF_H
 /* tok_gguf.h — build colibri's tokenizer straight out of a GGUF.
  *
  * Nothing new is invented here. colibri's tok.h already implements exactly what GLM-5.2
@@ -133,4 +133,4 @@ static int tok_from_gguf(Tok *T, const gguf_model *m, TokIds *ids){
     return 1;
 }
 
-#endif /* COLIBRI_TOK_GGUF_H */
+#endif /* QWEN_TOK_GGUF_H */

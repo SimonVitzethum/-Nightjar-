@@ -1,5 +1,5 @@
-#ifndef COLIBRI_KQUANT_SIMD_H
-#define COLIBRI_KQUANT_SIMD_H
+#ifndef QWEN_KQUANT_SIMD_H
+#define QWEN_KQUANT_SIMD_H
 /* kquant_simd.h — AVX2 dot products for Q4_K and Q6_K, the two quants Qwen3.5's FFN is
  * made of.
  *
@@ -449,14 +449,14 @@ static void kq_gemv_vnni(float *y, const float *x, const void *W, int gtype, int
  * branch wrongly, and cost a 1.84x speedup for a while.
  *
  * Negative results are precisely the ones acted on by abandoning a direction, so the premise
- * that is invisible is the one that must be made observable. COLIBRI_KERNEL_LOG=1 prints, once
+ * that is invisible is the one that must be made observable. QWEN_KERNEL_LOG=1 prints, once
  * per (quant, S-class) pair, which kernel actually ran. "Which path executed" then becomes an
  * observation rather than an inference, for every future negative result. */
 static void kqs_log(const char *kernel, int gtype, int S){
     static const char *seen[64];
     static int n_seen = 0;
     static int enabled = -1;
-    if(enabled < 0) enabled = (getenv("COLIBRI_KERNEL_LOG") != NULL);
+    if(enabled < 0) enabled = (getenv("QWEN_KERNEL_LOG") != NULL);
     if(!enabled) return;
     char key[96];
     snprintf(key, sizeof key, "%s/%s/S%s", kernel, kq_name(gtype),
@@ -504,10 +504,10 @@ static inline float kq_dot_fast(int t, const void *w, const float *x, int64_t n)
  * The hardware prefetcher already covers a stream this regular, so the explicit hints add
  * nothing to fetch and cost the issue slots they occupy. That is the general shape of this
  * class of idea on a sequential workload: the cache is not being used wrongly, it is being
- * used the only way a single-pass stream can use it. COLIBRI_NTA=1 to retry. */
+ * used the only way a single-pass stream can use it. QWEN_NTA=1 to retry. */
 static int kqs_use_nta = -1;
 static inline int kqs_nta(void){
-    if(kqs_use_nta < 0) kqs_use_nta = (getenv("COLIBRI_NTA") != NULL);
+    if(kqs_use_nta < 0) kqs_use_nta = (getenv("QWEN_NTA") != NULL);
     return kqs_use_nta;
 }
 

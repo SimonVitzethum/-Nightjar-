@@ -70,7 +70,7 @@ extern "C" double q35cu_bandwidth(void){ return g_bw; }
         seterr(#call, cudaGetErrorString(e_)); return; } }while(0)
 
 extern "C" int q35cu_log_on(void){
-    if(g_logon < 0){ const char *e = getenv("COLIBRI_KERNEL_LOG"); g_logon = (e && *e && *e != '0'); }
+    if(g_logon < 0){ const char *e = getenv("QWEN_KERNEL_LOG"); g_logon = (e && *e && *e != '0'); }
     return g_logon;
 }
 extern "C" void q35cu_log(const char *component, const char *detail){

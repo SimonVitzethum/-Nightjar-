@@ -3,8 +3,8 @@
  * It lives in its own file for one reason: the tool harness and its test must escape JSON with
  * the SAME function the HTTP layer uses. A second copy in the test would be a test that passes
  * while the server ships a different escaper. */
-#ifndef COLIBRI_STRBUF_H
-#define COLIBRI_STRBUF_H
+#ifndef QWEN_STRBUF_H
+#define QWEN_STRBUF_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,4 +61,4 @@ static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
     return t.tv_sec + 1e-9*t.tv_nsec; }
 
 
-#endif /* COLIBRI_STRBUF_H */
+#endif /* QWEN_STRBUF_H */

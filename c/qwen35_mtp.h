@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_MTP_H
-#define COLIBRI_QWEN35_MTP_H
+#ifndef QWEN_QWEN35_MTP_H
+#define QWEN_QWEN35_MTP_H
 /* qwen35_mtp.h — the draft head that ships with the model, and speculative decoding on it.
  *
  * WHY THIS IS THE BEST SPEEDUP-PER-EFFORT AVAILABLE

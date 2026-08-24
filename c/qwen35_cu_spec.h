@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_CU_SPEC_H
-#define COLIBRI_QWEN35_CU_SPEC_H
+#ifndef QWEN_QWEN35_CU_SPEC_H
+#define QWEN_QWEN35_CU_SPEC_H
 /* qwen35_cu_spec.h — batched verification and speculative decode on the hetero path.
  *
  * WHY THIS IS THE ONLY REMAINING LEVER

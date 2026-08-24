@@ -29,7 +29,7 @@
 #include <sys/prctl.h>
 
 #include "qwen35_cpu.h"
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 #include "qwen35_cu_spec.h"
 #endif
 #include "tok.h"
@@ -41,14 +41,15 @@ static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
 /* libgomp reads OMP_WAIT_POLICY and friends when it initializes, which happens before we
  * could set them. Measured on this machine they are worth 20%: without an active wait the
  * threads sleep between layers and every FFN pays a wake-up. So set them and re-exec once.
- * COLIBRI_ENV_SET marks that we already did, so this cannot loop. */
+ * QWEN_ENV_SET marks that we already did, so this cannot loop. */
 static void q35_fix_omp_env(char **argv){
     /* execv("/proc/self/exe") renames the process to "exe" — that is the basename of the path
      * handed to execve, not of the binary. pgrep, pkill, ps and every "is it running" check
      * then miss it, including this project's own `make stop`. Say the name explicitly. */
     prctl(PR_SET_NAME, "qwen35_run", 0, 0, 0);
-    if(getenv("COLIBRI_ENV_SET")) return;
-    setenv("COLIBRI_ENV_SET", "1", 1);
+    q35_env_compat();          /* COLIBRI_* still works */
+    if(getenv("QWEN_ENV_SET")) return;
+    setenv("QWEN_ENV_SET", "1", 1);
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "active", 1);
     if(!getenv("OMP_PROC_BIND"))   setenv("OMP_PROC_BIND", "close", 1);
     if(!getenv("OMP_PLACES"))      setenv("OMP_PLACES", "cores", 1);
@@ -185,10 +186,10 @@ int main(int argc, char **argv){
 
     Q35State R;
     const int64_t kvb = q35_kv_bytes_per_token(c, Q35_KV_Q8_0)*(int64_t)n_ctx + (32<<20);
-    if(!q35_state_init_ex(&R, &M, n_ctx, Q35_KV_Q8_0, kvb, getenv("COLIBRI_KV_SPILL"), 4096)){
+    if(!q35_state_init_ex(&R, &M, n_ctx, Q35_KV_Q8_0, kvb, getenv("QWEN_KV_SPILL"), 4096)){
         fprintf(stderr, "qwen35_run: kv init failed\n"); return 1; }
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     Q35Cu G; int use_gpu = 0;
     if(!cpu_only){
         const double t0 = now();
@@ -208,7 +209,7 @@ int main(int argc, char **argv){
 
     Q35Resident RES;
     q35_reside_anon(&M, &RES, use_gpu ? Q35_RES_FFN : Q35_RES_ALL);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(use_gpu){
         q35cu_pin_weights(&G, &M);           /* after residency: the mapping exists only now */
         q35cu_report(&G, stderr);            /* ...and report after it, so the line is true */
@@ -219,7 +220,7 @@ int main(int argc, char **argv){
                  RES.resident/1073741824.0, RES.want ? 100.0*RES.resident/RES.want : 0.0);
 
     q35_state_reset(&R);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     Q35CuBatch Z; Q35Mtp P; int use_spec = 0;
     if(use_gpu){
         q35cu_state_reset(&G);
@@ -285,7 +286,7 @@ int main(int argc, char **argv){
 
         const double tp0 = now();
         int i = 0;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         /* BATCHED PREFILL. A prompt token costs the same weight pass as a generated one only
          * if you feed them one at a time; in a batch the 9.65 GiB is read once for all of
          * them, and on the streamed layers the PCIe traffic is shared too. This is what makes
@@ -315,12 +316,12 @@ int main(int argc, char **argv){
 #endif
         for(; i < nt && !g_stop; i++){
             const int last = (i == nt-1);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
             if(use_gpu) q35_forward_cu(&G, &R, toks[i], pos, last ? logits : NULL);
             else
 #endif
                         q35_forward(&R, toks[i], pos, last ? logits : NULL);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
             if(use_spec){
                 float hbuf[8192];
                 q35_hidden(&R, hbuf);
@@ -336,7 +337,7 @@ int main(int argc, char **argv){
 
         const double td0 = now();
         int ngen = 0;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         if(use_spec){
             /* One round drafts a token with the MTP head and verifies BOTH positions in a
              * single batched pass. The true token is always sampled from the trunk's own
@@ -384,7 +385,7 @@ int main(int argc, char **argv){
                 fprintf(stderr, "\n[context full]\n"); break;
             }
             if(pos + 1 > R.n_ctx) R.n_ctx = R.kv.n_ctx;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
             if(use_gpu) q35_forward_cu(&G, &R, id, pos, logits);
             else
 #endif
@@ -402,7 +403,7 @@ int main(int argc, char **argv){
     }
 
     free(logits); free(cbuf); free(toks); free(hist.buf);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(use_spec){ q35_mtp_free(&P); q35cu_batch_free(&Z); }
     if(use_gpu) q35cu_model_free(&G);
 #endif

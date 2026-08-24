@@ -85,7 +85,7 @@ int main(int argc, char **argv){
 
     /* --- placement plan --- */
     int64_t vram = 8151LL << 20;              /* the 5070's 8151 MiB, per nvidia-smi */
-    const char *vs = getenv("COLIBRI_VRAM_MB");
+    const char *vs = getenv("QWEN_VRAM_MB");
     if(vs) vram = (int64_t)atoll(vs) << 20;
     /* leave the driver's own context out of the budget */
     vram -= 400LL << 20;

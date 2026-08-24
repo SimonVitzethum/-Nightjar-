@@ -1,5 +1,5 @@
-#ifndef COLIBRI_GGUF_H
-#define COLIBRI_GGUF_H
+#ifndef QWEN_GGUF_H
+#define QWEN_GGUF_H
 /* gguf.h — GGUF v3 reader for streamed MoE inference.
  *
  * Scoped to what colibri actually needs, which is not what a general GGUF library
@@ -395,4 +395,4 @@ static int gguf_expert_slice(const gguf_model *m, const gguf_tensor *t, int e,
     return 1;
 }
 
-#endif /* COLIBRI_GGUF_H */
+#endif /* QWEN_GGUF_H */

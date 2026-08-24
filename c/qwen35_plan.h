@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_PLAN_H
-#define COLIBRI_QWEN35_PLAN_H
+#ifndef QWEN_QWEN35_PLAN_H
+#define QWEN_QWEN35_PLAN_H
 /* qwen35_plan.h — decide WHERE every byte lives, from the machine's real numbers.
  *
  * THE RULE THIS ENCODES
@@ -45,7 +45,7 @@
  * The drive, not the plan, is the limit — which is the point.
  *
  *   VRAM   the newest tokens — no bus traffic at all
- *   RAM    a bounded hot window (COLIBRI_KV_RAM_GB, default 1) — NOT "the rest"
+ *   RAM    a bounded hot window (QWEN_KV_RAM_GB, default 1) — NOT "the rest"
  *   NVMe   everything else — O_DIRECT, 8 deep, read ahead of the compute
  *
  * THE OVERLAP THAT MAKES IT WORK
@@ -145,8 +145,8 @@ static void q35_plan(Q35Plan *P, const Q35Model *M, int n_ctx, int kv_fmt,
      * that pushes 5 GiB onto the drive for no reason, and the drive is 5x slower than RAM).
      *
      * The measurement is MemAvailable, taken now, minus a reserve that is never planned into.
-     * COLIBRI_KV_RAM_GB pins it if you want the disk path exercised deliberately. */
-    const char *kve = getenv("COLIBRI_KV_RAM_GB");
+     * QWEN_KV_RAM_GB pins it if you want the disk path exercised deliberately. */
+    const char *kve = getenv("QWEN_KV_RAM_GB");
     int64_t kv_ram_cap = kve ? (int64_t)(atof(kve)*(1024.0*1024.0*1024.0)) : ram_left;
     if(kv_ram_cap > ram_left) kv_ram_cap = ram_left;
     P->kv_ram_cap = kv_ram_cap;
@@ -202,14 +202,14 @@ static void q35_plan(Q35Plan *P, const Q35Model *M, int n_ctx, int kv_fmt,
         P->ok = 0;
         snprintf(P->why, sizeof P->why,
                  "VRAM too small: weights %.2f + state %.2f + work %.2f GiB > %.2f GiB free. "
-                 "Move the GDN layers to RAM (COLIBRI_Q35_GDN=cpu) or use a bigger card.",
+                 "Move the GDN layers to RAM (QWEN_Q35_GDN=cpu) or use a bigger card.",
                  q35_gib(P->vram_weights), q35_gib(P->gdn_state),
                  q35_gib(P->vram_work), q35_gib(vram_free));
     } else if(P->ram_weights + P->reserve > ram_avail){
         P->ok = 0;
         snprintf(P->why, sizeof P->why,
                  "RAM too small: FFN+embd %.2f GiB + reserve %.2f GiB > %.2f GiB available. "
-                 "Lower COLIBRI_RESERVE_GB or free memory.",
+                 "Lower QWEN_RESERVE_GB or free memory.",
                  q35_gib(P->ram_weights), q35_gib(P->reserve), q35_gib(ram_avail));
     }
 }
@@ -242,7 +242,7 @@ static void q35_plan_print(const Q35Plan *P, const Q35Model *M, FILE *o){
     fprintf(o, "    VRAM  %8.3f GiB  %8d tokens   (no bus traffic)\n", q35_gib(P->kv_vram), P->tok_vram);
     fprintf(o, "    RAM   %8.3f GiB  %8d tokens   (%s, room for %.2f GiB)\n",
             q35_gib(P->kv_ram), P->tok_ram,
-            getenv("COLIBRI_KV_RAM_GB") ? "pinned by COLIBRI_KV_RAM_GB" : "auto, from MemAvailable",
+            getenv("QWEN_KV_RAM_GB") ? "pinned by QWEN_KV_RAM_GB" : "auto, from MemAvailable",
             q35_gib(P->kv_ram_cap));
     if(P->kv_disk > 0)
         fprintf(o, "    NVMe  %8.3f GiB  %8d tokens   (O_DIRECT, 8 deep, read ahead)\n\n",

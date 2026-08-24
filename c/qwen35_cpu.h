@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_CPU_H
-#define COLIBRI_QWEN35_CPU_H
+#ifndef QWEN_QWEN35_CPU_H
+#define QWEN_QWEN35_CPU_H
 /* qwen35_cpu.h — the Qwen3.5 forward pass, in plain C, on the CPU.
  *
  * This is the REFERENCE. It is not the fast path and does not try to be: its job is to be

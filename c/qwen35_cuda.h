@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_CUDA_H
-#define COLIBRI_QWEN35_CUDA_H
+#ifndef QWEN_QWEN35_CUDA_H
+#define QWEN_QWEN35_CUDA_H
 /* qwen35_cuda.h — the device half of the engine.
  *
  * WHAT GOES TO THE GPU AND WHY
@@ -25,7 +25,7 @@
  * Nothing here falls back silently. If the device is missing, out of memory, or handed a
  * type it does not decode, the call returns 0 and q35cu_error() says why. "CUDA didn't help"
  * and "CUDA didn't run" look identical from the outside, and that has already cost 1.84x
- * once on this codebase — see COLIBRI_KERNEL_LOG.
+ * once on this codebase — see QWEN_KERNEL_LOG.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -124,7 +124,7 @@ void   q35cu_attn_gate(float *o, const float *qg, int nh, int dh);
 void q35cu_lse_merge(float *o, float *lse, const float *o2, const float *lse2, int nh, int dh);
 
 /* ---------------- instrumentation ----------------
- * COLIBRI_KERNEL_LOG=1 makes every component announce the device it actually ran on. */
+ * QWEN_KERNEL_LOG=1 makes every component announce the device it actually ran on. */
 void q35cu_log(const char *component, const char *detail);
 void q35cu_mark_begin(void);
 void q35cu_mark(const char *name);

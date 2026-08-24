@@ -1,5 +1,5 @@
-#ifndef COLIBRI_KV_TIER_H
-#define COLIBRI_KV_TIER_H
+#ifndef QWEN_KV_TIER_H
+#define QWEN_KV_TIER_H
 /* kv_tier.h — the KV cache as a streamed, tiered store. estream.h's principle, applied to
  * the one thing in this model that GROWS.
  *
@@ -345,7 +345,7 @@ static int kvt_open_n(KvTier *S, const Q35Cfg *c, int n_layer, int n_ctx, int fm
     const int need_disk = 1;
     (void)n_slots;
     if(need_disk){
-        const char *env = getenv("COLIBRI_KV_SPILL");
+        const char *env = getenv("QWEN_KV_SPILL");
         if(env) dir = env;
         if(!dir) dir = "/tmp";
         /* tmpfs is the quiet disaster: the cold tier would sit in the very RAM the tiering
@@ -356,7 +356,7 @@ static int kvt_open_n(KvTier *S, const Q35Cfg *c, int n_layer, int n_ctx, int fm
             fprintf(stderr,
                 "kv_tier: WARNING: %s is tmpfs — the cold KV tier would live in RAM, not on\n"
                 "         disk, competing with the weights it is meant to make room for.\n"
-                "         Set COLIBRI_KV_SPILL to a path on real storage.\n", dir);
+                "         Set QWEN_KV_SPILL to a path on real storage.\n", dir);
         snprintf(S->path, sizeof S->path, "%s/colibri-kv-%d.bin", dir, (int)getpid());
 #ifdef O_DIRECT
         S->fd = open(S->path, O_RDWR|O_CREAT|O_TRUNC|O_DIRECT, 0600);
@@ -397,7 +397,7 @@ static int kvt_open_n(KvTier *S, const Q35Cfg *c, int n_layer, int n_ctx, int fm
     if(S->n_rth > KVT_MAXQ) S->n_rth = KVT_MAXQ;
     /* Writers are separate from readers because their cost profile is: NVMe sustained write
      * is well under its read rate, so it needs its own depth to keep up during a prefill. */
-    { const char *e = getenv("COLIBRI_KV_WTHREADS");
+    { const char *e = getenv("QWEN_KV_WTHREADS");
       int w = e ? atoi(e) : 4; if(w < 1) w = 1; if(w > 4) w = 4;
       S->n_wth = need_disk ? w : 0; }
     for(int i = 0; i < S->n_rth; i++) pthread_create(&S->rth[i], NULL, kvt_reader, S);

@@ -1,5 +1,5 @@
-#ifndef COLIBRI_KQUANT_H
-#define COLIBRI_KQUANT_H
+#ifndef QWEN_KQUANT_H
+#define QWEN_KQUANT_H
 /* kquant.h — GGUF quant decoders for the types Unsloth's Dynamic GGUFs actually use.
  *
  * The name "UD-Q2_K_XL" is misleading: dumping the tensor directory of
@@ -603,4 +603,4 @@ static void kq_gemm(float *y,const float *x,const void *W,int gtype,int S,int I,
 #endif
 }
 
-#endif /* COLIBRI_KQUANT_H */
+#endif /* QWEN_KQUANT_H */

@@ -1,5 +1,5 @@
-#ifndef COLIBRI_KV_TIER_SIMD_H
-#define COLIBRI_KV_TIER_SIMD_H
+#ifndef QWEN_KV_TIER_SIMD_H
+#define QWEN_KV_TIER_SIMD_H
 /* kv_tier_simd.h — the three kernels that touch every byte of the KV cache.
  *
  * WHY THESE THREE AND NOTHING ELSE

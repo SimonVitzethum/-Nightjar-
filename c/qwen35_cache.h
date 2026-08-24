@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_CACHE_H
-#define COLIBRI_QWEN35_CACHE_H
+#ifndef QWEN_QWEN35_CACHE_H
+#define QWEN_QWEN35_CACHE_H
 /* qwen35_cache.h — prefix caching across requests.
  *
  * WHY A PLAIN "DID THE LAST REQUEST EXTEND THIS ONE" CACHE IS NOT ENOUGH
@@ -52,7 +52,7 @@
 #include <string.h>
 
 #include "qwen35_cpu.h"
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 #include "qwen35_hetero.h"
 #endif
 
@@ -66,7 +66,7 @@ typedef struct {
 
 typedef struct {
     Q35State *R;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     Q35Cu    *G;
 #endif
     int       gpu, pinned;
@@ -98,11 +98,11 @@ typedef struct {
  * anywhere, because the kernel does not ask.
  *
  * A cache that occasionally kills the process is worse than a cache that copies four times
- * slower. COLIBRI_CACHE_PIN=1 restores the old behaviour for a machine with room. */
+ * slower. QWEN_CACHE_PIN=1 restores the old behaviour for a machine with room. */
 static void *q35_cache_alloc(Q35Cache *C, size_t n){
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     static int want = -1;
-    if(want < 0){ const char *e = getenv("COLIBRI_CACHE_PIN"); want = (e && *e && *e != '0'); }
+    if(want < 0){ const char *e = getenv("QWEN_CACHE_PIN"); want = (e && *e && *e != '0'); }
     if(C->gpu && want){
         void *p = q35cu_host_alloc(n);
         if(p){ C->pinned = 1; return p; }
@@ -111,13 +111,13 @@ static void *q35_cache_alloc(Q35Cache *C, size_t n){
     return malloc(n);
 }
 static void q35_cache_release(Q35Cache *C, void *p){
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(C->pinned){ q35cu_host_free(p); return; }
 #endif
     free(p);
 }
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 static int q35_cache_init(Q35Cache *C, Q35State *R, Q35Cu *G, int slots, int spacing){
 #else
 static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spacing){
@@ -125,7 +125,7 @@ static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spac
     memset(C, 0, sizeof *C);
     const Q35Cfg *c = &R->M->c;
     C->R = R;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     C->G = G; C->gpu = (G != NULL);
 #else
     (void)G;
@@ -133,7 +133,7 @@ static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spac
     C->s_bytes = (size_t)R->n_gdn*c->n_v_heads*c->d_state*c->d_head_v*sizeof(float);
     C->c_bytes = (size_t)R->n_gdn*(c->d_conv-1)*c->conv_dim*sizeof(float);
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(C->gpu){
         C->kv_win    = G->win;
         C->kv_stride = (size_t)G->kv_half;
@@ -142,14 +142,14 @@ static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spac
     }
 #endif
 
-    { const char *e = getenv("COLIBRI_CACHE_SPACING"); if(e) spacing = atoi(e); }
+    { const char *e = getenv("QWEN_CACHE_SPACING"); if(e) spacing = atoi(e); }
     if(spacing < 64) spacing = 64;
 
     /* Budget-driven rather than count-driven: a checkpoint's size depends on the KV window,
      * so "six slots" means very different things at 4k and at 32k. */
     double gb = 1.5;
-    { const char *e = getenv("COLIBRI_CACHE_GB"); if(e) gb = atof(e); }
-    { const char *e = getenv("COLIBRI_CACHE_SLOTS"); if(e) slots = atoi(e); else slots = 64; }
+    { const char *e = getenv("QWEN_CACHE_GB"); if(e) gb = atof(e); }
+    { const char *e = getenv("QWEN_CACHE_SLOTS"); if(e) slots = atoi(e); else slots = 64; }
     const size_t per = C->s_bytes + C->c_bytes + C->kv_bytes;
     int by_budget = per ? (int)((int64_t)(gb*1073741824.0)/(int64_t)per) : 0;
     if(by_budget < 0) by_budget = 0;
@@ -203,7 +203,7 @@ static void q35_cache_push(Q35Cache *C, int tok){
 /* The device window stores each attention layer's K (and V) contiguously over tokens, so one
  * layer's prefix is one contiguous range and a checkpoint is `kv_layers` pairs of copies. */
 static void q35_cache_kv(Q35Cache *C, Q35Ckpt *k, int save){
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(!C->gpu || !k->kv || !C->kv_bytes) return;
     const Q35Cu *G = C->G;
     const size_t n = q35_len(k->pos, "checkpoint pos")*C->kv_stride;
@@ -221,7 +221,7 @@ static void q35_cache_kv(Q35Cache *C, Q35Ckpt *k, int save){
 static void q35_cache_grab(Q35Cache *C, Q35Ckpt *k){
     if(k->pos <= 0 || (C->kv_win && k->pos > C->kv_win)) return;   /* caller must set pos first */
     const double t0 = q35_clk();
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(C->gpu){
         q35cu_sync();
         q35cu_d2h(k->S,    C->G->S,    C->s_bytes);
@@ -236,7 +236,7 @@ static void q35_cache_grab(Q35Cache *C, Q35Ckpt *k){
 
 static void q35_cache_put_back(Q35Cache *C, Q35Ckpt *k){
     const double t0 = q35_clk();
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(C->gpu){
         q35cu_h2d(C->G->S,    k->S,    C->s_bytes);
         q35cu_h2d(C->G->conv, k->conv, C->c_bytes);
@@ -256,7 +256,7 @@ static void q35_cache_put_back(Q35Cache *C, Q35Ckpt *k){
 
 static void q35_cache_reset_state(Q35Cache *C){
     q35_state_reset(C->R);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(C->gpu) q35cu_state_reset(C->G);
 #endif
 }

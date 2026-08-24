@@ -1,4 +1,4 @@
-# Colibrì · Web UI und OpenAI-kompatible API
+# QwenEngine · Web UI, Agent und OpenAI-kompatible API
 
 Ein Prozess, zwei Zugänge: eine Chat-Oberfläche im Browser und dieselbe Engine als
 OpenAI-kompatibler Endpunkt, an den sich opencode (oder jeder andere Client) hängt.
@@ -31,14 +31,14 @@ Die Konfiguration liegt bereits in `~/.config/opencode/opencode.jsonc`:
 ```jsonc
 {
   "provider": {
-    "colibri": {
+    "qwenengine": {
       "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "local" },
       "models": { "qwen3.5-27b": { "tool_call": true, "reasoning": true,
                                    "limit": { "context": 32768, "output": 8192 } } }
     }
   },
-  "model": "colibri/qwen3.5-27b"
+  "model": "qwenengine/qwen3.5-27b"
 }
 ```
 
@@ -48,7 +48,7 @@ Einmalig nötig, weil opencode den Provider nicht selbst nachlädt:
 npm install --prefix ~/.config/opencode @ai-sdk/openai-compatible
 ```
 
-Dann `opencode` starten, oder direkt `opencode run "..."`. `opencode models | grep colibri`
+Dann `opencode` starten, oder direkt `opencode run "..."`. `opencode models | grep qwenengine`
 zeigt, ob der Provider erkannt wird.
 
 **Tool-Calling funktioniert.** Das Modell schreibt Funktionsaufrufe in einem eigenen
@@ -93,12 +93,30 @@ Die Weboberfläche ist ein Agent, kein reines Chatfenster. Sie kann suchen, lese
 vorbeiführen; sie schickt nur einen Namen und ein Argumentobjekt an `/v1/tools/exec`.
 
 ```bash
-make serve                              # Agent an, workspace-write, im Repo-Wurzelverzeichnis
-make serve WORKSPACE=/home/ich/projekt  # anderer Arbeitsbereich
+make serve                              # Agent an, workspace-write, Projekte in $HOME
 make serve TOOLS=ro                     # nur lesen und suchen
 make serve TOOLS=off                    # reiner Chatserver
+make serve PROJECTS=/anderer/ort        # andere Projektwurzel
+make serve ARGS='--workspace /ein/repo' # ein fester Arbeitsbereich statt Projekte
 make tools                              # nur die Werkzeugschicht testen, ohne Modell
 ```
+
+**Projekte.** Eine Engine, viele Arbeitsbereiche. Alles, was die Engine zur Laufzeit besitzt,
+liegt unter `~/QwenEngine` — außerhalb jedes Checkouts:
+
+```
+~/QwenEngine/
+├── projects/<name>/     ein Verzeichnis pro Projekt
+├── kvspill/             der kalte KV-Tier
+├── logs/server.log
+└── models/
+```
+
+Die Oberfläche hat oben eine Projektauswahl und ein `+` für ein neues. Der Agent ist auf das
+gewählte Projekt eingegrenzt und sieht seine Nachbarn nicht. Der Client wählt per **Name**, nie
+per Pfad, und der Name muss `[A-Za-z0-9._-]` entsprechen — alles andere wird abgelehnt, nicht
+bereinigt: Bereinigen erzeugt einen *anderen* Namen, der trotzdem irgendwohin auflöst, und
+genau so wird aus einem Filter ein Traversal.
 
 | `--tools` | lesen | schreiben | Shell |
 |---|---|---|---|
@@ -143,15 +161,15 @@ opencode benutzt davon nichts — es bringt eigene Werkzeuge mit und braucht nur
 
 | Variable | Default | Wirkung |
 |---|---|---|
-| `COLIBRI_CUDA_STREAM` | `0.60` | Anteil jeder nicht-residenten FFN-Schicht, den die GPU beim **Decode** über PCIe zieht. |
-| `COLIBRI_CUDA_STREAM_PREFILL` | `0.85` | Dasselbe für **Batch-Arbeit**. Höher, weil ein Batch jedes Gewicht S-mal benutzt: die CPU-Seite amortisiert ihre Dekodierkosten, die Buskosten pro Byte bleiben gleich. Nicht 1,0 — die GPU-Seite ist eine DMA und bei f=1 dauert ein Batch 400 ms statt 339. |
-| `COLIBRI_CACHE_GB` | `3.0` | Speicher für Präfix-Prüfpunkte. Jeder hält den rekurrenten Zustand plus den Trunk-KV seines Präfixes und ist damit unabhängig von allem, was dazwischen lief. |
-| `COLIBRI_CACHE_SPACING` | `512` | Abstand der Prüfpunkte in Token. Bestimmt, wie viel im schlimmsten Fall neu gerechnet wird. |
-| `COLIBRI_CUDA_KV_TOK` | `8192` | Obergrenze des KV-Fensters im VRAM. Größer lohnt erst jenseits ~24k Kontext — davor sind residente FFN-Schichten mehr wert (§7.8 im Plan.md). |
-| `COLIBRI_CUDA_FFN_GB` | auto | Deckel für residente FFN-Schichten. |
-| `COLIBRI_KV_SPILL` | `../../kvspill` | Auslagerungspfad des kalten KV-Tiers. **Nicht auf tmpfs zeigen lassen** — das legt den „Disk"-Tier zurück in genau den RAM, den er freimachen soll. |
-| `COLIBRI_RESERVE_GB` | `4` | RAM, den die Engine nie anfasst. |
-| `COLIBRI_KERNEL_LOG` | aus | Meldet pro Komponente, auf welchem Gerät sie tatsächlich lief. |
+| `QWEN_CUDA_STREAM` | `0.60` | Anteil jeder nicht-residenten FFN-Schicht, den die GPU beim **Decode** über PCIe zieht. |
+| `QWEN_CUDA_STREAM_PREFILL` | `0.85` | Dasselbe für **Batch-Arbeit**. Höher, weil ein Batch jedes Gewicht S-mal benutzt: die CPU-Seite amortisiert ihre Dekodierkosten, die Buskosten pro Byte bleiben gleich. Nicht 1,0 — die GPU-Seite ist eine DMA und bei f=1 dauert ein Batch 400 ms statt 339. |
+| `QWEN_CACHE_GB` | `3.0` | Speicher für Präfix-Prüfpunkte. Jeder hält den rekurrenten Zustand plus den Trunk-KV seines Präfixes und ist damit unabhängig von allem, was dazwischen lief. |
+| `QWEN_CACHE_SPACING` | `512` | Abstand der Prüfpunkte in Token. Bestimmt, wie viel im schlimmsten Fall neu gerechnet wird. |
+| `QWEN_CUDA_KV_TOK` | `8192` | Obergrenze des KV-Fensters im VRAM. Größer lohnt erst jenseits ~24k Kontext — davor sind residente FFN-Schichten mehr wert (§7.8 im Plan.md). |
+| `QWEN_CUDA_FFN_GB` | auto | Deckel für residente FFN-Schichten. |
+| `QWEN_KV_SPILL` | `../../kvspill` | Auslagerungspfad des kalten KV-Tiers. **Nicht auf tmpfs zeigen lassen** — das legt den „Disk"-Tier zurück in genau den RAM, den er freimachen soll. |
+| `QWEN_RESERVE_GB` | `4` | RAM, den die Engine nie anfasst. |
+| `QWEN_KERNEL_LOG` | aus | Meldet pro Komponente, auf welchem Gerät sie tatsächlich lief. |
 | `--tools MODE` | `workspace` | Was der Agent darf: `off`, `ro`, `workspace`, `full`. |
 | `--workspace DIR` | `.` | Wurzel, in der der Agent arbeitet. |
 | `--tool-output N` | `16384` | Bytes Werkzeugausgabe, die das Modell sieht. |

@@ -41,7 +41,7 @@ int main(int argc, char **argv){
 
     Q35State R;
     const int64_t kvb = q35_kv_bytes_per_token(c, Q35_KV_Q8_0)*(int64_t)n_ctx + (32<<20);
-    if(!q35_state_init_ex(&R, &M, n_ctx, Q35_KV_Q8_0, kvb, getenv("COLIBRI_KV_SPILL"), 4096)){
+    if(!q35_state_init_ex(&R, &M, n_ctx, Q35_KV_Q8_0, kvb, getenv("QWEN_KV_SPILL"), 4096)){
         printf("kv init failed\n"); return 1; }
 
     Q35Cu G;

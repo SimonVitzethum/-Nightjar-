@@ -39,7 +39,7 @@ int main(int argc, char **argv){
     const int n_ctx   = argc > 1 ? atoi(argv[1]) : 65536;
     const double ramgb= argc > 2 ? atof(argv[2]) : 0.25;   /* deliberately small: force disk */
     const int chunk   = argc > 3 ? atoi(argv[3]) : 4096;
-    const char *spill = argc > 4 ? argv[4] : NULL;   /* NULL => COLIBRI_KV_SPILL, else /tmp */
+    const char *spill = argc > 4 ? argv[4] : NULL;   /* NULL => QWEN_KV_SPILL, else /tmp */
     const int  depth  = argc > 5 ? atoi(argv[5]) : 6;    /* chunks kept in flight */
 
     /* Qwen3.5-27B's real attention geometry */
