@@ -54,53 +54,11 @@
 #include "tok_gguf.h"
 #include "json.h"
 
-/* ---------------- small dynamic string ---------------- */
+#include "strbuf.h"
 
-typedef struct { char *p; size_t n, cap; } Str;
-static void s_reserve(Str *s, size_t extra){
-    if(s->n + extra + 1 <= s->cap) return;
-    size_t c = s->cap ? s->cap : 256;
-    while(c < s->n + extra + 1) c *= 2;
-    s->p = (char*)realloc(s->p, c); s->cap = c;
-}
-static void s_add(Str *s, const char *b, size_t n){
-    s_reserve(s, n); memcpy(s->p + s->n, b, n); s->n += n; s->p[s->n] = 0;
-}
-static void s_cat(Str *s, const char *z){ s_add(s, z, strlen(z)); }
-static void s_fmt(Str *s, const char *fmt, ...){
-    va_list ap; va_start(ap, fmt);
-    char tmp[4096];
-    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
-    va_end(ap);
-    if(n > 0) s_add(s, tmp, (size_t)(n < (int)sizeof tmp ? n : (int)sizeof tmp - 1));
-}
-static void s_free(Str *s){ free(s->p); s->p = NULL; s->n = s->cap = 0; }
-
-/* JSON string escaping. Control characters MUST be escaped or the client's parser rejects the
- * whole SSE frame — and a model emitting a raw newline inside a delta is the normal case. */
-static void s_json(Str *s, const char *z, size_t n){
-    s_reserve(s, n*6 + 2);
-    s_add(s, "\"", 1);
-    for(size_t i = 0; i < n; i++){
-        const unsigned char c = (unsigned char)z[i];
-        switch(c){
-            case '"':  s_cat(s, "\\\""); break;
-            case '\\': s_cat(s, "\\\\"); break;
-            case '\n': s_cat(s, "\\n");  break;
-            case '\r': s_cat(s, "\\r");  break;
-            case '\t': s_cat(s, "\\t");  break;
-            case '\b': s_cat(s, "\\b");  break;
-            case '\f': s_cat(s, "\\f");  break;
-            default:
-                if(c < 0x20) s_fmt(s, "\\u%04x", c);
-                else         s_add(s, (const char*)&c, 1);
-        }
-    }
-    s_add(s, "\"", 1);
-}
-
-static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
-    return t.tv_sec + 1e-9*t.tv_nsec; }
+/* The tool half of the agent loop. It needs Str, s_json and now(), which is why it is included
+ * here and not at the top with the rest. */
+#include "harness.h"
 
 /* ---------------- global engine state ---------------- */
 
@@ -682,9 +640,11 @@ static void handle_chat(int fd, const char *body, size_t blen){
         }
         s_fmt(&out, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
                     "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],"
-                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n"
+                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
+                    "\"prompt_tokens_cached\":%d,\"prefill_s\":%.3f,\"decode_s\":%.3f}}\n\n"
                     "data: [DONE]\n\n",
-                    g.id, g.created, g_model_name, finish, np, ngen, np + ngen);
+                    g.id, g.created, g_model_name, finish, np, ngen, np + ngen,
+                    reused, t_pre, t_dec);
         sock_write(fd, out.p, out.n);
     } else {
         s_fmt(&out, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\","
@@ -705,8 +665,9 @@ static void handle_chat(int fd, const char *body, size_t blen){
             s_cat(&out, "]");
         }
         s_fmt(&out, "},\"finish_reason\":\"%s\"}],"
-                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                    finish, np, ngen, np + ngen);
+                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
+                    "\"prompt_tokens_cached\":%d,\"prefill_s\":%.3f,\"decode_s\":%.3f}}",
+                    finish, np, ngen, np + ngen, reused, t_pre, t_dec);
         http_send(fd, 200, "OK", "application/json", out.p, out.n);
     }
     s_free(&out);
@@ -864,6 +825,10 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             else     http_err(fd, 404, "Not Found", "no web UI was loaded (see --www)");
         }
         else if(path_is(path, "/v1/models") || path_is(path, "/models")) handle_models(fd);
+        else if(path_is(path, "/v1/tools")  || path_is(path, "/tools")){
+            Str b = {0}; h_tools_json(&b);
+            http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
+        }
         else if(path_is(path, "/health") || path_is(path, "/v1/health"))  handle_health(fd);
         else http_err(fd, 404, "Not Found", "no such path");
         s_free(&req); return 0;
@@ -876,8 +841,24 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             engine_submit(fd, req.p + hdr_end, clen);
             s_free(&req);
             return 1;                    /* the engine thread owns fd now */
+        } else if(path_is(path, "/v1/tools/exec") || path_is(path, "/tools/exec")){
+            /* Deliberately NOT on the engine thread. A tool call holds no model state, so
+             * running it here lets the page fetch, list and grep while a generation streams —
+             * and a `make` that takes two minutes does not stall the engine queue behind it. */
+            Str b = {0};
+            char *body = strndup(req.p + hdr_end, clen);
+            if(g_verbose){
+                char *arena = NULL; jval *r = json_parse(body, &arena);
+                fprintf(stderr, "  tool %s\n", r ? a_str(r, "name", "?") : "?");
+                free(arena);
+            }
+            h_exec_json(&b, body ? body : "{}");
+            free(body);
+            http_send(fd, 200, "OK", "application/json", b.p, b.n);
+            s_free(&b);
         } else {
-            http_err(fd, 404, "Not Found", "only /v1/chat/completions is implemented");
+            http_err(fd, 404, "Not Found",
+                     "POST is /v1/chat/completions or /v1/tools/exec");
         }
         s_free(&req); return 0;
     }
@@ -927,7 +908,7 @@ static char *read_file(const char *p, size_t *len){
 }
 
 int main(int argc, char **argv){
-    const char *path = NULL, *host = "127.0.0.1", *www = NULL;
+    const char *path = NULL, *host = "127.0.0.1", *www = NULL, *workspace = NULL;
     /* 8192, not 32768. The KV tier is sized from n_ctx and the engine already holds 9.3 GiB
      * of resident weights; at 32768 the process reached 14.5 GiB RSS on a 31 GiB machine and
      * was OOM-killed mid-request. The context still GROWS past this — kvt_grow raises it on
@@ -943,21 +924,68 @@ int main(int argc, char **argv){
         else if(!strcmp(a,"--api-key") && i+1 < argc) g_api_key = argv[++i];
         else if(!strcmp(a,"--name") && i+1 < argc) g_model_name = argv[++i];
         else if(!strcmp(a,"--cpu")) cpu_only = 1;
+        else if(!strcmp(a,"--workspace") && i+1 < argc) workspace = argv[++i];
+        else if(!strcmp(a,"--tools") && i+1 < argc){
+            if(!h_mode_parse(argv[++i], &g_tmode)){
+                fprintf(stderr, "--tools: expected off | ro | workspace | full\n"); return 1; }
+        }
+        else if(!strcmp(a,"--tool-timeout") && i+1 < argc) g_ttmo = atoi(argv[++i]);
+        else if(!strcmp(a,"--tool-output")  && i+1 < argc) g_tmax = (size_t)atol(argv[++i]);
         else if(!strcmp(a,"--quiet")) g_verbose = 0;
         else if(!strcmp(a,"-h") || !strcmp(a,"--help")){
             fprintf(stderr,
                 "usage: %s <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 8192]\n"
-                "          [--www webui.html] [--api-key KEY] [--name ID] [--cpu] [--quiet]\n\n"
-                "  --ctx N   INITIAL context, not a limit. It grows on demand and stops\n"
-                "            only at the memory floor (COLIBRI_MEM_FLOOR_GB, 2 GiB).\n\n"
+                "          [--www webui.html] [--api-key KEY] [--name ID] [--cpu] [--quiet]\n"
+                "          [--tools MODE] [--workspace DIR] [--tool-timeout MS] [--tool-output N]\n\n"
+                "  --ctx N        INITIAL context, not a limit. It grows on demand and stops\n"
+                "                 only at the memory floor (COLIBRI_MEM_FLOOR_GB, 2 GiB).\n"
+                "  --tools MODE   what the agent may do. The default is `workspace`.\n"
+                "                   off        no tools at all; a plain chat server\n"
+                "                   ro         read, grep, glob, list — nothing that writes\n"
+                "                   workspace  also write, confined to --workspace;\n"
+                "                              a shell command needs a human to approve it\n"
+                "                   full       everything, anywhere, unapproved\n"
+                "  --workspace D  the root the agent works in (default: the current directory).\n"
+                "                 Paths are resolved with realpath before they are compared to\n"
+                "                 it, so ..  and symlinks cannot leave it.\n\n"
                 "  GET  /                     the chat UI\n"
                 "  GET  /v1/models            model list\n"
+                "  GET  /v1/tools             tool schemas + policy + the agent system prompt\n"
                 "  POST /v1/chat/completions  OpenAI-compatible, streaming and not\n"
+                "  POST /v1/tools/exec        run one tool  {name, arguments, approved}\n"
                 "  GET  /health               engine status\n", argv[0]);
             return 0;
         }
     }
     if(!path){ fprintf(stderr, "qwen35_server: no model given (-h for usage)\n"); return 1; }
+
+    /* The workspace is resolved ONCE, here, and every path a tool is handed is compared to the
+     * result. Resolving it per call would let a symlink swapped in mid-session change what
+     * "inside" means. */
+    if(!workspace) workspace = ".";
+    if(!realpath(workspace, g_root)){
+        fprintf(stderr, "--workspace %s: %s\n", workspace, strerror(errno)); return 1; }
+    { struct stat ws; if(stat(g_root, &ws) || !S_ISDIR(ws.st_mode)){
+        fprintf(stderr, "--workspace %s is not a directory\n", g_root); return 1; } }
+
+    /* FAIL CLOSED. Tools on a non-loopback address with no key is remote code execution on
+     * this machine for anyone who can route to the port — and `full` is that for anyone at
+     * all. Refusing to start is the only honest answer; a warning printed above a running
+     * server is one nobody reads. */
+    const int loopback = !strncmp(host, "127.", 4) || !strcmp(host, "localhost");
+    if(g_tmode != TM_OFF && !loopback && !g_api_key){
+        fprintf(stderr,
+            "\n  refusing to start: --tools %s on %s with no --api-key.\n"
+            "  Anything that can reach %s:%d could run commands here. Pick one:\n"
+            "    --api-key KEY   require a key, or\n"
+            "    --tools off     serve chat only, or\n"
+            "    --host 127.0.0.1\n\n", h_mode_name(), host, host, port);
+        return 1;
+    }
+    if(g_tmode == TM_FULL)
+        fprintf(stderr, "\n  ** --tools full: no path confinement and no approval. The agent can\n"
+                        "     run and change anything this user can. **\n");
+
     fix_omp_env(argv);
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);
@@ -1066,6 +1094,7 @@ int main(int argc, char **argv){
         "    model    %s  (%d layers, ctx from %d and growing, %s)\n"
         "    web UI   http://%s:%d/\n"
         "    API      http://%s:%d/v1   (OpenAI-compatible)\n"
+        "    tools    %s in %s\n"
         "    opencode  point a provider at the /v1 URL above; any api key works%s\n\n",
         g_model_name, c->n_layer, g_n_ctx,
 #ifndef COLIBRI_NO_CUDA
@@ -1073,7 +1102,8 @@ int main(int argc, char **argv){
 #else
         "cpu",
 #endif
-        host, port, host, port, g_api_key ? " except this one, which is required" : "");
+        host, port, host, port, h_mode_name(), g_root,
+        g_api_key ? " except this one, which is required" : "");
 
     { pthread_t eng; pthread_create(&eng, NULL, engine_thread, NULL); pthread_detach(eng); }
 
