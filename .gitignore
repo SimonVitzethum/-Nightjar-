@@ -39,7 +39,7 @@ c/glm_tiny_i4/
 c/glm_tiny_mix/
 c/glm_bench_medium/
 c/bench/
-
+/models
 # pesi modello / artefatti di run
 *.safetensors
 stats*.txt
@@ -60,3 +60,12 @@ c/backend_metal_test
 c/tests/test_tier
 c/mio_env/
 c/bench/
+
+# ---- qwen3.5 engine build output ----
+c/qwen35_run
+c/qwen35_server
+c/qwen35_cuda.o
+c/server.log
+c/tests/*
+!c/tests/*.c
+!c/tests/*.py
