@@ -88,10 +88,23 @@ typedef struct {
     double    t_copy;
 } Q35Cache;
 
+/* NOT pinned by default, and that is a deliberate reversal.
+ *
+ * Pinned pages copy at 27.7 GB/s instead of 6.8, so a 422 MiB checkpoint moves in 15 ms
+ * rather than 62. Against a prefill it saves — 150 seconds and up — those 47 ms are noise.
+ * What pinning does cost is real: the pages become unswappable, and this cache sits on top of
+ * 9.3 GiB of already-pinned weights. Measured, 2.95 GiB of pinned cache on a 31 GiB machine
+ * drove it into swap and the server was OOM-killed mid-request — silently, with no error
+ * anywhere, because the kernel does not ask.
+ *
+ * A cache that occasionally kills the process is worse than a cache that copies four times
+ * slower. COLIBRI_CACHE_PIN=1 restores the old behaviour for a machine with room. */
 static void *q35_cache_alloc(Q35Cache *C, size_t n){
 #ifndef COLIBRI_NO_CUDA
-    if(C->gpu){
-        void *p = q35cu_host_alloc(n);      /* pinned: 27.7 GB/s instead of 6.8 */
+    static int want = -1;
+    if(want < 0){ const char *e = getenv("COLIBRI_CACHE_PIN"); want = (e && *e && *e != '0'); }
+    if(C->gpu && want){
+        void *p = q35cu_host_alloc(n);
         if(p){ C->pinned = 1; return p; }
     }
 #endif
@@ -134,7 +147,7 @@ static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spac
 
     /* Budget-driven rather than count-driven: a checkpoint's size depends on the KV window,
      * so "six slots" means very different things at 4k and at 32k. */
-    double gb = 3.0;
+    double gb = 1.5;
     { const char *e = getenv("COLIBRI_CACHE_GB"); if(e) gb = atof(e); }
     { const char *e = getenv("COLIBRI_CACHE_SLOTS"); if(e) slots = atoi(e); else slots = 64; }
     const size_t per = C->s_bytes + C->c_bytes + C->kv_bytes;
@@ -143,7 +156,11 @@ static int q35_cache_init(Q35Cache *C, Q35State *R, void *G, int slots, int spac
     if(slots > by_budget) slots = by_budget;
     /* Never take the machine under its floor: an evicted FFN costs far more than any
      * re-prefill this saves. */
-    while(slots > 0 && !q35_mem_room((int64_t)slots*(int64_t)per)) slots--;
+    /* Ask for TWICE what will be used. q35_mem_room measures MemAvailable, which counts
+     * reclaimable page cache — and this allocation is the thing that stops it being
+     * reclaimable, so the honest question is whether there is room to spare, not room to
+     * fit exactly. */
+    while(slots > 0 && !q35_mem_room(2*(int64_t)slots*(int64_t)per)) slots--;
 
     C->n_slots = slots; C->spacing = spacing;
     if(slots){

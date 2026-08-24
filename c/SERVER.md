@@ -68,8 +68,13 @@ nur die Differenz. Im Log steht, wie viel wiederverwendet wurde:
    42 prompt (22 cached) in ...
 ```
 
-Fällt der Cache aus, wird der Zustand komplett neu aufgebaut — ein teilweises Zurückspulen
-gibt es nicht. Das ist keine Bequemlichkeit: 48 der 64 Schichten sind Gated DeltaNet, deren
+Die Prüfpunkte sind **selbsttragend**: jeder hält den rekurrenten Zustand *und* den
+Trunk-KV seines eigenen Präfixes und wird gegen seine eigene Tokenfolge geprüft, nicht gegen
+das, was zuletzt lief. Deshalb überlebt ein langer Agenten-Prompt den kurzen Title-Request,
+den opencode dazwischenschiebt — vorher hat der alles entwertet.
+
+Fällt der Cache trotzdem aus, wird der Zustand komplett neu aufgebaut — ein teilweises
+Zurückspulen gibt es nicht. Das ist keine Bequemlichkeit: 48 der 64 Schichten sind Gated DeltaNet, deren
 Zustand bei jedem Schritt gedämpft und rang-1-aktualisiert wird. Diese Operation ist nicht
 invertierbar. Der Attention-KV allein ließe sich abschneiden, der rekurrente Teil nicht.
 
@@ -84,7 +89,10 @@ einen zweiten 146-MiB-Zustand und ein zweites KV-Fenster; dafür ist auf dieser 
 
 | Variable | Default | Wirkung |
 |---|---|---|
-| `COLIBRI_CUDA_STREAM` | `0.60` | Anteil jeder nicht-residenten FFN-Schicht, den die GPU über PCIe zieht. Auf dieser Maschine gemessenes Optimum. |
+| `COLIBRI_CUDA_STREAM` | `0.60` | Anteil jeder nicht-residenten FFN-Schicht, den die GPU beim **Decode** über PCIe zieht. |
+| `COLIBRI_CUDA_STREAM_PREFILL` | `0.85` | Dasselbe für **Batch-Arbeit**. Höher, weil ein Batch jedes Gewicht S-mal benutzt: die CPU-Seite amortisiert ihre Dekodierkosten, die Buskosten pro Byte bleiben gleich. Nicht 1,0 — die GPU-Seite ist eine DMA und bei f=1 dauert ein Batch 400 ms statt 339. |
+| `COLIBRI_CACHE_GB` | `3.0` | Speicher für Präfix-Prüfpunkte. Jeder hält den rekurrenten Zustand plus den Trunk-KV seines Präfixes und ist damit unabhängig von allem, was dazwischen lief. |
+| `COLIBRI_CACHE_SPACING` | `512` | Abstand der Prüfpunkte in Token. Bestimmt, wie viel im schlimmsten Fall neu gerechnet wird. |
 | `COLIBRI_CUDA_KV_TOK` | `8192` | Obergrenze des KV-Fensters im VRAM. Größer lohnt erst jenseits ~24k Kontext — davor sind residente FFN-Schichten mehr wert (§7.8 im Plan.md). |
 | `COLIBRI_CUDA_FFN_GB` | auto | Deckel für residente FFN-Schichten. |
 | `COLIBRI_KV_SPILL` | `../../kvspill` | Auslagerungspfad des kalten KV-Tiers. **Nicht auf tmpfs zeigen lassen** — das legt den „Disk"-Tier zurück in genau den RAM, den er freimachen soll. |
