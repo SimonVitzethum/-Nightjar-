@@ -177,6 +177,11 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
 
 /* ---------- pre-tokenizer regex (pattern cl100k) su una porzione di testo ----------
  * Decodifica i codepoint, applica le alternative IN ORDINE, e per ogni pezzo chiama bpe_piece. */
+/* Which pre-tokenizer variant. 0 = cl100k (the GLM path), 1 = qwen35. Set from
+ * tokenizer.ggml.pre; see tok_set_pre. */
+static int g_tok_qwen35 = 0;
+static inline int is_LM(uint32_t c){ return is_L(c) || is_M(c); }
+
 static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
@@ -194,16 +199,33 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 if((d=='r'&&d2=='e')||(d=='v'&&d2=='e')||(d=='l'&&d2=='l')){ i+=3; bpe_piece(T,p,off[start],off[i],out,no,max); continue; } }
             if(d=='s'||d=='t'||d=='m'||d=='d'){ i+=2; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         }
-        /* 2) [^\r\n\p{L}\p{N}]? \p{L}+ */
+        /* 2) [^\r\n\p{L}\p{N}]? \p{L}+     (qwen35: [\p{L}\p{M}]+)
+         *
+         * The two places the qwen35 pre-tokenizer differs from cl100k are here and in (3).
+         * Both are silent when wrong: text still tokenizes, just into different pieces than
+         * the model was trained on, so the output degrades without ever failing. */
         {
             int j=i;
-            if(!is_L(c) && !ISNL(c) && !is_N(c)){ if(j+1<n && is_L(cp[j+1])) j++; else j=-1; }
+            const int letter = g_tok_qwen35 ? is_LM(c) : is_L(c);
+            if(!letter && !ISNL(c) && !is_N(c)){
+                const int nxt = (j+1<n) && (g_tok_qwen35 ? is_LM(cp[j+1]) : is_L(cp[j+1]));
+                if(nxt) j++; else j=-1;
+            }
             if(j>=0){
-                if(is_L(cp[j])){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+                const int here = g_tok_qwen35 ? is_LM(cp[j]) : is_L(cp[j]);
+                if(here){
+                    if(g_tok_qwen35) while(j<n && is_LM(cp[j])) j++;
+                    else             while(j<n && is_L(cp[j]))  j++;
+                    i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+                }
             }
         }
-        /* 3) \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 3) \p{N}{1,3}     (qwen35: \p{N}, one digit at a time) */
+        if(is_N(c)){
+            int j=i,k=0; const int lim = g_tok_qwen35 ? 1 : 3;
+            while(j<n && is_N(cp[j]) && k<lim){ j++; k++; }
+            i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+        }
         /* 4) ' ?[^\s\p{L}\p{N}]+[\r\n]*' */
         {
             int j=i;
