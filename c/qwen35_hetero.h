@@ -582,6 +582,7 @@ static Q35Slice q35cu_slice(const Q35Cu *G, const Q35Layer *L, double f){
  * this one's. */
 static void q35cu_stream_issue(Q35Cu *G, int il, int half){
     uint8_t *dst = G->stage + (int64_t)half*(G->stage_bytes/2);
+    q35cu_copy_join(half);        /* do not overwrite a half whose gemms are still running */
     Q35Slice *S = (Q35Slice*)&G->slice[half];
     const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
     const Q35Layer *L = &M->L[il];
@@ -628,6 +629,7 @@ static int q35cu_ffn_split(Q35Cu *G, int il, const float *xn_dev, float *out_dev
     q35cu_gemv(G->su, xn_dev, base + gb,       L->ffn_up->type,   Dm, r);
     q35cu_swiglu(G->sg, G->su, r);
     q35cu_gemv(out_dev, G->sg, base + 2*gb,    L->ffn_down->type, r, Dm);
+    q35cu_compute_mark(half);     /* this half is free once these have run */
 
     /* the CPU half runs NOW, against the GPU and against the next layer's DMA */
     const double tc = q35_clk();

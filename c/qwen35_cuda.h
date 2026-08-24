@@ -64,6 +64,8 @@ int  q35cu_h2d_2d_async(void *dst, size_t dpitch, const void *src, size_t spitch
                         size_t width, size_t height);
 void q35cu_copy_mark(int slot);
 void q35cu_stream_join(int slot);
+void q35cu_compute_mark(int slot);
+void q35cu_copy_join(int slot);
 int  q35cu_d2h_compute(void *d, const void *s, size_t n);                 /* wait for the copy stream only */
 int q35cu_sync(void);                      /* wait for the compute stream */
 int q35cu_zero(void *p, size_t n);

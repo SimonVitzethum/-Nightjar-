@@ -1107,7 +1107,8 @@ extern "C" int q35cu_h2d_2d_async(void *dst, size_t dpitch, const void *src, siz
  * host blocked here it would stop computing the CPU's half of the same layer, which is the
  * whole point. cudaStreamWaitEvent makes the dependency a GPU-side one and returns instantly. */
 #define NCPEV 4
-static cudaEvent_t g_cpev[NCPEV];
+static cudaEvent_t g_cpev[NCPEV];     /* copy done  -> compute may read  */
+static cudaEvent_t g_csev[NCPEV];     /* compute done -> copy may overwrite */
 extern "C" void q35cu_copy_mark(int slot){
     if(slot < 0 || slot >= NCPEV) return;
     if(!g_cpev[slot]) cudaEventCreateWithFlags(&g_cpev[slot], cudaEventDisableTiming);
@@ -1116,4 +1117,24 @@ extern "C" void q35cu_copy_mark(int slot){
 extern "C" void q35cu_stream_join(int slot){
     if(slot < 0 || slot >= NCPEV || !g_cpev[slot]) return;
     cudaStreamWaitEvent(g_s, g_cpev[slot], 0);
+}
+
+/* The other half of the double buffer, and the one that was missing.
+ *
+ * A staging half is written by the copy stream and read by the compute stream. Making compute
+ * wait for the copy is obvious and was there. Making the COPY wait for compute is not, and
+ * without it the host can issue the next layer's DMA into a half whose gemms are still
+ * running — the weights change underneath a kernel that is mid-flight.
+ *
+ * It is timing-dependent, so it hides: at a 104 MiB slice the DMA was slow enough that the
+ * gemms had always finished, and at 145 MiB it was not. The symptom was a batch that
+ * disagreed with sequential decode by 1e-1 while still producing fluent text. */
+extern "C" void q35cu_compute_mark(int slot){
+    if(slot < 0 || slot >= NCPEV) return;
+    if(!g_csev[slot]) cudaEventCreateWithFlags(&g_csev[slot], cudaEventDisableTiming);
+    cudaEventRecord(g_csev[slot], g_s);
+}
+extern "C" void q35cu_copy_join(int slot){
+    if(slot < 0 || slot >= NCPEV || !g_csev[slot]) return;
+    cudaStreamWaitEvent(g_cp, g_csev[slot], 0);
 }

@@ -52,7 +52,7 @@ CUHDRS = qwen35_cuda.h qwen35_hetero.h qwen35_cu_spec.h
 CPU_TESTS = tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
             tests/qwen35_batch_test tests/qwen35_mtp_test tests/qwen35_sparsity_test
 CU_TESTS  = tests/qwen35_cuda_test tests/qwen35_hetero_test tests/qwen35_cu_fwd_test \
-            tests/qwen35_cu_spec_test
+            tests/qwen35_cu_spec_test tests/qwen35_cu_split_test
 
 ifeq ($(HAVE_CUDA),1)
 ALL = qwen35_cuda.o $(CPU_TESTS) $(CU_TESTS) qwen35_run qwen35_server
@@ -95,15 +95,18 @@ test: all
 #  1. every device kernel vs its CPU counterpart, scored against the POPULATION RMS
 #  2. every layer kind vs the CPU reference, including the recurrent state itself
 #  3. the whole model, CPU and GPU, must both print 11751 ' Paris' at p ~ 0.606
-#  4. a batch must reproduce sequential decode, and greedy speculation must reproduce
-#     greedy decode TOKEN FOR TOKEN — otherwise the rollback is wrong
+#  4. a batch must reproduce sequential decode at EVERY batch width the engine emits,
+#     not just the one speculation happens to use
+#  5. greedy speculation must reproduce greedy decode TOKEN FOR TOKEN — otherwise the
+#     rollback is wrong
 gates: all
 	@mkdir -p "$(KV_SPILL)"
 	@echo "=== 1. device kernels ==="   && ./tests/qwen35_cuda_test "$(MODEL)"
 	@echo "=== 2. layers ==="           && ./tests/qwen35_hetero_test "$(MODEL)"
 	@echo "=== 3a. cpu forward ==="     && ./tests/qwen35_fwd_test "$(MODEL)" 760,6511,314,9338,369 | tail -14
 	@echo "=== 3b. gpu forward ==="     && ./tests/qwen35_cu_fwd_test "$(MODEL)" 760,6511,314,9338,369 | tail -14
-	@echo "=== 4. batch + speculation ===" && ./tests/qwen35_cu_spec_test "$(MODEL)" 24
+	@echo "=== 4. batch width, every S ===" && ./tests/qwen35_cu_split_test "$(MODEL)"
+	@echo "=== 5. batch + speculation ===" && ./tests/qwen35_cu_spec_test "$(MODEL)" 24
 
 # Interactive. qwen35_run sets the OpenMP environment itself and re-execs once — measured
 # worth 20%, and libgomp reads those variables before main() could set them.

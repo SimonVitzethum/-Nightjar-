@@ -48,6 +48,7 @@ typedef struct {
     /* pinned host staging for the FFN hand-off */
     float *hxnB, *htB;
     float *hgB, *huB;            /* [S][d_ff] for the CPU half of a split layer */
+    float *stB;                  /* [S][d_model] device landing zone for the CPU's partial */
 
     /* the CPU's batched FFN scratch (kq_gemm_batched lives behind it) */
     Q35Batch B;
@@ -80,10 +81,12 @@ static int q35cu_batch_init(Q35CuBatch *Z, Q35Cu *G, Q35State *R, int S_max){
 
     Z->hxnB = (float*)q35cu_host_alloc(D*4);
     Z->htB  = (float*)q35cu_host_alloc(D*4);
+    Z->stB  = (float*)q35cu_alloc(D*4);
+    Z->vram += (int64_t)D*4;
     Z->hgB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
     Z->huB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
     if(!Z->xB || !Z->xnB || !Z->tB || !Z->logitsB || !Z->snapS || !Z->snapConv
-       || !Z->hxnB || !Z->htB || !Z->hgB || !Z->huB
+       || !Z->hxnB || !Z->htB || !Z->hgB || !Z->huB || !Z->stB
        || (G->n_ffn_gpu && (!Z->gB || !Z->uB))){
         fprintf(stderr, "qwen35_cu_spec: out of memory (%s)\n", q35cu_error());
         return 0;
@@ -92,7 +95,7 @@ static int q35cu_batch_init(Q35CuBatch *Z, Q35Cu *G, Q35State *R, int S_max){
 }
 
 static void q35cu_batch_free(Q35CuBatch *Z){
-    void *p[] = { Z->xB, Z->xnB, Z->tB, Z->gB, Z->uB, Z->logitsB, Z->snapS, Z->snapConv };
+    void *p[] = { Z->xB, Z->xnB, Z->tB, Z->gB, Z->uB, Z->logitsB, Z->snapS, Z->snapConv, Z->stB };
     for(unsigned i = 0; i < sizeof p/sizeof *p; i++) q35cu_free(p[i]);
     q35cu_host_free(Z->hxnB); q35cu_host_free(Z->htB);
     q35cu_host_free(Z->hgB);  q35cu_host_free(Z->huB);
@@ -135,6 +138,7 @@ static int q35cu_ffn_split_b(Q35CuBatch *Z, int il, const float *xnB, float *tB,
     q35cu_gemm(Z->uB, xnB, base + gb,    L->ffn_up->type,   Dm, r, S);
     q35cu_swiglu(Z->gB, Z->uB, S*r);
     q35cu_gemm(tB, Z->gB, base + 2*gb,   L->ffn_down->type, r, Dm, S);
+    q35cu_compute_mark(half);     /* this half is free once these have run */
 
     /* CPU half, concurrent with all of that */
     const double tc = q35_clk();
@@ -164,8 +168,14 @@ static int q35cu_ffn_split_b(Q35CuBatch *Z, int il, const float *xnB, float *tB,
     }
     G->t_cpu_side += q35_clk() - tc;
 
-    q35cu_h2d(Z->xnB, Z->htB, (size_t)S*Dm*4);      /* xnB is free here: tB is the target */
-    q35cu_add(tB, Z->xnB, S*Dm);
+    /* NOT into xnB. xnB is this layer's INPUT and the gate/up gemms above are still reading
+     * it on the compute stream while the host runs the CPU half — a synchronous h2d into it
+     * is a race, and it lands differently depending on how long the CPU half takes. Measured:
+     * exact at S=2 and wrong by 1e-1 at S=4 and S=8, which reads like "batching is broken"
+     * and is really "the input buffer was overwritten mid-flight". The single-token path
+     * always used a dedicated buffer; this one has one now too. */
+    q35cu_h2d(Z->stB, Z->htB, (size_t)S*Dm*4);
+    q35cu_add(tB, Z->stB, S*Dm);
     return 1;
 }
 
