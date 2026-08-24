@@ -206,7 +206,7 @@ static void q35_cache_kv(Q35Cache *C, Q35Ckpt *k, int save){
 #ifndef COLIBRI_NO_CUDA
     if(!C->gpu || !k->kv || !C->kv_bytes) return;
     const Q35Cu *G = C->G;
-    const size_t n = (size_t)k->pos*C->kv_stride;      /* bytes of one layer's prefix */
+    const size_t n = q35_len(k->pos, "checkpoint pos")*C->kv_stride;
     for(int l = 0; l < C->kv_layers; l++){
         const size_t lane = (size_t)l*(size_t)C->kv_win*C->kv_stride;
         uint8_t *hk = k->kv + 2u*lane, *hv = hk + (size_t)C->kv_win*C->kv_stride;
@@ -230,7 +230,7 @@ static void q35_cache_grab(Q35Cache *C, Q35Ckpt *k){
     } else
 #endif
     { memcpy(k->S, C->R->S, C->s_bytes); memcpy(k->conv, C->R->conv, C->c_bytes); }
-    memcpy(k->toks, C->ctx, sizeof(int)*(size_t)k->pos);
+    memcpy(k->toks, C->ctx, sizeof(int)*q35_len(k->pos, "checkpoint pos"));
     C->t_copy += q35_clk() - t0;
 }
 
@@ -250,7 +250,7 @@ static void q35_cache_put_back(Q35Cache *C, Q35Ckpt *k){
         C->ctx_cap = k->pos + 4096;
         C->ctx = (int*)realloc(C->ctx, sizeof(int)*(size_t)C->ctx_cap);
     }
-    memcpy(C->ctx, k->toks, sizeof(int)*(size_t)k->pos);
+    memcpy(C->ctx, k->toks, sizeof(int)*q35_len(k->pos, "checkpoint pos"));
     C->t_copy += q35_clk() - t0;
 }
 

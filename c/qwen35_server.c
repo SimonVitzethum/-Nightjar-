@@ -190,7 +190,7 @@ static void http_send(int fd, int code, const char *status, const char *ctype,
     const int n = snprintf(head, sizeof head,
         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
         CORS "Connection: close\r\n\r\n", code, status, ctype, blen);
-    sock_write(fd, head, (size_t)n);
+    if(n > 0) sock_write(fd, head, (size_t)n);   /* snprintf returns <0 on error */
     if(blen) sock_write(fd, body, blen);
 }
 static void http_err(int fd, int code, const char *status, const char *msg){
@@ -914,6 +914,7 @@ static char *read_file(const char *p, size_t *len){
     FILE *f = fopen(p, "rb");
     if(!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if(n < 0){ fclose(f); return NULL; }        /* ftell returns -1 on error */
     char *b = (char*)malloc((size_t)n + 1);
     if(!b || fread(b, 1, (size_t)n, f) != (size_t)n){ free(b); fclose(f); return NULL; }
     b[n] = 0; *len = (size_t)n; fclose(f);

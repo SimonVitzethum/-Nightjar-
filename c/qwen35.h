@@ -425,6 +425,28 @@ static void q35_oom(const char *what, int64_t bytes){
 }
 
 /* malloc that either succeeds or ends the process. Used for anything on the growth path. */
+/* A LENGTH IS NEVER NEGATIVE, AND size_t DOES NOT KNOW THAT.
+ *
+ * Casting a negative int to size_t yields ~1.8e19, and memcpy, malloc and cudaMemcpy will all
+ * accept it. The engine uses -1 as "empty" in several places — an unassigned checkpoint, a
+ * layer's slot index when it is not that kind of layer — so the sentinel and the length share
+ * a type and the conversion is silent. One instance of this segfaulted inside libc with no
+ * message, ~512 tokens into a prefill.
+ *
+ * Anywhere a position or a count becomes a size, it goes through here. The cost is a
+ * predictable branch; what it buys is that the sentinel can never become 18 exabytes. */
+static size_t q35_len(int64_t n, const char *what){
+    if(n < 0){
+        char b[192];
+        const int k = snprintf(b, sizeof b,
+            "qwen35: %s is %lld — a negative length would become 1.8e19 as size_t\n",
+            what ? what : "length", (long long)n);
+        if(k > 0) { ssize_t w = write(2, b, (size_t)k); (void)w; }
+        abort();
+    }
+    return (size_t)n;
+}
+
 static void *q35_xalloc(size_t n, const char *what){
     void *p = malloc(n);
     if(!p) q35_oom(what, (int64_t)n);

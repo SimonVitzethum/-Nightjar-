@@ -227,8 +227,11 @@ static void q35_gdn_b(Q35Batch *B, const Q35Layer *L, int il, const float *xn, f
     q35_mm(beta_all,  xn, B->M, L->w_beta,  S);
     q35_mm(alpha_all, xn, B->M, L->w_alpha, S);
 
-    float *cs   = R->conv + (size_t)slot*K1*cd;
-    float *Sall = R->S + (size_t)slot*nv*dk*dv;
+    /* gdn_slot is -1 for an attention layer; the dispatch guarantees we are not one, and
+     * this makes that guarantee checked rather than assumed. */
+    const size_t sl = q35_len(slot, "gdn slot");
+    float *cs   = R->conv + sl*K1*cd;
+    float *Sall = R->S + sl*nv*dk*dv;
     const float qscale = 1.0f/sqrtf((float)dk);
 
     for(int s = 0; s < S; s++){
