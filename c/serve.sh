@@ -11,7 +11,31 @@ ENGINE_HOME="${ENGINE_HOME:-$HOME/QwenEngine}"
 LOG="${LOG:-$ENGINE_HOME/logs/server.log}"
 KV_SPILL="${KV_SPILL:-$ENGINE_HOME/kvspill}"
 
+# Kill the agent's own Firefox, and NOTHING ELSE that is a Firefox.
+#
+# Deliberately not `pkill -f -- --profile .../browser/profile`: -f matches any command line
+# CONTAINING the pattern, which includes the shell running this script. That has already cost
+# this project two self-inflicted kills. pgrep -x matches the process NAME, so the shell is
+# never a candidate, and the profile path is then checked from /proc.
+stop_browser() {
+    for p in $(pgrep -x firefox 2>/dev/null); do
+        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "$ENGINE_HOME/browser/profile"; then
+            kill -9 "$p" 2>/dev/null
+        fi
+    done
+    rm -f "$ENGINE_HOME/browser/firefox.pid" 2>/dev/null
+}
+
+if [ "${1:-}" = "stop" ]; then
+    pkill -x qwen35_server 2>/dev/null && echo "stopped" || echo "not running"
+    stop_browser
+    exit 0
+fi
+
 pkill -x qwen35_server 2>/dev/null   # -x: match the process NAME, not any command line containing it
+# A Firefox left over from a crashed server holds the listening socket it inherited, and then
+# nothing named qwen35_server is running while the port is still bound.
+stop_browser
 
 # Wait for the PROCESS to be gone, not for the port to be free. The port is released before
 # the CUDA context is, and this is not a theoretical gap: starting on a released port while

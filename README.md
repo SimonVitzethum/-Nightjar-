@@ -54,7 +54,7 @@ make serve                              # http://127.0.0.1:8080/
 make serve PORT=9000                    # another port
 make serve CTX=16384                    # larger FIRST allocation — see below
 make serve MODEL=/path/to/other.gguf    # another model — see below
-make stop                               # stop it
+make stop                               # stop it — engine AND the headless Firefox it started
 make serve                              # restarting is just serve again; it waits for the
                                         # old instance to release the port AND the CUDA context
 ```

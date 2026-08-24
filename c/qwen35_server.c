@@ -1234,7 +1234,10 @@ int main(int argc, char **argv){
     g_ui = read_file(www, &g_ui_len);
     if(!g_ui) fprintf(stderr, "  note: no web UI at %s — the API still works\n", www);
 
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    /* SOCK_CLOEXEC, not a bare socket(). Everything this server forks — a shell command, a
+     * whole Firefox — inherits its descriptors otherwise, and a child holding the listening
+     * socket keeps the port bound long after the server is gone. */
+    int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
@@ -1265,7 +1268,7 @@ int main(int argc, char **argv){
 
     while(!g_abort){
         struct sockaddr_in ca; socklen_t cl = sizeof ca;
-        const int fd = accept(srv, (struct sockaddr*)&ca, &cl);
+        const int fd = accept4(srv, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
         if(fd < 0){ if(errno == EINTR) continue; break; }
         int nodelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);

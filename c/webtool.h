@@ -171,6 +171,12 @@ static void web_stop(void){
         kill(-g_ff_pid, SIGKILL);
         waitpid(g_ff_pid, NULL, WNOHANG);
         g_ff_pid = 0;
+        if(g_ff_prof[0]){
+            char pf[PATH_MAX];
+            snprintf(pf, sizeof pf, "%.*s/firefox.pid",
+                     (int)(strrchr(g_ff_prof, '/') - g_ff_prof), g_ff_prof);
+            unlink(pf);
+        }
     }
     pthread_mutex_unlock(&g_ff_mu);
 }
@@ -243,12 +249,20 @@ static int web_start(void){
         setsid();
         const int nul = open("/dev/null", O_RDWR);
         if(nul >= 0){ dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if(nul > 2) close(nul); }
+        /* Firefox outlives every request and would otherwise hold the listening socket, the
+         * model file and any connection that was open at the moment it started. It held port
+         * 8080 for exactly this reason. */
+        h_close_inherited();
         setenv("MOZ_HEADLESS", "1", 1);
         execlp("firefox", "firefox", "--headless", "--marionette", "--no-remote",
                "--profile", g_ff_prof, "about:blank", (char*)NULL);
         _exit(127);
     }
     g_ff_pid = pid;
+    { char pf[PATH_MAX];
+      snprintf(pf, sizeof pf, "%s/firefox.pid", base);
+      FILE *f = fopen(pf, "w");
+      if(f){ fprintf(f, "%d\n", (int)pid); fclose(f); } }
 
     for(int i = 0; i < 160; i++){          /* a cold profile takes seconds to come up */
         struct timespec ts = { 0, 250*1000*1000 }; nanosleep(&ts, NULL);

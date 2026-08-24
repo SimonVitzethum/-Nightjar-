@@ -13,6 +13,8 @@
 #include "json.h"
 #include "strbuf.h"
 #include "harness.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static int pass = 0, fail = 0;
 static void ok(int cond, const char *what){
@@ -314,6 +316,39 @@ int main(void){
     { const char *c = field(r, "content");
       ok(strlen(c) <= g_tmax + 512, "and stays inside the budget"); }
     free(ar); ar = NULL;
+
+    /* ---- 6a. WHAT A CHILD MUST NOT INHERIT.
+     *
+     * This is here because it happened. Firefox is forked by the server and inherited its
+     * LISTENING SOCKET, then outlived it and kept port 8080 bound:
+     *
+     *   LISTEN 127.0.0.1:8080  users:(("firefox",pid=1712201,fd=39))
+     *
+     * `make stop` reported success, `make serve` failed with "port 8080 is still held by
+     * something else", and nothing named qwen35_server was running. The same inheritance pins
+     * the model file and every in-flight HTTP connection. ---- */
+    puts("\n6a. inheritance");
+    {
+        const int ls = socket(AF_INET, SOCK_STREAM, 0);          /* deliberately NOT CLOEXEC:
+                                                                  * the child must close it
+                                                                  * even when the parent forgot */
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_addr.s_addr = inet_addr("127.0.0.1"); sa.sin_port = 0;
+        int bound = ls >= 0 && bind(ls, (struct sockaddr*)&sa, sizeof sa) == 0 && listen(ls, 4) == 0;
+        ok(bound, "(opened a listening socket in the parent)");
+        r = call("{\"name\":\"bash\",\"arguments\":{"
+                 "\"command\":\"ls -l /proc/self/fd | grep -c socket || true\"},"
+                 "\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "0"), "a forked command inherits NO socket from the server");
+        free(ar); ar = NULL;
+        r = call("{\"name\":\"bash\",\"arguments\":{"
+                 "\"command\":\"ls /proc/self/fd | wc -l\"},\"approved\":true}", &ar, &raw);
+        { const char *c = field(r, "content");
+          const int nfd = atoi(c);
+          ok(nfd > 0 && nfd <= 5, "and only its own three plus the listing itself"); }
+        free(ar); ar = NULL;
+        if(ls >= 0) close(ls);
+    }
 
     /* ---- 6b. PROJECTS. A second confinement, and a different one: the caller no longer
      *          names a directory at all, it names a project, and everything that is not a

@@ -586,12 +586,39 @@ static int h_term_signal(int sig){
     return p > 0;
 }
 
+/* CLOSE WHAT THE CHILD MUST NOT KEEP.
+ *
+ * A forked child inherits every descriptor the server has open, and one of them is the LISTENING
+ * SOCKET. Firefox inherited it, kept running after the server was stopped, and kept port 8080
+ * bound — `make stop` reported success and `make serve` then failed with "port 8080 is still
+ * held by something else", twice, with nothing named qwen35_server anywhere:
+ *
+ *     LISTEN 127.0.0.1:8080 users:(("firefox",pid=1712201,fd=39))
+ *
+ * The same inheritance pins the model file and every in-flight HTTP connection. The sockets are
+ * created O_CLOEXEC now, which is the real fix; this is the backstop that does not depend on
+ * every future fd being opened correctly. */
+static void h_close_inherited(void){
+    DIR *d = opendir("/proc/self/fd");
+    if(d){
+        struct dirent *e;
+        while((e = readdir(d))){
+            const int fd = atoi(e->d_name);
+            if(fd > 2 && fd != dirfd(d)) close(fd);
+        }
+        closedir(d);
+        return;
+    }
+    for(int fd = 3; fd < 4096; fd++) close(fd);      /* no /proc: brute force */
+}
+
 static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
     int master = -1;
     struct winsize ws = { 40, 120, 0, 0 };       /* something sane for programs that ask */
     const pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if(pid < 0) return 0;
     if(pid == 0){
+        h_close_inherited();          /* forkpty already put the slave on 0,1,2 */
         if(chdir(h_root()) != 0) _exit(126);
         setenv("TERM", "dumb", 1);               /* no colour escapes in the model's context */
         setenv("PAGER", "cat", 1);

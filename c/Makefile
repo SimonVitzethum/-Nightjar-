@@ -135,10 +135,12 @@ serve: qwen35_server webui.html
 	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) LOG="$(ENGINE_HOME)/logs/server.log" \
 	    KV_SPILL="$(KV_SPILL)" ./serve.sh --projects "$(PROJECTS)" --tools $(TOOLS)
 
-# -x matches the process NAME. The -f form matches any command line CONTAINING
-# "qwen35_server", which includes the shell running this rule.
+# Stops the engine AND the headless Firefox it may have started. The browser is a forked child;
+# before the fds were made close-on-exec it inherited the listening socket and kept port 8080
+# bound after the server was gone, so `make stop` said "stopped" and `make serve` then failed
+# with "port 8080 is still held by something else".
 stop:
-	@pkill -x qwen35_server && echo "stopped" || echo "not running"
+	@ENGINE_HOME="$(ENGINE_HOME)" ./serve.sh stop
 
 tools: tests/harness_test
 	./tests/harness_test
