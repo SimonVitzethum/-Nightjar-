@@ -35,7 +35,7 @@ CUDA_HOME ?= /opt/cuda
 
 CFLAGS  ?= -O3 -march=$(ARCH) -fopenmp -Wall -Wextra \
            -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation
-LDFLAGS ?= -lm -fopenmp -lpthread
+LDFLAGS ?= -lm -fopenmp -lpthread -lutil
 CUFLAGS ?= -O3 -arch=$(CUDA_ARCH)
 CULIBS  ?= -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
 

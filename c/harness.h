@@ -47,6 +47,9 @@
 #include <limits.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <pty.h>
+#include <pthread.h>
+#include <stdint.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -136,14 +139,38 @@ static ToolDecision h_policy(ToolClass c, const char **why){
  * this decision because it does not see the arguments, so without this the two arrive at the
  * caller looking identical — a red tool error next to a green "allow". Thread-local because
  * tool calls run on connection threads and two can be in flight at once. */
-static __thread int h_out_of_tree = 0;
+static __thread int  h_out_of_tree = 0;
+static __thread char t_outside[PATH_MAX] = "";   /* the path that was refused, resolved */
+
+/* CONSENT INSTEAD OF REFUSAL, OUTSIDE THE PROJECT.
+ *
+ * The first version hard-refused anything outside the workspace, full stop. That is the right
+ * default and the wrong only-option: a coding agent is regularly asked about a file one
+ * directory over, and "refused" with no way to say yes makes the human do it by hand — which
+ * is not more secure, just more tedious, and it trains them to run the whole thing with
+ * --tools full instead.
+ *
+ * So an out-of-tree path is now an ASK, bound to the exact resolved path that was shown. The
+ * grant is thread-local, lives for one request, and is echoed back by the caller from the ask
+ * response — so consent is consent to THAT path, not a mode the session slips into. A
+ * directory grant covers what is under it, because otherwise list_dir and grep are useless on
+ * the thing that was just approved.
+ *
+ * g_home is $HOME/QwenEngine. Leaving the project but staying inside it is one kind of
+ * question; leaving the engine's own directory tree entirely is a louder one, and the ask says
+ * which it is. */
+static char          g_home[PATH_MAX] = "";
+static __thread char t_grant[PATH_MAX] = "";
+
+static int h_in(const char *abs, const char *root){
+    if(!root || !*root) return 0;
+    const size_t n = strlen(root);
+    return !strncmp(abs, root, n) && (abs[n] == 0 || abs[n] == '/');
+}
 
 static int h_under_root(const char *abs){
-    const char *root = h_root();
-    const size_t n = strlen(root);
-    if(!n) return 0;
-    if(strncmp(abs, root, n)) return 0;
-    return abs[n] == 0 || abs[n] == '/';
+    if(t_grant[0] && h_in(abs, t_grant)) return 1;      /* consent given, for this path */
+    return h_in(abs, h_root());
 }
 
 /* Normalize "." and ".." TEXTUALLY, touching no filesystem.
@@ -201,9 +228,11 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
         h_lexical(joined, lex, sizeof lex);
         if(!h_under_root(lex)){
             snprintf(msg, sizeof msg,
-                     "%s resolves to %s, which is outside the workspace %s — refused",
+                     "%s resolves to %s, which is outside the workspace %s",
                      rel, lex, h_root());
-            *err = msg; h_out_of_tree = 1; return 0;
+            *err = msg; h_out_of_tree = 1;
+            snprintf(t_outside, sizeof t_outside, "%s", lex);
+            return 0;
         }
     }
 
@@ -237,9 +266,11 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
             *err = "path too long"; return 0; }
         if(g_tmode != TM_FULL && !h_under_root(out)){
             snprintf(msg, sizeof msg,
-                     "%s resolves to %s, which is outside the workspace %s — refused",
+                     "%s resolves to %s, which is outside the workspace %s",
                      rel, out, h_root());
-            *err = msg; h_out_of_tree = 1; return 0;
+            *err = msg; h_out_of_tree = 1;
+            snprintf(t_outside, sizeof t_outside, "%s", out);
+            return 0;
         }
         if(missing){                      /* inside, and genuinely not there */
             snprintf(msg, sizeof msg, "%s: %s", rel, strerror(ENOENT));
@@ -248,9 +279,11 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
     }
     if(g_tmode != TM_FULL && !h_under_root(out)){
         snprintf(msg, sizeof msg,
-                 "%s resolves to %s, which is outside the workspace %s — refused",
+                 "%s resolves to %s, which is outside the workspace %s",
                  rel, out, h_root());
-        *err = msg; h_out_of_tree = 1; return 0;
+        *err = msg; h_out_of_tree = 1;
+        snprintf(t_outside, sizeof t_outside, "%s", out);
+        return 0;
     }
     return 1;
 }
@@ -382,62 +415,191 @@ static void h_trunc(Str *s){
 
 /* ---------------- running a command ---------------- */
 
-/* fork/exec rather than popen, for three reasons popen cannot give: a process GROUP that can
- * be killed as a unit (a shell that spawned children leaks them otherwise), a timeout at all,
- * and stderr merged into the same stream in the order it was written.
+/* THE TERMINAL.
  *
- * The output is kept as HEAD PLUS A RING OF THE TAIL, not as the first N bytes. The first
- * version kept the first 64 KiB and dropped the rest, which is precisely backwards for the
- * command this tool exists to run: a build prints its warnings for a minute and its ERRORS in
- * the last twenty lines. Keeping the head only means the model is handed a log that ends
- * before anything went wrong, and it then reports success.
+ * A command runs on a PTY, not on a pipe, and the whole difference is one sentence: on a pipe
+ * `sudo` says "no tty present and no askpass program specified" and exits, because it refuses
+ * to read a password from something that is not a terminal. Give it a terminal and it prompts,
+ * reads, and — this part is free and matters — turns off echo while it reads, so the password
+ * never appears in the transcript that the panel shows and the model sees.
  *
- * The pipe is drained to the end either way, whether the bytes are kept or not — stopping the
- * reads would block the child on a full pipe until the timeout killed it, turning "long
- * output" into "hangs for two minutes". */
+ * The same PTY makes the panel possible at all. Output goes into a session-long log that a
+ * second HTTP connection can poll while the command is still running, and input typed there
+ * goes back down the same file descriptor. That is a terminal, not a rendering of one.
+ *
+ * TWO AUDIENCES, TWO BUDGETS. The log keeps everything (to a cap); what the tool RETURNS to
+ * the model is still head-plus-tail inside 4 KiB. A person scrolls; a model pays 10.5 tok/s
+ * for every byte.
+ *
+ * THE TIMEOUT IS AN IDLE TIMEOUT. It exists to catch a hang, and a build that prints for five
+ * minutes is not hung. Output or input resets the clock. Without that, "type the sudo
+ * password" would race a 120-second kill. */
+
+#define TERM_CAP (2u<<20)
+
+typedef struct {
+    pthread_mutex_t mu;
+    int      live, fd;
+    pid_t    pid;
+    Str      log;            /* the session transcript the panel shows */
+    Str      hide;           /* secret input still possibly echoing back */
+    size_t   hidepos;        /* how much of it has been matched in the output so far */
+    uint64_t base;           /* bytes dropped off the front, so offsets stay absolute */
+    int      code, has_code;
+    char     cmd[512];
+} Term;
+static Term g_term = { PTHREAD_MUTEX_INITIALIZER, 0, -1, 0, {0}, {0}, 0, 0, 0, 0, {0} };
+
+/* THE HARNESS HIDES THE SECRET, NOT THE COMMAND.
+ *
+ * sudo turns off terminal echo while it reads a password, so on a PTY the password never comes
+ * back — which is the whole reason a PTY is the right answer here. But that is sudo's
+ * behaviour, not a property of this design, and the difference showed up the first time I
+ * tested it: `stty -echo; read p` in bash echoes anyway, because bash's `read` RE-ENABLES echo
+ * unless given -s. Anything the model writes that reads a secret without knowing that trick
+ * would put it straight into the transcript and into the next prompt.
+ *
+ * So the bytes typed as secret are stripped from the output stream by the harness itself,
+ * incrementally, whatever the command does with termios. The transcript gets a visible marker
+ * instead — the reader should know something was typed, only not what. */
+static size_t h_hide_filter(char *b, size_t n){
+    if(!g_term.hide.n) return n;
+    size_t w = 0;
+    for(size_t i = 0; i < n; i++){
+        if(g_term.hidepos < g_term.hide.n && b[i] == g_term.hide.p[g_term.hidepos]){
+            g_term.hidepos++;
+            if(g_term.hidepos == g_term.hide.n){ g_term.hide.n = 0; g_term.hidepos = 0; }
+            continue;                                /* swallowed */
+        }
+        if(g_term.hidepos){
+            /* the match broke — those bytes were ordinary output after all, put them back */
+            for(size_t k = 0; k < g_term.hidepos; k++) b[w++] = g_term.hide.p[k];
+            g_term.hidepos = 0;
+            if(g_term.hide.n && b[i] == g_term.hide.p[0]){ g_term.hidepos = 1; continue; }
+        }
+        b[w++] = b[i];
+    }
+    return w;
+}
+
+static void h_term_add(const char *b, size_t n){
+    pthread_mutex_lock(&g_term.mu);
+    s_add(&g_term.log, b, n);
+    if(g_term.log.n > TERM_CAP){                 /* drop the oldest half, keep offsets honest */
+        const size_t drop = g_term.log.n - TERM_CAP/2;
+        memmove(g_term.log.p, g_term.log.p + drop, g_term.log.n - drop);
+        g_term.log.n -= drop;
+        g_term.base  += drop;
+    }
+    pthread_mutex_unlock(&g_term.mu);
+}
+
+/* What the panel reads. `since` is absolute over the session; a client that has fallen behind
+ * the drop window is told so rather than handed bytes from the wrong place. */
+static void h_term_json(Str *o, uint64_t since){
+    pthread_mutex_lock(&g_term.mu);
+    const uint64_t end = g_term.base + g_term.log.n;
+    int reset = 0;
+    if(since < g_term.base){ since = g_term.base; reset = 1; }
+    if(since > end) since = end;
+    const size_t off = (size_t)(since - g_term.base);
+    s_fmt(o, "{\"at\":%llu,\"live\":%s,\"reset\":%s,\"cmd\":",
+          (unsigned long long)end, g_term.live ? "true" : "false", reset ? "true" : "false");
+    s_json(o, g_term.cmd, strlen(g_term.cmd));
+    if(g_term.has_code) s_fmt(o, ",\"exit\":%d", g_term.code);
+    s_cat(o, ",\"data\":");
+    s_json(o, g_term.log.p ? g_term.log.p + off : "", g_term.log.n - off);
+    s_cat(o, "}");
+    pthread_mutex_unlock(&g_term.mu);
+}
+
+/* Typed into the panel and written straight down the PTY. Never logged, never echoed by us,
+ * never put anywhere the model can read: when this carries a sudo password, the only correct
+ * number of copies is zero. sudo's own echo suppression keeps it out of the transcript. */
+static int h_term_input(const char *data, size_t n, int secret){
+    pthread_mutex_lock(&g_term.mu);
+    const int fd = g_term.live ? g_term.fd : -1;
+    if(fd >= 0 && secret){
+        g_term.hide.n = 0; g_term.hidepos = 0;
+        s_add(&g_term.hide, data, n);
+        while(g_term.hide.n && (g_term.hide.p[g_term.hide.n-1] == '\n' ||
+                                g_term.hide.p[g_term.hide.n-1] == '\r')) g_term.hide.n--;
+        s_cat(&g_term.log, "[Eingabe verborgen]\n");
+    }
+    if(fd >= 0){
+        size_t done = 0;
+        while(done < n){
+            const ssize_t w = write(fd, data + done, n - done);
+            if(w <= 0) break;
+            done += (size_t)w;
+        }
+    }
+    pthread_mutex_unlock(&g_term.mu);
+    return fd >= 0;
+}
+
+static int h_term_signal(int sig){
+    pthread_mutex_lock(&g_term.mu);
+    const pid_t p = g_term.live ? g_term.pid : 0;
+    if(p > 0) kill(-p, sig);
+    pthread_mutex_unlock(&g_term.mu);
+    return p > 0;
+}
+
 static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
-    int pfd[2];
-    if(pipe(pfd) != 0) return 0;
-    const pid_t pid = fork();
-    if(pid < 0){ close(pfd[0]); close(pfd[1]); return 0; }
+    int master = -1;
+    struct winsize ws = { 40, 120, 0, 0 };       /* something sane for programs that ask */
+    const pid_t pid = forkpty(&master, NULL, NULL, &ws);
+    if(pid < 0) return 0;
     if(pid == 0){
-        setpgid(0, 0);
-        close(pfd[0]);
-        dup2(pfd[1], 1); dup2(pfd[1], 2); close(pfd[1]);
-        const int nul = open("/dev/null", O_RDONLY);
-        if(nul >= 0){ dup2(nul, 0); close(nul); }
         if(chdir(h_root()) != 0) _exit(126);
-        setenv("TERM", "dumb", 1);          /* no colour escapes in the model's context */
+        setenv("TERM", "dumb", 1);               /* no colour escapes in the model's context */
         setenv("PAGER", "cat", 1);
         setenv("GIT_PAGER", "cat", 1);
         setenv("NO_COLOR", "1", 1);
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
-    close(pfd[1]);
+
+    pthread_mutex_lock(&g_term.mu);
+    g_term.live = 1; g_term.fd = master; g_term.pid = pid;
+    g_term.has_code = 0;
+    snprintf(g_term.cmd, sizeof g_term.cmd, "%s", cmd);
+    pthread_mutex_unlock(&g_term.mu);
+    { Str hdr = {0}; s_fmt(&hdr, "\n$ %s\n", cmd); h_term_add(hdr.p, hdr.n); s_free(&hdr); }
 
     const size_t hcap = g_tmax * 3 / 4;
     const size_t tcap = g_tmax / 4 > 300 ? g_tmax / 4 - 200 : 256;
     char  *ring = (char*)malloc(tcap);
-    size_t rpos = 0, seen_tail = 0;         /* seen_tail counts everything past the head */
-    const double t0 = now();
+    size_t rpos = 0, seen_tail = 0;
+    double last = now();
     int killed = 0;
     for(;;){
-        const int left = timeout_ms - (int)((now() - t0) * 1000.0);
+        const int left = timeout_ms - (int)((now() - last) * 1000.0);
         if(left <= 0){ kill(-pid, SIGKILL); killed = 1; break; }
-        struct pollfd p = { pfd[0], POLLIN, 0 };
+        struct pollfd p = { master, POLLIN, 0 };
         const int r = poll(&p, 1, left > 200 ? 200 : left);
         if(r > 0){
             char b[8192];
-            const ssize_t k = read(pfd[0], b, sizeof b);
-            if(k <= 0) break;
-            const char *q = b; size_t n = (size_t)k;
+            const ssize_t k = read(master, b, sizeof b);
+            /* a PTY master returns EIO, not 0, when the last slave closes */
+            if(k <= 0){ if(k < 0 && errno == EINTR) continue; break; }
+            last = now();                        /* idle timeout, not a wall clock */
+            /* the line discipline turns \n into \r\n; nobody downstream wants the \r */
+            size_t w = 0;
+            for(ssize_t i = 0; i < k; i++) if(b[i] != '\r') b[w++] = b[i];
+            pthread_mutex_lock(&g_term.mu);
+            w = h_hide_filter(b, w);          /* before the transcript AND before the model */
+            pthread_mutex_unlock(&g_term.mu);
+            if(!w) continue;
+            h_term_add(b, w);
+            const char *q = b; size_t n = w;
             if(out->n < hcap){
                 const size_t take = hcap - out->n < n ? hcap - out->n : n;
                 s_add(out, q, take);
                 q += take; n -= take;
             }
-            if(n && ring){                  /* the rest goes round and round */
+            if(n && ring){
                 seen_tail += n;
                 if(n >= tcap){ memcpy(ring, q + n - tcap, tcap); rpos = 0; }
                 else {
@@ -448,8 +610,12 @@ static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
                 }
             }
         } else if(r < 0 && errno != EINTR) break;
+        /* input typed into the panel counts as activity too */
+        pthread_mutex_lock(&g_term.mu);
+        if(g_term.fd < 0) killed = 1;
+        pthread_mutex_unlock(&g_term.mu);
+        if(killed){ kill(-pid, SIGKILL); break; }
     }
-    close(pfd[0]);
     int st = 0;
     waitpid(pid, &st, 0);
     if(killed) kill(-pid, SIGKILL);
@@ -458,7 +624,7 @@ static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
         Str t = {0};
         if(seen_tail >= tcap){ s_add(&t, ring + rpos, tcap - rpos); s_add(&t, ring, rpos); }
         else                   s_add(&t, ring, seen_tail);
-        size_t at = 0;                      /* never start the tail mid-line */
+        size_t at = 0;
         if(seen_tail >= tcap){ while(at < t.n && t.p[at] != '\n') at++; if(at < t.n) at++; }
         if(seen_tail > t.n - at)
             s_fmt(out, "\n… %zu bytes cut here (output limit %zu — narrow the command) …\n",
@@ -471,7 +637,14 @@ static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
     *code = killed ? 124
           : WIFEXITED(st)   ? WEXITSTATUS(st)
           : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
-    if(killed) s_fmt(out, "\n[killed after %d ms]\n", timeout_ms);
+    if(killed) s_fmt(out, "\n[killed after %d ms idle]\n", timeout_ms);
+
+    { Str f = {0}; s_fmt(&f, "\n[exit %d]\n", *code); h_term_add(f.p, f.n); s_free(&f); }
+    pthread_mutex_lock(&g_term.mu);
+    g_term.live = 0; g_term.code = *code; g_term.has_code = 1;
+    g_term.hide.n = 0; g_term.hidepos = 0;      /* a secret does not outlive its command */
+    if(g_term.fd >= 0){ close(g_term.fd); g_term.fd = -1; }
+    pthread_mutex_unlock(&g_term.mu);
     return 1;
 }
 
@@ -1073,14 +1246,46 @@ static void h_exec_json(Str *o, const char *body){
         args = &empty;
     }
 
+    /* Consent to a specific path, echoed back from the ask. Read-only mode still says no:
+     * a human agreeing to a path is not a human agreeing to a write. */
+    t_grant[0] = 0;
+    { const char *g = a_str(req, "allow_path", NULL);
+      if(g && g[0] == '/' && !strstr(g, "/..")) snprintf(t_grant, sizeof t_grant, "%s", g); }
+
     Str out = {0};
     int code = 0;
     const char *err = NULL;
     h_out_of_tree = 0;
+    t_outside[0] = 0;
     const double t0 = now();
     const int ok = t->fn(args, &out, &code, &err);
     const double ms = (now() - t0) * 1000.0;
     h_trunc(&out);
+
+    /* Out of tree, and nobody has agreed to this path yet: that is a QUESTION, not a verdict.
+     * The resolved path goes back with it so the human approves what will actually be touched
+     * rather than what was typed, and so the yes can be bound to it. */
+    /* h_out_of_tree is only set when the fence refused DESPITE the grant, so there is nothing
+     * to combine here: an unrelated grant produces a fresh question about the new path rather
+     * than a refusal. Checking !t_grant[0] as well — which the first version did — turned
+     * "consent to /etc/passwd, now asking about /etc/hostname" into a flat deny. */
+    if(h_out_of_tree){
+        const int inside_home = h_in(t_outside, g_home);
+        s_fmt(o, "{\"decision\":\"ask\",\"ok\":false,\"tool\":\"%s\",\"class\":\"%s\","
+                 "\"kind\":\"path\",\"inside_home\":%s,\"path\":",
+              t->name, h_cls_name(t->cls), inside_home ? "true" : "false");
+        s_json(o, t_outside, strlen(t_outside));
+        s_cat(o, ",\"reason\":");
+        { char r[PATH_MAX + 160];
+          snprintf(r, sizeof r, inside_home
+                   ? "leaves the project, but stays inside %s"
+                   : "leaves %s entirely", g_home[0] ? g_home : "the engine directory");
+          s_json(o, r, strlen(r)); }
+        s_cat(o, "}");
+        s_free(&out);
+        free(arena2); free(arena);
+        return;
+    }
 
     s_fmt(o, "{\"decision\":\"%s\",\"ok\":%s,\"tool\":\"%s\",\"class\":\"%s\","
              "\"exit\":%d,\"ms\":%.1f,\"content\":",

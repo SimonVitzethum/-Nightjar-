@@ -38,6 +38,25 @@ static int has(jval *r, const char *k, const char *want){
     return strstr(field(r, k), want) != NULL;
 }
 
+/* Types a secret into whatever command is running, once it has had a moment to start and turn
+ * echo off. A helper thread, because h_run blocks until the command exits — which is the same
+ * shape the real thing has: the browser posts to /v1/term/input on a different connection. */
+static int secret_flag = 0;
+static void *feed_secret(void *arg){
+    (void)arg;
+    for(int i = 0; i < 300; i++){
+        struct timespec ts = { 0, 10*1000*1000 };
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&g_term.mu);
+        const int live = g_term.live;
+        pthread_mutex_unlock(&g_term.mu);
+        if(live) break;
+    }
+    { struct timespec ts = { 0, 250*1000*1000 }; nanosleep(&ts, NULL); }
+    h_term_input("hunter2-secret\n", 15, secret_flag);
+    return NULL;
+}
+
 static void wr(const char *rel, const char *body){
     char p[PATH_MAX]; snprintf(p, sizeof p, "%s/%s", g_root, rel);
     FILE *f = fopen(p, "wb"); if(f){ fputs(body, f); fclose(f); }
@@ -138,54 +157,62 @@ int main(void){
     ok(has(r, "content", "does not appear"), "a missing old_string is an error, not a no-op");
     free(ar); ar = NULL;
 
-    /* ---- 4. THE CONFINEMENT. Three ways out, all of which a strncmp on the argument as
-     *         typed would let through. ---- */
-    puts("\n4. confinement");
+    /* ---- 4. THE FENCE. Leaving the workspace is a QUESTION now, not a verdict — but the
+     *         question has to be asked about the RESOLVED path, the answer has to be bound to
+     *         that path, and nothing may happen until it comes. ---- */
+    puts("\n4. the fence, and consent");
+    { char home[PATH_MAX]; snprintf(home, sizeof home, "%s", g_root); realpath(home, g_home); }
+
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../../../etc/passwd\"}}", &ar, &raw);
-    ok(has(r, "content", "outside the workspace"), "..  cannot climb out");
-    /* and it must READ as a refusal, not as a tool that happened to fail — the caller renders
-     * those differently and the model is told a different thing */
-    ok(!strcmp(field(r, "decision"), "deny"), "leaving the workspace is reported as a refusal");
+    ok(!strcmp(field(r, "decision"), "ask"), "..  out of the tree asks instead of refusing");
+    ok(!strcmp(field(r, "kind"), "path"), "and says it is a path question, not a shell one");
+    ok(!strcmp(field(r, "path"), "/etc/passwd"), "the RESOLVED path is what is put to the human");
+    ok(!has(r, "content", "root:"), "and nothing was read while asking");
     free(ar); ar = NULL;
 
-    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"/etc/passwd\"}}", &ar, &raw);
-    ok(has(r, "content", "outside the workspace"), "an absolute path outside is refused");
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"/etc/passwd\"},"
+             "\"allow_path\":\"/etc/passwd\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "allow") && has(r, "content", "root:"),
+       "with consent to exactly that path, it reads");
     free(ar); ar = NULL;
 
+    /* the whole point of binding: yes to one thing is not yes to the neighbourhood */
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"/etc/hostname\"},"
+             "\"allow_path\":\"/etc/passwd\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "ask"), "consent to one path is not consent to its sibling");
+    free(ar); ar = NULL;
+
+    /* a symlink out of the tree resolves first, so the human is asked about where it GOES */
     { char link[PATH_MAX]; snprintf(link, sizeof link, "%s/escape", g_root);
       ok(symlink("/etc", link) == 0, "(made a symlink to /etc inside the workspace)"); }
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"escape/passwd\"}}", &ar, &raw);
-    ok(has(r, "content", "outside the workspace"), "a symlink out of the tree is refused");
+    ok(!strcmp(field(r, "decision"), "ask") && !strcmp(field(r, "path"), "/etc/passwd"),
+       "a symlink is asked about by its TARGET, not by its name");
     free(ar); ar = NULL;
 
     r = call("{\"name\":\"write_file\",\"arguments\":{\"path\":\"../escaped.txt\",\"content\":\"no\"}}", &ar, &raw);
-    ok(has(r, "content", "outside the workspace"), "a write above the root is refused");
+    ok(!strcmp(field(r, "decision"), "ask"), "a write above the root asks");
+    { char probe[PATH_MAX]; snprintf(probe, sizeof probe, "%s/../escaped.txt", g_root);
+      struct stat st;
+      ok(stat(probe, &st) != 0, "and wrote nothing while asking"); }
     free(ar); ar = NULL;
 
-    /* NO EXISTENCE ORACLE ACROSS THE FENCE. Reading a path outside must answer the same way
-     * whether or not it is there — otherwise the two error messages tell the caller exactly
-     * what the confinement exists to withhold. The earlier tests all used /etc/passwd, which
-     * EXISTS, so they never exercised this branch. */
-    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../does-not-exist-at-all\"}}", &ar, &raw);
-    ok(!strcmp(field(r, "decision"), "deny"), "a MISSING path outside is refused, not reported missing");
-    ok(has(r, "content", "outside the workspace"), "and it says so in the same words");
-    free(ar); ar = NULL;
-    /* And the same again where not even the PARENT exists outside the tree. The first fix
-     * only covered a missing file whose directory was there; this one is decided lexically,
-     * so the answer no longer depends on the filesystem at all. */
+    /* the answer must not depend on whether the target exists — that difference is an oracle */
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../../../nowhere/at/all\"}}", &ar, &raw);
-    ok(!strcmp(field(r, "decision"), "deny"), "a path whose PARENT is also absent and outside is refused");
-    ok(has(r, "content", "outside the workspace"), "and in the same words as an existing one");
+    ok(!strcmp(field(r, "decision"), "ask"), "a path whose parents do not exist asks the same way");
     free(ar); ar = NULL;
-
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"inside-but-absent\"}}", &ar, &raw);
     ok(!strcmp(field(r, "decision"), "allow") && has(r, "content", "No such file"),
-       "while a missing path INSIDE still says it is missing");
+       "while a missing path INSIDE is simply missing");
     free(ar); ar = NULL;
 
-    r = call("{\"name\":\"glob\",\"arguments\":{\"pattern\":\"*\",\"path\":\"/\"}}", &ar, &raw);
-    ok(has(r, "content", "outside the workspace"), "the search root itself is confined");
+    /* and consent is about the PATH; it never upgrades the policy class */
+    g_tmode = TM_RO;
+    r = call("{\"name\":\"write_file\",\"arguments\":{\"path\":\"/tmp/nope.txt\",\"content\":\"x\"},"
+             "\"allow_path\":\"/tmp/nope.txt\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "consent to a path does not buy a write in read-only mode");
     free(ar); ar = NULL;
+    g_tmode = TM_WS;
 
     /* ---- 5. the gate ---- */
     puts("\n5. the policy gate");
@@ -251,6 +278,24 @@ int main(void){
     ok(has(r, "content", "started"), "output before the kill is kept");
     free(ar); ar = NULL;
 
+    /* and ordinary, non-secret input is left alone — suppressing it would make every
+     * interactive prompt unreadable */
+    { pthread_t th; secret_flag = 0;
+      pthread_create(&th, NULL, feed_secret, NULL);
+      Str t0 = {0}; h_term_json(&t0, ~0ull); char *a3 = NULL; jval *j3 = json_parse(t0.p, &a3);
+      unsigned long long m2 = 0;
+      { jval *at = j3 ? json_get(j3, "at") : NULL; if(at) m2 = (unsigned long long)at->num; }
+      free(a3); s_free(&t0);
+      r = call("{\"name\":\"bash\",\"arguments\":{\"command\":\"read q; echo q=$q\","
+               "\"timeout_ms\":6000},\"approved\":true}", &ar, &raw);
+      pthread_join(th, NULL);
+      ok(has(r, "content", "q=hunter2-secret"), "plain input is passed through untouched");
+      free(ar); ar = NULL;
+      Str t = {0}; h_term_json(&t, m2); char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      ok(strstr(field(j, "data"), "hunter2-secret") != NULL,
+         "and stays visible in the transcript when it is not marked secret");
+      free(a2); s_free(&t); }
+
     r = call("{\"name\":\"bash\",\"arguments\":{\"command\":\"exit 3\"},\"approved\":true}", &ar, &raw);
     { jval *ex = json_get(r, "exit");
       ok(ex && (int)ex->num == 3, "the exit code comes back"); }
@@ -293,7 +338,13 @@ int main(void){
     free(ar); ar = NULL;
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../alpha/only-in-alpha.txt\"},"
              "\"project\":\"beta\"}", &ar, &raw);
-    ok(!strcmp(field(r, "decision"), "deny"), "one project cannot climb into its sibling");
+    /* a sibling project is out of tree, so it ASKS — and because g_home is the projects root
+     * here, the question says the target is still inside the engine directory rather than out
+     * on the wider machine. The distinction is the whole reason inside_home exists. */
+    ok(!strcmp(field(r, "decision"), "ask"), "one project cannot silently reach its sibling");
+    { jval *ih = json_get(r, "inside_home");
+      ok(ih && ih->t == J_BOOL && ih->boolean, "and the ask says it is a neighbour, not the machine"); }
+    ok(!has(r, "content", "alpha"), "nothing was read while asking");
     free(ar); ar = NULL;
     r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"../..\"}", &ar, &raw);
     ok(!strcmp(field(r, "decision"), "deny"), "a dot-dot project name is refused");
@@ -315,6 +366,51 @@ int main(void){
       ok(d && d->t == J_ARR && d->len >= 2, "the project list is JSON and finds them");
       free(a2); s_free(&t); }
     g_proot[0] = 0; t_root[0] = 0;
+
+    /* ---- 6c. THE TERMINAL. A PTY, a live transcript, and stdin that works — which is the
+     *          whole reason sudo can be answered at all. ---- */
+    puts("\n6c. the terminal");
+    unsigned long long mark = 0;
+    { Str t = {0}; h_term_json(&t, ~0ull); char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      jval *at = j ? json_get(j, "at") : NULL;
+      if(at && at->t == J_NUM) mark = (unsigned long long)at->num;
+      free(a2); s_free(&t); }
+    r = call("{\"name\":\"bash\",\"arguments\":{\"command\":\"echo eins; echo zwei\"},\"approved\":true}", &ar, &raw);
+    free(ar); ar = NULL;
+    { Str t = {0}; h_term_json(&t, mark); char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      const char *d = j ? field(j, "data") : "";
+      ok(strstr(d, "$ echo eins") != NULL, "the transcript shows the command that was run");
+      ok(strstr(d, "eins") && strstr(d, "zwei"), "and its output");
+      ok(strstr(d, "[exit 0]") != NULL, "and how it ended");
+      ok(!strstr(d, "\r"), "with no carriage returns from the line discipline");
+      free(a2); s_free(&t); }
+
+    /* Is it really a terminal? Ask something that can only tell the truth on one. */
+    r = call("{\"name\":\"bash\",\"arguments\":{\"command\":\"test -t 1 && echo TTY || echo PIPE\"},"
+             "\"approved\":true}", &ar, &raw);
+    ok(has(r, "content", "TTY"), "stdout IS a tty — without this sudo refuses to read a password");
+    free(ar); ar = NULL;
+
+    /* And the property that makes a password safe to type: with echo off, what is typed does
+     * not come back. But the command here does NOT hide anything: `stty -echo; read p` echoes
+     * in bash, because bash's read re-enables echo unless given -s. That is exactly the case a
+     * harness has to survive — a model writing the obvious idiom and getting it wrong must not
+     * leak the password anyway — so the input is marked secret and the harness strips it. */
+    { pthread_t th;
+      secret_flag = 1;
+      pthread_create(&th, NULL, feed_secret, NULL);
+      r = call("{\"name\":\"bash\",\"arguments\":{"
+               "\"command\":\"stty -echo; read p; stty echo; echo len=${#p}\","
+               "\"timeout_ms\":6000},\"approved\":true}", &ar, &raw);
+      pthread_join(th, NULL);
+      ok(has(r, "content", "len=14"), "input typed into the terminal reaches the command");
+      ok(!has(r, "content", "hunter2-secret"), "and with echo off it is NOT in what the model sees");
+      free(ar); ar = NULL;
+      Str t = {0}; h_term_json(&t, mark); char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      ok(!strstr(field(j, "data"), "hunter2-secret"), "nor anywhere in the transcript");
+      ok(strstr(field(j, "data"), "[Eingabe verborgen]") != NULL,
+         "but the transcript DOES say that something was typed");
+      free(a2); s_free(&t); }
 
     /* ---- 7. the escaper: a tool result goes into a JSON body ---- */
     puts("\n7. escaping");

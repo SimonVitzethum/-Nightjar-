@@ -875,6 +875,11 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
         }
         /* The file view. Same h_resolve, same fence, same per-thread project as the tools —
          * a second reader with its own idea of "inside" would be the second door. */
+        else if(path_is(path, "/v1/term")){
+            char sn[32]; query_arg(path, "since", sn, sizeof sn);
+            Str b = {0}; h_term_json(&b, sn[0] ? strtoull(sn, NULL, 10) : 0);
+            http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
+        }
         else if(path_is(path, "/v1/fs/list") || path_is(path, "/v1/fs/read")){
             char proj[96], rel[1024];
             query_arg(path, "project", proj, sizeof proj);
@@ -913,6 +918,27 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
                 http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
             } else http_err(fd, 400, "Bad Request", perr);
             free(arena); free(body);
+        } else if(path_is(path, "/v1/term/input") || path_is(path, "/v1/term/signal")){
+            /* Whatever arrives here goes down the PTY and nowhere else. It is not logged, not
+             * echoed, and not put anywhere the model can read it: when it carries a sudo
+             * password the only correct number of copies is zero. */
+            char *body = strndup(req.p + hdr_end, clen);
+            char *arena = NULL;
+            jval *r = body ? json_parse(body, &arena) : NULL;
+            int ok = 0;
+            if(path_is(path, "/v1/term/signal")){
+                const char *sg = r ? a_str(r, "sig", "int") : "int";
+                ok = h_term_signal(!strcmp(sg, "kill") ? SIGKILL : SIGINT);
+            } else {
+                jval *d = r ? json_get(r, "data") : NULL;
+                const int secret = r && a_bool(r, "secret", 0);
+                if(d && d->t == J_STR) ok = h_term_input(d->str, strlen(d->str), secret);
+            }
+            free(arena);
+            if(body) memset(body, 0, clen);      /* do not leave it in the heap either */
+            free(body);
+            http_send(fd, 200, "OK", "application/json",
+                      ok ? "{\"ok\":true}" : "{\"ok\":false}", ok ? 13 : 14);
         } else if(path_is(path, "/v1/tools/exec") || path_is(path, "/tools/exec")){
             /* Deliberately NOT on the engine thread. A tool call holds no model state, so
              * running it here lets the page fetch, list and grep while a generation streams —
@@ -1032,6 +1058,9 @@ int main(int argc, char **argv){
                 "  GET  /v1/projects          the projects that exist\n"
                 "  GET  /v1/fs/list           directory listing for the file view\n"
                 "  GET  /v1/fs/read           one file, for the file view\n"
+                "  GET  /v1/term?since=N      the live terminal transcript\n"
+                "  POST /v1/term/input        type into the running command (sudo password)\n"
+                "  POST /v1/term/signal       {sig:\"int\"|\"kill\"}\n"
                 "  POST /v1/projects          create one: {name}\n"
                 "  POST /v1/chat/completions  OpenAI-compatible, streaming and not\n"
                 "  POST /v1/tools/exec        run one tool  {name, arguments, approved}\n"
@@ -1070,6 +1099,11 @@ int main(int argc, char **argv){
         if(stat(g_proot, &st) || !S_ISDIR(st.st_mode)){
             fprintf(stderr, "--projects %s is not a directory\n", g_proot); return 1; }
         snprintf(g_root, sizeof g_root, "%s", g_proot);   /* the default when none is chosen */
+        /* the engine's own directory: one level up from projects/. It is not a fence — it is
+         * how the consent question knows whether it is asking about a neighbour or about the
+         * rest of the machine. */
+        { char up[PATH_MAX]; snprintf(up, sizeof up, "%s/..", g_proot);
+          if(!realpath(up, g_home)) g_home[0] = 0; }
     }
     if(workspace){                                   /* explicit single-workspace mode */
         g_proot[0] = 0;

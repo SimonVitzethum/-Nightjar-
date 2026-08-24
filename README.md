@@ -158,6 +158,64 @@ flight at once, and a global would let one request move the fence under the othe
 | `glob` | read | find files by name pattern, recursively |
 | `grep` | read | POSIX regex over file contents → `path:line:text` |
 
+#### The terminal
+
+Commands run on a **PTY**, not a pipe, and the panel shows that terminal live — the transcript
+is polled from the server while the command is still running, and the input line writes back
+down the same descriptor.
+
+The PTY is not a nicety. On a pipe `sudo` says *"no tty present and no askpass program
+specified"* and exits, because it will not read a password from something that is not a
+terminal. Give it a terminal and it prompts:
+
+```
+$ sudo -k id -un
+[sudo] Passwort für simon:
+```
+
+The panel recognises that prompt, masks the input box, and posts what you type to
+`POST /v1/term/input` with `secret: true`.
+
+**The password does not reach the model, and does not depend on the command to keep it out.**
+sudo turns off terminal echo while it reads, so on a PTY it never comes back — but that is
+sudo's behaviour, not a property of this design, and the first live test proved the difference:
+`stty -echo; read p` in bash echoes anyway, because bash's `read` **re-enables** echo unless
+given `-s`. So the harness strips the bytes it was told are secret out of the output stream
+itself, incrementally, whatever the command does with termios. The transcript gets
+`[Eingabe verborgen]` in their place — you should know something was typed, only not what.
+
+```
+GET  /v1/term?since=N     the transcript from an absolute offset
+POST /v1/term/input       {data, secret}   → written to the PTY, logged nowhere
+POST /v1/term/signal      {sig:"int"|"kill"}
+```
+
+The command timeout is an **idle** timeout: output or input resets it. A build that prints for
+five minutes is not hung, and without this rule "type the sudo password" would race a
+120-second kill.
+
+#### Outside the project: consent, not refusal
+
+The first version hard-refused every path outside the workspace. That is the right default and
+the wrong only-option — a coding agent is regularly asked about a file one directory over, and
+"refused" with no way to say yes makes the human do it by hand, which is not more secure, just
+more tedious, and it trains them to run everything with `--tools full`.
+
+So an out-of-tree path is now a **question**:
+
+```
+decision=ask  kind=path  inside_home=true   /home/me/QwenEngine/projects/other
+              leaves the project, but stays inside /home/me/QwenEngine
+decision=ask  kind=path  inside_home=false  /etc/hostname
+              leaves /home/me/QwenEngine entirely
+```
+
+No password — the user asked for consent, not authentication, and a password here would be
+theatre: the process already runs as them. What matters is that the **resolved** path is what
+is shown, and that saying yes binds to *that* path. Consent to `/etc/hostname` is not consent
+to `/etc/hosts`; the next one asks again. And it never upgrades the policy class — agreeing to
+a path does not buy a write in `--tools ro`.
+
 #### The four modes
 
 | `--tools` | read | write | shell |

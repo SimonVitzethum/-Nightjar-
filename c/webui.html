@@ -171,6 +171,8 @@ details.think .inner{padding:0 13px 11px;font-size:13.5px;color:var(--fg-dim);wh
   border:1px solid var(--line);background:var(--bg-soft);color:var(--fg)}
 .tc-ask button.go{background:var(--accent);border-color:var(--accent);color:#fff}
 .tc-ask button.no{color:var(--bad)}
+.tc-ask.hard{border-top-color:var(--bad)}
+.tc-ask.hard .q b{color:var(--bad)}
 .tc-pre{margin:0 0 9px;padding:9px 10px;background:var(--code-bg);border-radius:7px;
   font-family:var(--mono);font-size:12px;white-space:pre-wrap;max-height:14rem;overflow:auto}
 .tc-pre .del{color:var(--bad)}
@@ -249,6 +251,35 @@ aside#side.on{width:34rem}
 :root[data-theme="dark"] .n,:root:not([data-theme="light"]) .n{color:#d19a66}
 :root[data-theme="dark"] .t,:root:not([data-theme="light"]) .t{color:#61afef}
 .fv-empty{padding:3rem 1.5rem;text-align:center;color:var(--fg-faint);font-size:13.5px}
+
+/* ---- the terminal ---- */
+#pterm{display:none;flex-direction:column}
+#pterm.on{display:flex}
+.th{flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:8px 13px;background:var(--bg);
+  border-bottom:1px solid var(--line);font-size:12px;color:var(--fg-faint)}
+.th .dot2{width:7px;height:7px;border-radius:50%;background:var(--fg-faint);flex:0 0 auto}
+.th.live .dot2{background:var(--ok);animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.25}}
+.th .cmd{flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--fg-dim)}
+.th button{border:1px solid var(--line);background:var(--bg-soft);color:var(--fg-dim);
+  border-radius:6px;font:inherit;font-size:11.5px;padding:2px 8px;cursor:pointer}
+.th button:hover{border-color:var(--bad);color:var(--bad)}
+#tout{flex:1;overflow:auto;margin:0;padding:11px 13px 16px;background:var(--bg);border:0;
+  border-radius:0;font-family:var(--mono);font-size:12.5px;line-height:1.5;white-space:pre-wrap;
+  word-break:break-word;color:var(--fg)}
+#tout .p{color:var(--accent);font-weight:600}
+.ti{flex:0 0 auto;display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);
+  padding:8px 11px;background:var(--bg-soft)}
+.ti .ps{font-family:var(--mono);color:var(--accent);font-size:13px}
+.ti input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:7px;
+  color:var(--fg);font-family:var(--mono);font-size:12.5px;padding:5px 9px;outline:0}
+.ti input:focus{border-color:var(--accent)}
+.ti input:disabled{opacity:.45}
+.ti .mk{font-size:11.5px;color:var(--fg-faint);display:flex;align-items:center;gap:4px;
+  cursor:pointer;white-space:nowrap}
+.ti.secret input{border-color:var(--accent);background:var(--accent-soft)}
+.ti.secret .ps::after{content:" 🔒"}
 .tj{padding:16px 16px 40px;font-size:13px}
 .tj h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--fg-faint);
   margin:0 0 12px;font-weight:600}
@@ -322,10 +353,23 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
   <aside id="side">
     <div class="tabs">
       <button data-t="file" class="on">Datei</button>
+      <button data-t="term">Terminal</button>
       <button data-t="traj">Trajectory</button>
       <div class="sp"></div><button class="x" id="sidex">✕</button>
     </div>
     <div class="pane on" id="pfile"><div class="fv-empty">Eine Datei im Baum links auswählen.</div></div>
+    <div class="pane" id="pterm">
+      <div class="th" id="thead"><span class="dot2"></span>
+        <span class="cmd" id="tcmd">kein Befehl</span>
+        <button id="tint" title="SIGINT">Ctrl-C</button>
+        <button id="tkill" title="SIGKILL">kill</button></div>
+      <pre id="tout"></pre>
+      <div class="ti" id="tirow">
+        <span class="ps">›</span>
+        <input id="tin" placeholder="Eingabe an den laufenden Befehl…  (Enter)" autocomplete="off">
+        <label class="mk"><input type="checkbox" id="tmask"> verbergen</label>
+      </div>
+    </div>
     <div class="pane" id="ptraj"><div class="tj">
       <h2>Trajectory</h2>
       <div class="tot" id="tjtot"></div>
@@ -365,6 +409,7 @@ let tools = [], policy = {}, sysPrompt = '', workspace = '', toolMode = 'off';
 let project = localStorage.getItem('project') || '', projectsRoot = '';
 let busy = false, ctrl = null, stopped = false;
 let sessionAllow = new Set();
+let pathGrants  = new Set();   /* paths the human has agreed to, this session, exactly */
 let mode = localStorage.getItem('mode') || 'agent';
 
 /* ---------- theme ---------- */
@@ -384,6 +429,7 @@ function side(tab){
             for (const b of document.querySelectorAll('.tabs button[data-t]'))
               b.classList.toggle('on', b.dataset.t === tab);
             $('#pfile').classList.toggle('on', tab === 'file');
+            $('#pterm').classList.toggle('on', tab === 'term');
             $('#ptraj').classList.toggle('on', tab === 'traj'); }
   else a.classList.remove('on');
   $('#tjb').classList.toggle('on', a.classList.contains('on'));
@@ -757,6 +803,107 @@ function askApproval(d, name, args, reason){
   });
 }
 
+/* A path outside the project is a different question from a shell command, and it deserves
+   different words. No password — the user asked for consent, not authentication, and a password
+   here would be theatre: the process already runs as them. What matters is that the RESOLVED
+   path is what is shown, and that agreeing binds to that path and nothing else. */
+function askPath(d, res){
+  return new Promise(resolve => {
+    d.dataset.s = 'ask';
+    d.querySelector('.tc-ico').textContent = '?';
+    d.querySelector('.tc-meta').textContent = res.inside_home ? 'außerhalb des Projekts'
+                                                              : 'außerhalb von QwenEngine';
+    const box = document.createElement('div');
+    box.className = 'tc-ask' + (res.inside_home ? '' : ' hard');
+    box.innerHTML =
+        '<div class="tc-pre">' + esc(res.path) + '</div>'
+      + '<div class="q">' + (res.inside_home
+          ? 'Dieser Pfad liegt außerhalb des gewählten Projekts. '
+          : '<b>Dieser Pfad liegt außerhalb von QwenEngine</b> — also im übrigen Dateisystem. ')
+      + esc(res.reason || '') + '</div>'
+      + '<div class="btns"><button class="go">Diesen Pfad erlauben</button>'
+      + '<button class="all">Pfad für die Sitzung erlauben</button>'
+      + '<button class="no">Ablehnen</button></div>';
+    d.querySelector('.tc-out').before(box);
+    stick();
+    box.querySelector('.go').onclick  = () => { box.remove(); resolve('once'); };
+    box.querySelector('.all').onclick = () => { pathGrants.add(res.path); box.remove(); resolve('once'); };
+    box.querySelector('.no').onclick  = () => { box.remove(); resolve('no'); };
+  });
+}
+
+/* ---------- the terminal ----------
+   The transcript comes from the server, not from the tool result, and it is polled while the
+   command is still running — so what you see here is the command's output as it happens, on a
+   real PTY, and the input line writes back down the same descriptor. That last part is the
+   whole reason sudo can be answered: on a pipe it refuses to read a password at all.
+
+   The typed text is posted and then dropped. It is never put in the transcript, never in the
+   message list, and never in anything the model reads. sudo turns off terminal echo while it
+   reads, so it does not come back in the output either. */
+let termAt = 0, termTimer = null, termLive = false;
+
+function looksLikePassword(tail){
+  return /(\[sudo\]|password|passwort|passphrase|kennwort)[^\n]{0,40}:\s*$/i.test(tail);
+}
+
+async function termTick(){
+  let r;
+  try { r = await fetch('/v1/term?since=' + termAt).then(x => x.json()); }
+  catch(e){ return; }
+  const out = $('#tout');
+  if (r.reset){ out.textContent = ''; out.append('… älterer Teil verworfen …\n'); }
+  if (r.data){
+    /* the "$ cmd" header the server writes gets the accent colour; everything else is output */
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+    for (const part of r.data.split(/(\n\$ [^\n]*\n)/)){
+      if (/^\n\$ /.test(part)){
+        const b = document.createElement('span');
+        b.className = 'p'; b.textContent = part;
+        out.appendChild(b);
+      } else if (part) out.append(part);
+    }
+    if (atBottom) out.scrollTop = out.scrollHeight;
+  }
+  termAt = r.at;
+  termLive = !!r.live;
+  $('#thead').classList.toggle('live', termLive);
+  $('#tcmd').textContent = r.cmd || 'kein Befehl';
+  $('#tin').disabled = !termLive;
+  const secret = termLive && looksLikePassword(out.textContent.slice(-200));
+  if (secret && !$('#tmask').checked) $('#tmask').checked = true;
+  $('#tirow').classList.toggle('secret', $('#tmask').checked);
+  $('#tin').type = $('#tmask').checked ? 'password' : 'text';
+  $('#tin').placeholder = secret ? 'Passwort — wird nicht gespeichert und nicht geloggt'
+                                 : 'Eingabe an den laufenden Befehl…  (Enter)';
+  if (secret && document.activeElement !== $('#tin') && $('#side').classList.contains('on'))
+    $('#tin').focus();
+  if (!termLive && termTimer){ clearInterval(termTimer); termTimer = null; termTick.pending = false; }
+}
+function termWatch(){
+  side('term');
+  if (!termTimer) termTimer = setInterval(termTick, 350);
+  termTick();
+}
+$('#tin').addEventListener('keydown', async e => {
+  if (e.key !== 'Enter') return;
+  const v = $('#tin').value;
+  $('#tin').value = '';                       /* cleared before the await, not after */
+  await fetch('/v1/term/input', { method:'POST', headers:{'Content-Type':'application/json'},
+                                  body: JSON.stringify({ data: v + '\n',
+                                                         secret: $('#tmask').checked }) })
+        .catch(()=>{});
+  if ($('#tmask').checked){ $('#tmask').checked = false; $('#tirow').classList.remove('secret');
+                            $('#tin').type = 'text'; }
+  termTick();
+});
+$('#tmask').onchange = () => { $('#tirow').classList.toggle('secret', $('#tmask').checked);
+                               $('#tin').type = $('#tmask').checked ? 'password' : 'text'; };
+const sig = s => fetch('/v1/term/signal', { method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({sig:s}) }).catch(()=>{});
+$('#tint').onclick  = () => sig('int');
+$('#tkill').onclick = () => sig('kill');
+
 /* ---------- trajectory ---------- */
 let tj = { steps: [], model_s:0, tool_s:0, ptok:0, ctok:0, cached:0 };
 function tjPush(row){ tj.steps.push(row); tjRender(); }
@@ -897,10 +1044,15 @@ async function runTool(call, host){
   const card = addCard(host, name, args);
   const t0 = performance.now();
 
+  let grant = null;
   const post = approved => fetch('/v1/tools/exec', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ name, arguments: call.function.arguments || '{}', approved, project })
+    body: JSON.stringify({ name, arguments: call.function.arguments || '{}', approved, project,
+                           ...(grant ? { allow_path: grant } : {}) })
   }).then(r => r.json());
+
+  /* seeing it is the point: a shell command opens the terminal by itself */
+  if (name === 'bash') termWatch();
 
   let pre = ($('#appr').value === 'auto') || sessionAllow.has(name);
   let res;
@@ -910,15 +1062,27 @@ async function runTool(call, host){
     return 'tool ' + name + ' failed to run: ' + e.message;
   }
 
-  if (res.decision === 'ask'){
-    const verdict = await askApproval(card, name, args, res.reason);
+  /* Two kinds of ask, and a path ask can repeat: agreeing to one path does not agree to the
+     next, so the loop asks again rather than escalating into a mode. Bounded, because a model
+     that keeps producing new paths should not be able to produce an endless prompt. */
+  for (let round = 0; round < 4 && res.decision === 'ask'; round++){
+    let verdict;
+    if (res.kind === 'path'){
+      if (pathGrants.has(res.path) || $('#appr').value === 'auto') verdict = 'once';
+      else verdict = await askPath(card, res);
+      if (verdict !== 'no') grant = res.path;
+    } else {
+      verdict = await askApproval(card, name, args, res.reason);
+    }
     if (verdict === 'no'){
       cardDone(card, 'deny', 'abgelehnt', 'Vom Benutzer abgelehnt.', false);
       tjPush({ kind:'tool', name, ms: performance.now()-t0, bytes:0 });
-      return 'The user declined to run this. Do not retry it; ask what to do instead.';
+      return 'The user declined this. Do not retry it; work inside the project, or ask what to '
+           + 'do instead.';
     }
     card.dataset.s = 'run';
     card.querySelector('.tc-meta').innerHTML = '<span class="spin">◌</span>';
+    if (name === 'bash') termWatch();
     try { res = await post(true); }
     catch(e){ cardDone(card, 'err', '—', String(e.message), true); return 'tool failed: ' + e.message; }
   }

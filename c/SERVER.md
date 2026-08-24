@@ -118,6 +118,36 @@ per Pfad, und der Name muss `[A-Za-z0-9._-]` entsprechen — alles andere wird a
 bereinigt: Bereinigen erzeugt einen *anderen* Namen, der trotzdem irgendwohin auflöst, und
 genau so wird aus einem Filter ein Traversal.
 
+**Das Terminal.** Befehle laufen auf einem **PTY**, nicht auf einer Pipe, und das Panel zeigt es
+live mit. Das ist keine Kosmetik: auf einer Pipe sagt `sudo` nur „no tty present and no askpass
+program specified" und bricht ab. Mit Terminal fragt es:
+
+```
+$ sudo -k id -un
+[sudo] Passwort für simon:
+```
+
+Das Panel erkennt den Prompt, verdeckt die Eingabe und schickt sie mit `secret: true`.
+
+**Das Passwort erreicht das Modell nicht — und das hängt nicht am Befehl.** `sudo` schaltet
+beim Lesen das Echo ab, aber das ist sudos Verhalten, keine Eigenschaft dieses Entwurfs. Der
+erste Livetest hat den Unterschied gezeigt: `stty -echo; read p` gibt in bash trotzdem aus,
+weil bash's `read` das Echo wieder einschaltet (dafür gibt es `read -s`). Also entfernt der
+Harness die als geheim markierten Bytes selbst aus dem Ausgabestrom, egal was der Befehl mit
+termios anstellt. Im Transcript steht stattdessen `[Eingabe verborgen]` — man soll sehen, *dass*
+getippt wurde, nur nicht *was*.
+
+Der Timeout ist ein **Leerlauf**-Timeout: Aus- oder Eingabe setzt ihn zurück. Sonst würde „gib
+das sudo-Passwort ein" gegen einen 120-Sekunden-Kill laufen.
+
+**Außerhalb des Projekts: Zustimmung statt Ablehnung.** Die erste Fassung hat jeden Pfad
+außerhalb hart verweigert. Richtige Voreinstellung, falsche einzige Möglichkeit — wer nie ja
+sagen kann, macht es von Hand oder schaltet gleich `--tools full` ein. Jetzt wird gefragt, mit
+dem **aufgelösten** Pfad und dem Hinweis, ob er noch in `~/QwenEngine` liegt oder im übrigen
+Dateisystem. Kein Passwort: der Prozess läuft ohnehin als dieser Benutzer, ein Passwort wäre
+Theater. Das Ja bindet an genau diesen Pfad — `/etc/hostname` erlaubt nicht `/etc/hosts` — und
+hebt nie die Policy-Klasse an: Zustimmung zu einem Pfad erlaubt kein Schreiben in `--tools ro`.
+
 | `--tools` | lesen | schreiben | Shell |
 |---|---|---|---|
 | `off` | — | — | — |
