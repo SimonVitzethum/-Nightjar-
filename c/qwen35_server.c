@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 
@@ -139,6 +140,25 @@ static int sock_write(int fd, const char *b, size_t n){
     return 1;
 }
 static int sock_str(int fd, const char *z){ return sock_write(fd, z, strlen(z)); }
+
+/* HAS THE CLIENT GONE AWAY?
+ *
+ * Nothing asked this before, and the consequence was the bug that produced this function. The
+ * page aborts a turn (the user pressed stop, or switched chat); the browser closes the socket;
+ * the server notices nothing and keeps prefilling — for FIVE AND A HALF MINUTES at 11k tokens.
+ * The engine runs one request at a time, so the next prompt sits in engine_submit behind a
+ * generation whose answer nobody will ever read. From the page it looks like "it said aborted
+ * and then stopped responding", which is exactly what it was: an abort that aborted only the
+ * half of the work that was not doing anything.
+ *
+ * POLLRDHUP is the half-close a browser's abort produces; POLLERR and POLLHUP cover the rest.
+ * A request that is still sending its body would read as readable, so this is only called
+ * AFTER the body has been consumed, when nothing more is expected from the client. */
+static int client_gone(int fd){
+    struct pollfd p = { fd, POLLRDHUP | POLLERR | POLLHUP, 0 };
+    if(poll(&p, 1, 0) <= 0) return 0;
+    return (p.revents & (POLLRDHUP | POLLERR | POLLHUP)) != 0;
+}
 
 #define CORS "Access-Control-Allow-Origin: *\r\n" \
              "Access-Control-Allow-Headers: *\r\n" \
@@ -372,7 +392,7 @@ static int parse_tool_call(const char *s, size_t n, ToolCall *tc){
 }
 
 typedef struct {
-    int   fd, stream, sent_role;
+    int   fd, stream, sent_role, dead;
     char  id[48];
     long  created;
     Str   content, reasoning, toolbuf;
@@ -390,7 +410,7 @@ static void sse_delta(Gen *g, const char *field, const char *b, size_t n){
     s_fmt(&f, "\"%s\":", field);
     s_json(&f, b, n);
     s_cat(&f, "},\"finish_reason\":null}]}\n\n");
-    sock_write(g->fd, f.p, f.n);
+    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
     s_free(&f);
 }
 
@@ -424,9 +444,21 @@ static int ensure_ctx(int need){
     return g_R.att != NULL;
 }
 
-static int prefill(const int *req, int n, float *logits, double *t_out, int *reused){
+static int prefill(int fd, const int *req, int n, float *logits, double *t_out, int *reused){
     const int start = q35_cache_begin(&g_C, req, n, reused);
+    /* ensure_ctx grows the KV store, and for a 20k prompt that is seconds of allocation and
+     * spilling before a single token is computed. Checked on both sides of it, which is as
+     * close as this gets: the growth ITSELF is not interruptible.
+     *
+     * Measured, same request six times: with no growth needed the prefill stops at 6.0 s —
+     * the exact second the client left — and the next prompt is served 4.0 s later. When the
+     * store had to grow by 9k tokens it stopped at 19.1 s instead, and the extra 13 s is that
+     * one uninterruptible call. Worth naming rather than rounding away: the window exists, it
+     * is bounded by how much the store has to grow, and it shrinks to nothing once the context
+     * has reached its working size. */
+    if(client_gone(fd)) return 0;
     if(!ensure_ctx(n + 4)) return 0;
+    if(client_gone(fd)) return 0;
     const double t0 = now();
     int i = start;
 #ifndef QWEN_NO_CUDA
@@ -434,7 +466,9 @@ static int prefill(const int *req, int n, float *logits, double *t_out, int *reu
         const int SB = g_Z.S_max;
         float *xall = (float*)malloc(sizeof(float)*(size_t)SB*g_M.c.d_model);
         float *hh   = (float*)malloc(sizeof(float)*g_M.c.d_model);
-        for(; i + SB <= n - 1 && !g_abort; i += SB){
+        /* checked once per batch of 8, so a five-minute prefill for a client that left ends
+         * within a fraction of a second rather than at the end */
+        for(; i + SB <= n - 1 && !g_abort && !client_gone(fd); i += SB){
             q35_forward_cu_batch_ex(&g_Z, (int*)req + i, SB, i, NULL, 0, xall);
             for(int s = 0; s < SB; s++){
                 q35_rmsnorm(hh, xall + (size_t)s*g_M.c.d_model, g_M.output_norm,
@@ -448,6 +482,7 @@ static int prefill(const int *req, int n, float *logits, double *t_out, int *reu
     }
 #endif
     for(; i < n && !g_abort; i++){
+        if((i & 63) == 0 && client_gone(fd)) break;
         forward1(req[i], i, (i == n-1) ? logits : NULL);
 #ifndef QWEN_NO_CUDA
         if(g_spec){ float h[8192]; q35_hidden(&g_R, h); q35_mtp_prefill_kv(&g_P, h, req[i], i); }
@@ -527,7 +562,7 @@ static void handle_chat(int fd, const char *body, size_t blen){
     if(!logits || !lg2 || !cbuf){ http_err(fd, 500, "Internal Server Error", "out of memory"); goto done; }
 
     double t_pre = 0; int reused = 0;
-    if(!prefill(req, np, logits, &t_pre, &reused)){
+    if(!prefill(fd, req, np, logits, &t_pre, &reused)){
         http_err(fd, 507, "Insufficient Storage", "context does not fit in memory");
         goto done;
     }
@@ -547,12 +582,16 @@ static void handle_chat(int fd, const char *body, size_t blen){
     long long rounds = 0, accepts = 0;
     int tok = sample(logits, V, temp, top_p, top_k, cbuf);
 
-    while(ngen < max_tokens && !g_abort){
+    int gone = 0;
+    while(ngen < max_tokens && !g_abort && !gone){
         if(tok == g_eos || tok == g_ids.eos){ hit_eos = 1; break; }
         handle_token(&g, tok, piece, sizeof piece);
         ngen++; ctx_push(tok);
         if(ngen >= max_tokens) break;
         if(!ensure_ctx(pos + 8)) break;
+        /* g.dead is set by the SSE writer the first time a send() fails; client_gone catches
+         * the non-streaming case, where nothing is written until the end. */
+        if(g.dead || ((ngen & 15) == 0 && client_gone(fd))){ gone = 1; break; }
 
 #ifndef QWEN_NO_CUDA
         /* One speculative round: the MTP head drafts, and the trunk verifies BOTH positions
@@ -603,7 +642,8 @@ static void handle_chat(int fd, const char *body, size_t blen){
         if(g.pend_r.n) sse_delta(&g, "reasoning_content", g.pend_r.p, g.pend_r.n);
         if(g.pend_c.n) sse_delta(&g, "content", g.pend_c.p, g.pend_c.n);
     }
-    const char *finish = g.n_tc ? "tool_calls" : (hit_eos ? "stop" : "length");
+    const char *finish = gone ? "abort"
+                       : g.n_tc ? "tool_calls" : (hit_eos ? "stop" : "length");
 
     Str out = {0};
     if(stream){
@@ -656,9 +696,15 @@ static void handle_chat(int fd, const char *body, size_t blen){
     s_free(&out);
 
     if(g_verbose){
-        fprintf(stderr, "  %d prompt (%d cached) in %.2fs = %.1f tok/s | %d gen in %.2fs = %.2f tok/s"
+        /* On an abort the prompt was NOT prefilled — only as far as g_C.ctx_n got. Reporting
+         * `np` there printed "20513 prompt in 19.34s = 1060.7 tok/s" for 129 tokens of actual
+         * work: a rate three orders out, in a log this project reads to make decisions. Same
+         * class as every other number here that described something other than what happened. */
+        const int did = g_C.ctx_n < np ? g_C.ctx_n : np;
+        fprintf(stderr, "  %d prompt (%d cached%s) in %.2fs = %.1f tok/s | %d gen in %.2fs = %.2f tok/s"
                         " | accept %.0f%% | ctx %d | %s\n",
-                np, reused, t_pre, reused < np ? (np-reused)/(t_pre > 0 ? t_pre : 1) : 0.0,
+                did, reused, did < np ? ", ABORTED partway" : "",
+                t_pre, reused < did ? (did-reused)/(t_pre > 0 ? t_pre : 1) : 0.0,
                 ngen, t_dec, t_dec > 0 ? ngen/t_dec : 0.0,
                 rounds ? 100.0*(double)accepts/(double)rounds : 0.0, g_C.ctx_n, finish);
     }

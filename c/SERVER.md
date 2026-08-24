@@ -82,6 +82,14 @@ Für interaktive Nutzung ist die Oberfläche deshalb angenehmer als ein Agent: k
 sofortige Antwort. Für opencode lohnt es sich, eine Sitzung offen zu lassen statt viele neue
 zu starten.
 
+**Abgebrochen heißt abgebrochen.** Bricht die Seite einen Zug ab, schließt der Browser die
+Verbindung, und der Server merkt das jetzt — im Prefill wie beim Generieren. Vorher tat er es
+nicht: er rechnete fünfeinhalb Minuten an einer Antwort weiter, die niemand mehr liest, und weil
+genau eine Anfrage zur Zeit läuft, wartete der nächste Prompt still dahinter. Auf der Seite sah
+das so aus: „steht abgebrochen und antwortet nicht mehr". Gemessen bricht der Prefill jetzt in
+derselben Sekunde ab, in der der Client geht; nur ein nötiges Wachsen des KV-Stores ist nicht
+unterbrechbar und verlängert das Fenster um dessen Dauer. `make abort` prüft es.
+
 **Eine Anfrage zur Zeit.** Eine Engine, ein rekurrenter Zustand. Parallele Generierung bräuchte
 einen zweiten 146-MiB-Zustand und ein zweites KV-Fenster; dafür ist auf dieser Karte kein Platz.
 

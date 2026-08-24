@@ -145,6 +145,11 @@ stop:
 tools: tests/harness_test
 	./tests/harness_test
 
+# Needs a running server: it checks that a client which walks away actually frees the engine,
+# which is only observable end to end.
+abort: 
+	@PORT=$(PORT) ./tests/abort_test.sh
+
 bench: tests/kvtier_test tests/kquant_simd_test
 	@mkdir -p "$(KV_SPILL)"
 	./tests/kquant_simd_test
@@ -167,4 +172,4 @@ CTX       ?= 8192
 PROJECTS  ?= $(ENGINE_HOME)/projects
 TOOLS     ?= workspace
 
-.PHONY: all test gates run serve stop tools bench fwd batch mtp clean
+.PHONY: all test gates run serve stop tools abort bench fwd batch mtp clean

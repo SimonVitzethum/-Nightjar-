@@ -101,6 +101,11 @@ open:
 | `POST /v1/tools/exec` | run one tool: `{name, arguments, approved}` |
 | `GET /health` | device, context, VRAM, cache state |
 
+An aborted request is actually aborted. The server checks whether the client is still there
+during prefill and during generation, which it did not before: a cancelled turn kept prefilling
+for minutes, and since one request runs at a time the next prompt queued silently behind it.
+`make abort` checks it end to end.
+
 ```bash
 curl localhost:8080/health
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \

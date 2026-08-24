@@ -423,6 +423,14 @@ let chatId = '', chatTitle = '', chats = [], saveTimer = null;
 let busy = false, ctrl = null, stopped = false;
 let sessionAllow = new Set();
 let pathGrants  = new Set();   /* paths the human has agreed to, this session, exactly */
+/* Every unresolved approval promise. An approval card is a promise that only settles when a
+   button in it is clicked — so if the transcript it lives in is wiped (switching chat, starting
+   a new one), the promise is orphaned, the agent loop stays parked on `await`, and `busy` stays
+   true forever. Every later prompt then returns at `if (busy) return` and the page answers
+   nothing at all, with no error anywhere. Anything that tears down a transcript settles these
+   first. */
+let pendingAsks = [];
+function cancelAsks(){ for (const r of pendingAsks.splice(0)) r('no'); }
 let mode = localStorage.getItem('mode') || 'agent';
 
 /* ---------- theme ---------- */
@@ -515,7 +523,7 @@ async function chatDelete(id){
 }
 
 async function chatOpen(id){
-  if (busy){ stopped = true; ctrl?.abort(); }
+  if (busy){ stopped = true; ctrl?.abort(); cancelAsks(); }
   const r = await fetch('/v1/chat?project=' + encodeURIComponent(project)
                         + '&id=' + encodeURIComponent(id)).then(x => x.json()).catch(() => null);
   if (!r || !r.messages){ return; }
@@ -924,9 +932,13 @@ function askApproval(d, name, args, reason){
       + '<button class="no">Ablehnen</button></div>';
     d.querySelector('.tc-out').before(box);
     stick();
-    box.querySelector('.go').onclick  = () => { box.remove(); resolve('once'); };
-    box.querySelector('.all').onclick = () => { sessionAllow.add(name); box.remove(); resolve('once'); };
-    box.querySelector('.no').onclick  = () => { box.remove(); resolve('no'); };
+    const done = v => { pendingAsks = pendingAsks.filter(r => r !== settle);
+                        box.remove(); resolve(v); };
+    const settle = v => { box.remove(); resolve(v); };
+    pendingAsks.push(settle);
+    box.querySelector('.go').onclick  = () => done('once');
+    box.querySelector('.all').onclick = () => { sessionAllow.add(name); done('once'); };
+    box.querySelector('.no').onclick  = () => done('no');
   });
 }
 
@@ -953,9 +965,13 @@ function askPath(d, res){
       + '<button class="no">Ablehnen</button></div>';
     d.querySelector('.tc-out').before(box);
     stick();
-    box.querySelector('.go').onclick  = () => { box.remove(); resolve('once'); };
-    box.querySelector('.all').onclick = () => { pathGrants.add(res.path); box.remove(); resolve('once'); };
-    box.querySelector('.no').onclick  = () => { box.remove(); resolve('no'); };
+    const done = v => { pendingAsks = pendingAsks.filter(r => r !== settle);
+                        box.remove(); resolve(v); };
+    const settle = v => { box.remove(); resolve(v); };
+    pendingAsks.push(settle);
+    box.querySelector('.go').onclick  = () => done('once');
+    box.querySelector('.all').onclick = () => { pathGrants.add(res.path); done('once'); };
+    box.querySelector('.no').onclick  = () => done('no');
   });
 }
 
@@ -1310,16 +1326,28 @@ function setSendIcon(stop){
     ? '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
     : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 }
-function submit(){
-  if (busy){ stopped = true; ctrl?.abort(); return; }
+/* STOPPING IS THE BUTTON'S JOB, NOT ENTER'S.
+   Both used to go through here, so pressing Enter while a turn was running aborted it — and
+   typing the next message while the model works is the most natural thing to do. The turn died,
+   the page said "abgebrochen", and the text that was typed was thrown away with it. */
+function submit(fromStopButton){
+  if (busy){
+    if (!fromStopButton){
+      $('#hint').textContent = 'läuft noch — mit dem Stopp-Knopf abbrechen';
+      return;
+    }
+    stopped = true; ctrl?.abort();
+    for (const r of pendingAsks.splice(0)) r('no');   /* nothing may stay waiting on a click */
+    return;
+  }
   const t = ta.value.trim();
   if (!t) return;
   ta.value = ''; ta.style.height = 'auto';
   ask(t);
 }
-send.onclick = submit;
+send.onclick = () => submit(true);
 ta.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(); }
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(false); }
 });
 ta.addEventListener('input', () => {
   ta.style.height = 'auto';
@@ -1346,7 +1374,7 @@ for (const b of document.querySelectorAll('#mode button'))
   b.onclick = () => { mode = b.dataset.m; localStorage.setItem('mode', mode); applyMode(); };
 
 function newChat(){
-  stopped = true; ctrl?.abort();
+  stopped = true; ctrl?.abort(); cancelAsks();
   chatId = newId(); chatTitle = '';
   localStorage.setItem('chat:' + project, chatId);
   messages = [];
