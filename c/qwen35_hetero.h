@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_HETERO_H
-#define COLIBRI_QWEN35_HETERO_H
+#ifndef QWEN_QWEN35_HETERO_H
+#define QWEN_QWEN35_HETERO_H
 /* qwen35_hetero.h — the per-layer scheduler: which half of the model runs where.
  *
  * THE SPLIT, AND THE ONE NUMBER THAT DECIDES IT
@@ -77,6 +77,9 @@ typedef struct {
     int     n_ffn_gpu;
     int     ok;
 
+    void   *upstage;        /* pinned staging for the weight upload; startup scratch only */
+    size_t  upstage_n;
+
     /* ---- the streamed FFN ----
      * For layers whose weights did not fit in VRAM, the GPU still does a share of the work
      * by pulling its slice over PCIe WHILE the CPU computes the rest in place. The two read
@@ -109,6 +112,73 @@ typedef struct {
 
 /* ---------------- upload ---------------- */
 
+/* THE UPLOAD READS THE FILE ITSELF INSTEAD OF COPYING OUT OF THE MMAP.
+ *
+ * The first version was cudaMemcpy(dev, mmapped_source, bytes) once per tensor. Every 4 KiB of
+ * that source is a page fault taken inside the copy, so the disk read, the fault and the DMA
+ * are serialized on one thread with no overlap and a request size the disk considers small.
+ * Measured: 5.085 GiB in 20.2 s = 0.25 GB/s, against 6.27 GB/s of disk and 6.8 GB/s of
+ * pageable PCIe.
+ *
+ * Prefaulting the pages first — in parallel, with fadvise and a touch pass — got it to
+ * 6.3 s + 3.7 s. Better, and still wrong, because touching pages is not reading a file: it
+ * asks for 128 KiB at a time and waits.
+ *
+ * Big requests are half of it. The other half is threads, and I got that wrong once already:
+ * the O_DIRECT benchmark says 19 MiB preads give 6.27 GB/s on one thread and the same at 16,
+ * so I concluded the disk needs size and not concurrency. That holds for O_DIRECT. It does not
+ * hold for BUFFERED reads, which is what this is — every read also fills the page cache, and
+ * that path blocks per thread. The evidence was in this engine's own startup log: the parallel
+ * residency pass gets 3.9 GB/s and this serial upload got 0.79, same disk, same second.
+ *
+ * So: fill a large pinned buffer with several 19 MiB preads IN PARALLEL, then hand the whole
+ * filled span to one DMA. Size for the requests, threads for the buffering, and the DMA (27.7
+ * GB/s pinned) is fast enough to disappear between fills.
+ *
+ * A tensor already living in anonymous RAM (the FFN layers the GPU shares) is copied from
+ * there, not re-read: q35_wdata knows the difference. */
+static int q35cu_stage_upload(Q35Cu *G, const Q35Model *M, const gguf_tensor *T, void *d){
+    const void *host = q35_wdata(M, T);
+    const gguf_shard *sh = &M->m.shard[T->shard];
+    const int from_file = (host == (const void*)(sh->map ? sh->map + T->off : NULL))
+                          && sh->fd >= 0 && G->upstage && G->upstage_n > 0;
+    if(!from_file) return q35cu_h2d(d, host, (size_t)T->bytes);
+
+    const int64_t REQ  = 19LL<<20;                  /* what the disk was measured to like */
+    const int64_t SPAN = (int64_t)G->upstage_n;     /* what one DMA carries */
+    for(int64_t base = 0; base < T->bytes; base += SPAN){
+        const int64_t span = (T->bytes - base < SPAN) ? T->bytes - base : SPAN;
+        const int nreq = (int)((span + REQ - 1)/REQ);
+        int bad = 0;
+        #pragma omp parallel for schedule(dynamic, 1) reduction(|:bad)
+        for(int k = 0; k < nreq; k++){
+            const int64_t o   = (int64_t)k*REQ;
+            const int64_t len = (span - o < REQ) ? span - o : REQ;
+            int64_t done = 0;
+            while(done < len){
+                const ssize_t r = pread(sh->fd, (char*)G->upstage + o + done,
+                                        (size_t)(len - done), (off_t)(T->off + base + o + done));
+                if(r <= 0) break;
+                done += r;
+            }
+            if(done != len) bad |= 1;
+        }
+        if(bad) return q35cu_h2d(d, host, (size_t)T->bytes);       /* fall back whole */
+        if(!q35cu_h2d((char*)d + base, G->upstage, (size_t)span)) return 0;
+        /* AND THEN DROP IT FROM THE PAGE CACHE.
+         *
+         * These bytes now live in VRAM. A copy in the page cache is not a cache of anything —
+         * nothing will read the file again this run — and it is 5 GiB of pressure that has to
+         * come from somewhere. Where it came from, measured, was the FFN: the residency pass
+         * runs next, reads 9.65 GiB, and evicts exactly the tensors the upload just pulled in.
+         * Next start those are cold again, which is why the upload sat at 6.2 s no matter how
+         * the reads were shaped, while residency read the FFN warm at 4 GB/s. The two halves
+         * of startup were evicting each other in a loop. */
+        posix_fadvise(sh->fd, (off_t)(T->off + base), (off_t)span, POSIX_FADV_DONTNEED);
+    }
+    return 1;
+}
+
 static void *q35cu_up_t(Q35Cu *G, const Q35Model *M, const gguf_tensor *T, int64_t *acc){
     if(!T) return NULL;
     if(!q35cu_type_ok(T->type)){
@@ -122,7 +192,7 @@ static void *q35cu_up_t(Q35Cu *G, const Q35Model *M, const gguf_tensor *T, int64
                 T->name, T->bytes/1048576.0, q35cu_error());
         G->ok = 0; return NULL;
     }
-    if(!q35cu_h2d(d, q35_wdata(M, T), (size_t)T->bytes)){
+    if(!q35cu_stage_upload(G, M, T, d)){
         fprintf(stderr, "qwen35_cuda: upload of %s failed: %s\n", T->name, q35cu_error());
         G->ok = 0; return NULL;
     }
@@ -174,6 +244,13 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
     if(q35cu_log_on()) fprintf(stderr, "  [kernel] device        %s, %.2f GiB free\n",
                                q35cu_name(), vfree/1073741824.0);
 
+    /* 19 MiB is not a round number, it is the request size this project measured the disk to
+     * like. Pinned, so the DMA out of it runs at the bus rate rather than through the driver's
+     * own staging copy. Freed as soon as the upload is done — it is startup scratch. */
+    G->upstage_n = 152u<<20;   /* 8 x 19 MiB: eight requests in flight, one DMA */
+    G->upstage   = q35cu_host_alloc(G->upstage_n);
+    if(!G->upstage) G->upstage_n = 0;      /* not fatal: q35cu_stage_upload falls back */
+
     int64_t w = 0;
     for(int il = 0; il < c->n_layer && G->ok; il++){
         const Q35Layer *S = &M->L[il];
@@ -202,6 +279,7 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
     G->output      = q35cu_up_t(G, M, M->output, &w);
     G->output_norm = q35cu_up_f(G, M->output_norm, c->d_model, &w);
     G->vram_weights = w;
+    if(G->upstage){ q35cu_host_free(G->upstage); G->upstage = NULL; G->upstage_n = 0; }
     if(!G->ok) return 0;
 
     /* recurrent state: 48 layers x 48 heads x 64 KiB, constant in context length */
@@ -261,8 +339,8 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
      * 32768-token window does not overtake an 8192-token one until the context reaches
      * ~35k; at 8192 the breakeven is ~24k. So the window is capped low by default and the
      * VRAM goes to FFN layers, which pay from the first token. Raise it with
-     * COLIBRI_CUDA_KV_TOK when the sessions really are that long. */
-    { const char *we = getenv("COLIBRI_CUDA_KV_TOK");
+     * QWEN_CUDA_KV_TOK when the sessions really are that long. */
+    { const char *we = getenv("QWEN_CUDA_KV_TOK");
       int cap = we ? atoi(we) : 8192;
       if(cap >= 0 && cap < G->win) G->win = cap; }
     if(G->win > 0){
@@ -277,10 +355,10 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
      * ask for. Capped at half the remaining VRAM: a landing zone big enough to starve the
      * resident FFN of a layer is a net loss. */
     {
-        const char *se = getenv("COLIBRI_CUDA_STREAM");
+        const char *se = getenv("QWEN_CUDA_STREAM");
         G->stream_f = se ? atof(se) : 0.60;
         if(G->stream_f > 0.9) G->stream_f = 0.9;
-        { const char *pe = getenv("COLIBRI_CUDA_STREAM_PREFILL");
+        { const char *pe = getenv("QWEN_CUDA_STREAM_PREFILL");
           G->stream_f_b = pe ? atof(pe) : 0.85;
           if(G->stream_f_b > 0.92) G->stream_f_b = 0.92;
           if(G->stream_f_b < G->stream_f) G->stream_f_b = G->stream_f; }
@@ -324,7 +402,7 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
      * and buys nothing here, because the two sides cannot overlap anyway. */
     q35cu_mem(&vfree, &vtot);
     spare = (int64_t)vfree - (320<<20);
-    const char *fe = getenv("COLIBRI_CUDA_FFN_GB");
+    const char *fe = getenv("QWEN_CUDA_FFN_GB");
     if(fe){ const double gb = atof(fe); const int64_t cap = (int64_t)(gb*1073741824.0);
             if(cap < spare) spare = cap; }
     if(spare > 0){

@@ -1,5 +1,5 @@
-#ifndef COLIBRI_QWEN35_H
-#define COLIBRI_QWEN35_H
+#ifndef QWEN_QWEN35_H
+#define QWEN_QWEN35_H
 /* qwen35.h — Qwen3.5 (arch "qwen35") geometry, tensor binding and placement plan.
  *
  * WHY THIS ARCH NEEDED A NEW FRONT-END, AND WHY THE OLD ENGINE STILL APPLIES
@@ -374,7 +374,7 @@ static int64_t q35_ram_avail_bytes(void){ return q35_meminfo_kb("MemAvailable:")
  * not this process.
  *
  * Two rules, both hard:
- *   1. Stop GROWING RAM below COLIBRI_MEM_FLOOR_GB (default 2). Everything past that point
+ *   1. Stop GROWING RAM below QWEN_MEM_FLOOR_GB (default 2). Everything past that point
  *      goes to the disk tier, which is why the disk tier exists.
  *   2. If an allocation actually FAILS, stop. Do not retry, do not fall back to a smaller
  *      request, do not free something and try again — by then the machine is already in
@@ -382,7 +382,7 @@ static int64_t q35_ram_avail_bytes(void){ return q35_meminfo_kb("MemAvailable:")
  *      Exit, and say what was being asked for.
  */
 static int64_t q35_mem_floor(void){
-    const char *e = getenv("COLIBRI_MEM_FLOOR_GB");
+    const char *e = getenv("QWEN_MEM_FLOOR_GB");
     double gb = e ? atof(e) : 2.0;
     if(gb < 0.25) gb = 0.25;
     return (int64_t)(gb*(1024.0*1024.0*1024.0));
@@ -405,12 +405,12 @@ static void q35_oom(const char *what, int64_t bytes){
     const int64_t avail = q35_ram_avail_bytes();
     char buf[768];
     const int n = snprintf(buf, sizeof buf,
-        "\n[colibri] OUT OF MEMORY - stopping instead of trying again.\n"
+        "\n[qwen35] OUT OF MEMORY - stopping instead of trying again.\n"
         "  wanted    : %.3f GiB for %s\n"
         "  available : %.3f GiB   (floor %.2f GiB)\n"
         "  The context grows until memory runs out by design; this is that point. Nothing\n"
-        "  further is allocated. Free memory, lower COLIBRI_KV_RAM_GB, or point\n"
-        "  COLIBRI_KV_SPILL at a drive with room, and restart.\n",
+        "  further is allocated. Free memory, lower QWEN_KV_RAM_GB, or point\n"
+        "  QWEN_KV_SPILL at a drive with room, and restart.\n",
         bytes/(1024.0*1024*1024), what, avail/(1024.0*1024*1024),
         q35_mem_floor()/(1024.0*1024.0*1024.0));
     if(n > 0){
@@ -458,7 +458,7 @@ static void *q35_xrealloc(void *old, size_t n, const char *what){
     return p;
 }
 static int64_t q35_reserve_bytes(void){
-    const char *e = getenv("COLIBRI_RESERVE_GB");
+    const char *e = getenv("QWEN_RESERVE_GB");
     double gb = e ? atof(e) : 6.0;
     if(gb < 1) gb = 1;
     return (int64_t)(gb*(1024.0*1024.0*1024.0));
@@ -495,6 +495,26 @@ static void q35_reside(Q35Model *M, Q35Resident *R, int do_lock){
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     R->secs = (t1.tv_sec-t0.tv_sec) + 1e-9*(t1.tv_nsec-t0.tv_nsec);
+}
+
+/* Old scripts and old shells still say COLIBRI_*. Accept them: an environment variable that
+ * silently stopped being read is the worst kind of rename, because nothing fails — the engine
+ * just quietly runs with a different KV spill path or a different memory floor than the person
+ * setting it believes. Renaming is free; breaking someone's shell profile is not. */
+extern char **environ;
+static void q35_env_compat(void){
+    for(char **e = environ; *e; e++){
+        if(strncmp(*e, "COLIBRI_", 8)) continue;
+        const char *eq = strchr(*e, '=');
+        if(!eq) continue;
+        char name[128];
+        const size_t n = (size_t)(eq - *e) - 8;
+        if(n + 6 >= sizeof name) continue;
+        memcpy(name, "QWEN_", 5);
+        memcpy(name + 5, *e + 8, n);
+        name[5 + n] = 0;
+        if(!getenv(name)) setenv(name, eq + 1, 1);
+    }
 }
 
 /* THE CPU-SIDE WEIGHTS, IN MEMORY THE KERNEL CANNOT TAKE BACK.
@@ -571,7 +591,7 @@ static int q35_reside_anon(Q35Model *M, Q35Resident *R, int what){
         if(avail - need < floor_){
             fprintf(stderr, "qwen35: refusing to make %.2f GiB resident: only %.2f GiB is "
                     "available and the floor is %.2f GiB.\n"
-                    "        Free memory, or lower COLIBRI_RESERVE_GB, or use Q35_RES_FFN and "
+                    "        Free memory, or lower QWEN_RESERVE_GB, or use Q35_RES_FFN and "
                     "put gdn/attn/output on the GPU.\n",
                     need/(1024.0*1024*1024), avail/(1024.0*1024*1024), floor_/(1024.0*1024*1024));
             free(want);
@@ -595,9 +615,9 @@ static int q35_reside_anon(Q35Model *M, Q35Resident *R, int what){
      * A/B on the real model, 16 tokens: 4 KiB -> 0.43 s/token, FFN 36.39 GB/s; 2 MiB pages
      * (40% granted, rest lost to fragmentation) -> 0.43 s/token, FFN 36.25 GB/s. Identical
      * inside noise, and the hugepage run cost 29 s MORE to load because defrag=madvise does
-     * direct compaction. Available, measured, not worth it: COLIBRI_HUGEPAGE=1 to retry on a
+     * direct compaction. Available, measured, not worth it: QWEN_HUGEPAGE=1 to retry on a
      * machine with less fragmented memory. */
-    const int want_huge = getenv("COLIBRI_HUGEPAGE") != NULL;
+    const int want_huge = getenv("QWEN_HUGEPAGE") != NULL;
     M->anon = (uint8_t*)mmap(NULL, (size_t)need, PROT_READ|PROT_WRITE,
                              MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if(M->anon == MAP_FAILED){
@@ -627,16 +647,81 @@ static int q35_reside_anon(Q35Model *M, Q35Resident *R, int what){
     M->tw = (uint8_t**)calloc((size_t)M->m.n_tensors, sizeof(uint8_t*));
     if(!M->tw){ free(want); return 0; }
 
-    int64_t off = 0;
+    /* PARALLEL, AND READ WITH pread RATHER THAN COPIED OUT OF THE MMAP.
+     *
+     * Two separate costs, both measured, and the second one only became visible after the
+     * first was fixed:
+     *
+     *  1. The destination is a fresh anonymous mapping, so every 4 KiB written is a minor
+     *     fault before it is a store. 19 MiB chunks, this box: 1 thread 2.01 GB/s (2040
+     *     ns/page), 4 threads 7.07, 16 threads 13.98. Faults are taken per-CPU, so they
+     *     parallelize — which is why this is 7x and not the 4.3x the copy alone would give.
+     *
+     *  2. The SOURCE was the mmapped file, and a memcpy out of it faults the pages in one at
+     *     a time behind 128 KiB of readahead. One sequential stream gives an NVMe a queue
+     *     depth of one. Measured with the source cold: 9.65 GiB took 9.48 s = 1.02 GB/s,
+     *     against 6.27 GB/s that the same disk gives for 19 MiB pread requests.
+     *
+     * So: pread, in chunks, in parallel. The chunk is 19 MiB because that is what this
+     * project already measured the disk to like, and chunking rather than parallelizing over
+     * TENSORS matters because an FFN matrix is 85 MiB and a norm vector is 20 KiB — a split by
+     * tensor hands one thread five big ones and another five small ones.
+     *
+     * The offsets must be laid out BEFORE the parallel region: `off` was a running total, and
+     * a running total is exactly what a parallel loop cannot have. */
+    int64_t *offs = (int64_t*)malloc(sizeof(int64_t)*(size_t)(nw > 0 ? nw : 1));
+    if(!offs){ free(want); return 0; }
+    {
+        int64_t off = 0;
+        for(int i = 0; i < nw; i++){ offs[i] = off; off += (want[i]->bytes + 63) & ~63LL; }
+    }
+
+    typedef struct { uint8_t *dst; int fd; int64_t foff, len; const void *src; } ResChunk;
+    const int64_t CHUNK = 19LL<<20;
+    int nc = 0;
+    for(int i = 0; i < nw; i++) nc += (int)((want[i]->bytes + CHUNK - 1)/CHUNK);
+    ResChunk *ch = (ResChunk*)malloc(sizeof(ResChunk)*(size_t)(nc > 0 ? nc : 1));
+    if(!ch){ free(offs); free(want); return 0; }
+    nc = 0;
     for(int i = 0; i < nw; i++){
         const gguf_tensor *T = want[i];
+        const gguf_shard  *sh = &M->m.shard[T->shard];
         const void *src = gguf_data(&M->m, T);
-        if(!src) continue;
-        memcpy(M->anon + off, src, (size_t)T->bytes);
-        const int idx = (int)(T - M->m.t);
-        if(idx >= 0 && idx < M->m.n_tensors) M->tw[idx] = M->anon + off;
-        off += (T->bytes + 63) & ~63LL;
+        for(int64_t o = 0; o < T->bytes; o += CHUNK){
+            const int64_t len = (T->bytes - o < CHUNK) ? T->bytes - o : CHUNK;
+            ch[nc].dst  = M->anon + offs[i] + o;
+            ch[nc].fd   = sh->fd;
+            ch[nc].foff = (int64_t)T->off + o;
+            ch[nc].len  = len;
+            ch[nc].src  = src ? (const uint8_t*)src + o : NULL;   /* fallback if fd is gone */
+            nc++;
+        }
     }
+    #pragma omp parallel for schedule(dynamic, 1)
+    for(int i = 0; i < nc; i++){
+        if(ch[i].fd >= 0){
+            int64_t done = 0;
+            while(done < ch[i].len){
+                const ssize_t r = pread(ch[i].fd, ch[i].dst + done,
+                                        (size_t)(ch[i].len - done), (off_t)(ch[i].foff + done));
+                if(r <= 0) break;
+                done += r;
+            }
+            if(done == ch[i].len){
+                /* same as the weight upload: it is in anonymous RAM now, so a second copy in
+                 * the page cache only competes with the half of startup that has not run yet */
+                posix_fadvise(ch[i].fd, (off_t)ch[i].foff, (off_t)ch[i].len, POSIX_FADV_DONTNEED);
+                continue;
+            }
+        }
+        if(ch[i].src) memcpy(ch[i].dst, ch[i].src, (size_t)ch[i].len);
+    }
+    free(ch);
+    for(int i = 0; i < nw; i++){
+        const int idx = (int)(want[i] - M->m.t);
+        if(idx >= 0 && idx < M->m.n_tensors) M->tw[idx] = M->anon + offs[i];
+    }
+    free(offs);
     free(want);
 
     /* Measure, do not assume: mincore on the anonymous range says what is really there. */

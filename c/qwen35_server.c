@@ -44,11 +44,11 @@
 #include <pthread.h>
 
 #include "qwen35_cpu.h"
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 #include "qwen35_cu_spec.h"
 #endif
 #include "qwen35_cache.h"
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 #endif
 #include "tok.h"
 #include "tok_gguf.h"
@@ -75,7 +75,7 @@ static int       g_n_ctx = 8192;
 static int       g_verbose = 1;
 static volatile sig_atomic_t g_abort = 0;
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
 static Q35Cu      g_G;
 static Q35CuBatch g_Z;
 static Q35Mtp     g_P;
@@ -433,7 +433,7 @@ static void emit(Gen *g, Str *acc, Str *pend, const char *field, const char *b, 
 }
 
 static void forward1(int tok, int pos, float *logits){
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(g_gpu){ q35_forward_cu(&g_G, &g_R, tok, pos, logits); return; }
 #endif
     q35_forward(&g_R, tok, pos, logits);
@@ -455,7 +455,7 @@ static int prefill(const int *req, int n, float *logits, double *t_out, int *reu
     if(!ensure_ctx(n + 4)) return 0;
     const double t0 = now();
     int i = start;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(g_spec){
         const int SB = g_Z.S_max;
         float *xall = (float*)malloc(sizeof(float)*(size_t)SB*g_M.c.d_model);
@@ -475,7 +475,7 @@ static int prefill(const int *req, int n, float *logits, double *t_out, int *reu
 #endif
     for(; i < n && !g_abort; i++){
         forward1(req[i], i, (i == n-1) ? logits : NULL);
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         if(g_spec){ float h[8192]; q35_hidden(&g_R, h); q35_mtp_prefill_kv(&g_P, h, req[i], i); }
 #endif
         ctx_push(req[i]);
@@ -571,7 +571,7 @@ static void handle_chat(int fd, const char *body, size_t blen){
         if(ngen >= max_tokens) break;
         if(!ensure_ctx(pos + 8)) break;
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         /* One speculative round: the MTP head drafts, and the trunk verifies BOTH positions
          * in a single pass over the weights. The true token is always sampled from the
          * trunk's own logits, so accepting only on an exact match leaves the output
@@ -748,7 +748,7 @@ static void engine_submit(int fd, const char *body, size_t len){
 static void handle_models(int fd){
     Str b = {0};
     s_fmt(&b, "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"created\":%ld,"
-              "\"owned_by\":\"colibri\"}]}", g_model_name, (long)time(NULL));
+              "\"owned_by\":\"qwenengine\"}]}", g_model_name, (long)time(NULL));
     http_send(fd, 200, "OK", "application/json", b.p, b.n);
     s_free(&b);
 }
@@ -756,13 +756,13 @@ static void handle_models(int fd){
 static void handle_health(int fd){
     Str b = {0};
     size_t vf = 0, vt = 0;
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(g_gpu) q35cu_mem(&vf, &vt);
 #endif
     s_fmt(&b, "{\"status\":\"ok\",\"model\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,"
               "\"gpu\":%s,\"speculative\":%s,\"vram_free_gib\":%.2f}",
           g_model_name, g_R.n_ctx, g_C.ctx_n,
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
           g_gpu ? "true" : "false", g_spec ? "true" : "false",
 #else
           "false", "false",
@@ -770,6 +770,27 @@ static void handle_health(int fd){
           vf/1073741824.0);
     http_send(fd, 200, "OK", "application/json", b.p, b.n);
     s_free(&b);
+}
+
+/* ?project=NAME out of a request target. Only what the caller can legally send: the name is
+ * validated in the harness, so nothing here needs to decode anything clever. */
+static void query_arg(const char *path, const char *key, char *out, size_t cap){
+    out[0] = 0;
+    const char *q = strchr(path, '?');
+    if(!q) return;
+    char pat[32];
+    const int pl = snprintf(pat, sizeof pat, "%s=", key);
+    for(const char *p = q + 1; p && *p; ){
+        if(!strncmp(p, pat, (size_t)pl)){
+            const char *v = p + pl;
+            size_t n = strcspn(v, "& ");
+            if(n >= cap) n = cap - 1;
+            memcpy(out, v, n); out[n] = 0;
+            return;
+        }
+        const char *amp = strchr(p, '&');
+        p = amp ? amp + 1 : NULL;
+    }
 }
 
 static int path_is(const char *p, const char *want){
@@ -826,7 +847,14 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
         }
         else if(path_is(path, "/v1/models") || path_is(path, "/models")) handle_models(fd);
         else if(path_is(path, "/v1/tools")  || path_is(path, "/tools")){
-            Str b = {0}; h_tools_json(&b);
+            char proj[96]; query_arg(path, "project", proj, sizeof proj);
+            const char *perr = NULL;
+            if(!h_use_project(proj, &perr)){ http_err(fd, 400, "Bad Request", perr); }
+            else { Str b = {0}; h_tools_json(&b);
+                   http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b); }
+        }
+        else if(path_is(path, "/v1/projects") || path_is(path, "/projects")){
+            Str b = {0}; h_projects_json(&b);
             http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
         }
         else if(path_is(path, "/health") || path_is(path, "/v1/health"))  handle_health(fd);
@@ -841,6 +869,16 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             engine_submit(fd, req.p + hdr_end, clen);
             s_free(&req);
             return 1;                    /* the engine thread owns fd now */
+        } else if(path_is(path, "/v1/projects") || path_is(path, "/projects")){
+            char *body = strndup(req.p + hdr_end, clen);
+            char *arena = NULL;
+            jval *r = body ? json_parse(body, &arena) : NULL;
+            const char *nm = r ? a_str(r, "name", NULL) : NULL, *perr = "no name given";
+            if(nm && h_make_project(nm, &perr)){
+                Str b = {0}; h_projects_json(&b);
+                http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
+            } else http_err(fd, 400, "Bad Request", perr);
+            free(arena); free(body);
         } else if(path_is(path, "/v1/tools/exec") || path_is(path, "/tools/exec")){
             /* Deliberately NOT on the engine thread. A tool call holds no model state, so
              * running it here lets the page fetch, list and grep while a generation streams —
@@ -882,8 +920,9 @@ static void fix_omp_env(char **argv){
      * handed to execve, not of the binary. pgrep, pkill, ps and every "is it running" check
      * then miss it, including this project's own `make stop`. Say the name explicitly. */
     prctl(PR_SET_NAME, "qwen35_server", 0, 0, 0);
-    if(getenv("COLIBRI_ENV_SET")) return;
-    setenv("COLIBRI_ENV_SET", "1", 1);
+    q35_env_compat();          /* COLIBRI_* still works */
+    if(getenv("QWEN_ENV_SET")) return;
+    setenv("QWEN_ENV_SET", "1", 1);
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "active", 1);
     if(!getenv("OMP_PROC_BIND"))   setenv("OMP_PROC_BIND", "close", 1);
     if(!getenv("OMP_PLACES"))      setenv("OMP_PLACES", "cores", 1);
@@ -908,7 +947,8 @@ static char *read_file(const char *p, size_t *len){
 }
 
 int main(int argc, char **argv){
-    const char *path = NULL, *host = "127.0.0.1", *www = NULL, *workspace = NULL;
+    const char *path = NULL, *host = "127.0.0.1", *www = NULL, *workspace = NULL,
+               *projects = NULL;
     /* 8192, not 32768. The KV tier is sized from n_ctx and the engine already holds 9.3 GiB
      * of resident weights; at 32768 the process reached 14.5 GiB RSS on a 31 GiB machine and
      * was OOM-killed mid-request. The context still GROWS past this — kvt_grow raises it on
@@ -925,6 +965,7 @@ int main(int argc, char **argv){
         else if(!strcmp(a,"--name") && i+1 < argc) g_model_name = argv[++i];
         else if(!strcmp(a,"--cpu")) cpu_only = 1;
         else if(!strcmp(a,"--workspace") && i+1 < argc) workspace = argv[++i];
+        else if(!strcmp(a,"--projects")  && i+1 < argc) projects  = argv[++i];
         else if(!strcmp(a,"--tools") && i+1 < argc){
             if(!h_mode_parse(argv[++i], &g_tmode)){
                 fprintf(stderr, "--tools: expected off | ro | workspace | full\n"); return 1; }
@@ -936,21 +977,26 @@ int main(int argc, char **argv){
             fprintf(stderr,
                 "usage: %s <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 8192]\n"
                 "          [--www webui.html] [--api-key KEY] [--name ID] [--cpu] [--quiet]\n"
-                "          [--tools MODE] [--workspace DIR] [--tool-timeout MS] [--tool-output N]\n\n"
+                "          [--tools MODE] [--projects DIR | --workspace DIR]\n"
+                "          [--tool-timeout MS] [--tool-output N]\n\n"
                 "  --ctx N        INITIAL context, not a limit. It grows on demand and stops\n"
-                "                 only at the memory floor (COLIBRI_MEM_FLOOR_GB, 2 GiB).\n"
+                "                 only at the memory floor (QWEN_MEM_FLOOR_GB, 2 GiB).\n"
                 "  --tools MODE   what the agent may do. The default is `workspace`.\n"
                 "                   off        no tools at all; a plain chat server\n"
                 "                   ro         read, grep, glob, list — nothing that writes\n"
                 "                   workspace  also write, confined to --workspace;\n"
                 "                              a shell command needs a human to approve it\n"
                 "                   full       everything, anywhere, unapproved\n"
-                "  --workspace D  the root the agent works in (default: the current directory).\n"
-                "                 Paths are resolved with realpath before they are compared to\n"
-                "                 it, so ..  and symlinks cannot leave it.\n\n"
+                "  --projects D   root holding one subdirectory per project; the client picks\n"
+                "                 one by NAME. Default $HOME/QwenEngine/projects.\n"
+                "  --workspace D  a single fixed workspace instead of projects.\n"
+                "                 Either way paths are resolved with realpath before they are\n"
+                "                 compared to the root, so .. and symlinks cannot leave it.\n\n"
                 "  GET  /                     the chat UI\n"
                 "  GET  /v1/models            model list\n"
-                "  GET  /v1/tools             tool schemas + policy + the agent system prompt\n"
+                "  GET  /v1/tools[?project=N] tool schemas + policy + the agent system prompt\n"
+                "  GET  /v1/projects          the projects that exist\n"
+                "  POST /v1/projects          create one: {name}\n"
                 "  POST /v1/chat/completions  OpenAI-compatible, streaming and not\n"
                 "  POST /v1/tools/exec        run one tool  {name, arguments, approved}\n"
                 "  GET  /health               engine status\n", argv[0]);
@@ -962,11 +1008,43 @@ int main(int argc, char **argv){
     /* The workspace is resolved ONCE, here, and every path a tool is handed is compared to the
      * result. Resolving it per call would let a symlink swapped in mid-session change what
      * "inside" means. */
-    if(!workspace) workspace = ".";
-    if(!realpath(workspace, g_root)){
-        fprintf(stderr, "--workspace %s: %s\n", workspace, strerror(errno)); return 1; }
-    { struct stat ws; if(stat(g_root, &ws) || !S_ISDIR(ws.st_mode)){
-        fprintf(stderr, "--workspace %s is not a directory\n", g_root); return 1; } }
+    /* Projects: one engine, many workspaces, each a direct subdirectory of this root. The
+     * default is ~/QwenEngine/projects — outside any checkout, because a coding agent whose
+     * workspace is the directory holding its own source is a footgun waiting for the first
+     * "clean up this repo". /home itself is root-owned, so "a folder in Home" means $HOME. */
+    static char pdefault[PATH_MAX];
+    if(!projects && !workspace){
+        const char *home = getenv("HOME");
+        if(home && *home){
+            snprintf(pdefault, sizeof pdefault, "%s/QwenEngine/projects", home);
+            mkdir(pdefault, 0755);                  /* parent may not exist; checked below */
+            struct stat st;
+            if(stat(pdefault, &st) || !S_ISDIR(st.st_mode)){
+                char up[PATH_MAX];
+                snprintf(up, sizeof up, "%s/QwenEngine", home);
+                mkdir(up, 0755); mkdir(pdefault, 0755);
+            }
+            projects = pdefault;
+        }
+    }
+    if(projects){
+        if(!realpath(projects, g_proot)){
+            fprintf(stderr, "--projects %s: %s\n", projects, strerror(errno)); return 1; }
+        struct stat st;
+        if(stat(g_proot, &st) || !S_ISDIR(st.st_mode)){
+            fprintf(stderr, "--projects %s is not a directory\n", g_proot); return 1; }
+        snprintf(g_root, sizeof g_root, "%s", g_proot);   /* the default when none is chosen */
+    }
+    if(workspace){                                   /* explicit single-workspace mode */
+        g_proot[0] = 0;
+        if(!realpath(workspace, g_root)){
+            fprintf(stderr, "--workspace %s: %s\n", workspace, strerror(errno)); return 1; }
+        struct stat ws;
+        if(stat(g_root, &ws) || !S_ISDIR(ws.st_mode)){
+            fprintf(stderr, "--workspace %s is not a directory\n", g_root); return 1; }
+    }
+    if(!g_root[0] && !realpath(".", g_root)){
+        fprintf(stderr, "cannot resolve the current directory\n"); return 1; }
 
     /* FAIL CLOSED. Tools on a non-loopback address with no key is remote code execution on
      * this machine for anyone who can route to the port — and `full` is that for anyone at
@@ -990,10 +1068,17 @@ int main(int argc, char **argv){
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);
 
+    double t_boot = now(), t_ph = t_boot;
+#define PHASE(name) do{ const double _n = now(); \
+    fprintf(stderr, "  [%6.2fs] %-22s %.2fs\n", _n - t_boot, (name), _n - t_ph); \
+    t_ph = _n; }while(0)
+
     if(!q35_open(&g_M, path)){ fprintf(stderr, "cannot open %s\n", path); return 1; }
+    PHASE("open gguf");
     const Q35Cfg *c = &g_M.c;
     tok_set_pre(&g_M.m);
     if(!tok_from_gguf(&g_T, &g_M.m, &g_ids)){ fprintf(stderr, "tokenizer failed\n"); return 1; }
+    PHASE("tokenizer");
     g_im_start = tok_id_of(&g_T, "<|im_start|>");
     g_im_end   = tok_id_of(&g_T, "<|im_end|>");
     g_eos      = g_im_end >= 0 ? g_im_end : g_ids.eos;
@@ -1007,7 +1092,7 @@ int main(int argc, char **argv){
      * --ctx sizes the FIRST allocation. From there the store grows on demand: kvt_grow
      * extends it, checks q35_mem_room() before every extension, and refuses — keeping the
      * context where it is and saying so — the moment MemAvailable would drop under the floor
-     * (COLIBRI_MEM_FLOOR_GB, 2 GiB by default). Nothing else stops it.
+     * (QWEN_MEM_FLOOR_GB, 2 GiB by default). Nothing else stops it.
      *
      * What --ctx really decides is how much of the KV stays in RAM rather than on the spill
      * tier, because the hot arena is sized once at open. So it is chosen from the memory that
@@ -1023,20 +1108,22 @@ int main(int argc, char **argv){
     const int64_t kv_250k = per_tok*250000;
     if(kvb > kv_250k) kvb = kv_250k;           /* no point reserving past the plan's horizon */
     if(kvb < per_tok*(int64_t)g_n_ctx + (32<<20)) kvb = per_tok*(int64_t)g_n_ctx + (32<<20);
-    if(!q35_state_init_ex(&g_R, &g_M, g_n_ctx, Q35_KV_Q8_0, kvb, getenv("COLIBRI_KV_SPILL"), 4096)){
+    if(!q35_state_init_ex(&g_R, &g_M, g_n_ctx, Q35_KV_Q8_0, kvb, getenv("QWEN_KV_SPILL"), 4096)){
         fprintf(stderr, "kv init failed\n"); return 1; }
+    PHASE("kv store");
     fprintf(stderr, "  context: %d initial, UNBOUNDED — grows on demand and stops only when\n"
                     "           MemAvailable reaches the %.2f GiB floor. Hot KV tier %.2f GiB"
                     " (%lld tokens), the rest spills to %s\n",
             g_n_ctx, q35_mem_floor()/1073741824.0, kvb/1073741824.0,
             (long long)(kvb/per_tok),
-            getenv("COLIBRI_KV_SPILL") ? getenv("COLIBRI_KV_SPILL") : "the spill tier");
+            getenv("QWEN_KV_SPILL") ? getenv("QWEN_KV_SPILL") : "the spill tier");
 
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     if(!cpu_only && q35cu_model_init(&g_G, &g_M, g_n_ctx, g_R.kv.fmt)){
         q35cu_align_win(&g_G, g_R.kv.chunk);
         q35cu_mark_resident_elsewhere(&g_G);
         g_gpu = 1;
+        PHASE("vram upload");
     } else if(!cpu_only){
         fprintf(stderr, "  gpu unavailable (%s) — CPU only\n", q35cu_error());
     }
@@ -1045,28 +1132,32 @@ int main(int argc, char **argv){
 #endif
     Q35Resident RES;
     q35_reside_anon(&g_M, &RES,
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         g_gpu ? Q35_RES_FFN : Q35_RES_ALL
 #else
         Q35_RES_ALL
 #endif
     );
-#ifndef COLIBRI_NO_CUDA
+    PHASE("ram residency");
+#ifndef QWEN_NO_CUDA
     if(g_gpu){
         q35cu_pin_weights(&g_G, &g_M);
+        PHASE("pin for DMA");
         q35cu_report(&g_G, stderr);
         q35cu_state_reset(&g_G);
         if(q35cu_batch_init(&g_Z, &g_G, &g_R, 8) && q35_mtp_init(&g_P, &g_R)) g_spec = 1;
+        PHASE("batch + mtp");
     }
 #endif
     q35_state_reset(&g_R);
     /* The cache holds the recurrent state at spaced positions. 6 slots x 150 MiB by default;
      * it shrinks itself rather than push the machine under the memory floor. */
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
     q35_cache_init(&g_C, &g_R, g_gpu ? &g_G : NULL, 6, 512);
 #else
     q35_cache_init(&g_C, &g_R, NULL, 6, 512);
 #endif
+    PHASE("prefix cache");
     q35_cache_report(&g_C, stderr);
 
     if(!www){
@@ -1094,15 +1185,16 @@ int main(int argc, char **argv){
         "    model    %s  (%d layers, ctx from %d and growing, %s)\n"
         "    web UI   http://%s:%d/\n"
         "    API      http://%s:%d/v1   (OpenAI-compatible)\n"
-        "    tools    %s in %s\n"
+        "    tools    %s%s%s\n"
         "    opencode  point a provider at the /v1 URL above; any api key works%s\n\n",
         g_model_name, c->n_layer, g_n_ctx,
-#ifndef COLIBRI_NO_CUDA
+#ifndef QWEN_NO_CUDA
         g_spec ? "gpu + speculative" : (g_gpu ? "gpu" : "cpu"),
 #else
         "cpu",
 #endif
-        host, port, host, port, h_mode_name(), g_root,
+        host, port, host, port, h_mode_name(),
+        g_proot[0] ? ", projects under " : " in ", g_proot[0] ? g_proot : g_root,
         g_api_key ? " except this one, which is required" : "");
 
     { pthread_t eng; pthread_create(&eng, NULL, engine_thread, NULL); pthread_detach(eng); }
