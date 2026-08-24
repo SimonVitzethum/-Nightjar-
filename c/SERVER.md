@@ -151,6 +151,21 @@ stehen ganz vorne im Prompt und ändern sich nie, also bedient der Präfix-Cache
 zweiten Zug vollständig. Genau darum schreibt die Oberfläche die Historie nie um: Anhängen
 behält den Cache, das Ändern einer früheren Nachricht wirft ihn weg.
 
+**Datei-Ansicht.** Links der Projektbaum, lazy aufgeklappt. Was der Agent schreibt oder ändert,
+bekommt einen grünen Punkt im Baum und einen **öffnen**-Knopf auf der Werkzeugkarte — der
+Betrachter rechts springt dann auf die geänderte Zeile. Zeilennummern, Syntaxfarben, und die
+Tabs **Datei / Trajectory** teilen sich das Panel.
+
+```
+GET /v1/fs/list?project=NAME&path=REL     Verzeichnisinhalt
+GET /v1/fs/read?project=NAME&path=REL     eine Datei, bis 2 MiB
+```
+
+Diese Endpunkte sind für Menschen geformt, nicht fürs Modell: rohe Bytes, keine Zeilennummern,
+kein 4-KiB-Budget. Aber sie sind **kein zweiter Weg ins Dateisystem** — sie gehen durch dasselbe
+`h_resolve`, dasselbe `realpath`, denselben Zaun und dasselbe thread-lokale Projekt wie die
+Werkzeuge.
+
 Oben rechts stehen dauerhaft **Cache-Trefferquote** und **Token/s**; das ⏱-Panel zeigt pro
 Schritt Prefill- und Decodezeit, Tokenzahlen und wie viele davon aus dem Cache kamen.
 

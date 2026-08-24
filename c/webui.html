@@ -150,6 +150,9 @@ details.think .inner{padding:0 13px 11px;font-size:13.5px;color:var(--fg-dim);wh
 .tc-cost{font-size:11px;color:var(--fg-faint);font-variant-numeric:tabular-nums;flex:0 0 auto;
   border:1px solid var(--line);border-radius:6px;padding:1px 6px}
 .tc-caret{color:var(--fg-faint);transition:.18s;flex:0 0 auto}
+.tc-open{flex:0 0 auto;border:1px solid var(--line);background:var(--bg);color:var(--fg-dim);
+  border-radius:6px;font:inherit;font-size:11.5px;padding:2px 8px;cursor:pointer}
+.tc-open:hover{border-color:var(--accent);color:var(--accent)}
 .tc.open .tc-caret{transform:rotate(90deg)}
 .tc-out{display:none;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;
   background:var(--bg);max-height:26rem;overflow:auto}
@@ -182,11 +185,71 @@ details.think .inner{padding:0 13px 11px;font-size:13.5px;color:var(--fg-dim);wh
   animation:blink 1.05s steps(2,start) infinite;margin-left:1px;border-radius:1px}
 @keyframes blink{to{visibility:hidden}}
 
-/* ---- trajectory drawer ---- */
-aside{width:0;flex:0 0 auto;border-left:1px solid var(--line);background:var(--bg-soft);
-  overflow:hidden auto;transition:width .18s}
-aside.on{width:23rem}
-.tj{padding:16px 16px 40px;font-size:13px;width:23rem}
+/* ---- the file tree, left ---- */
+aside#fs{width:0;flex:0 0 auto;border-right:1px solid var(--line);background:var(--bg-soft);
+  overflow:hidden;transition:width .18s;display:flex;flex-direction:column}
+aside#fs.on{width:17rem}
+.fsh{display:flex;align-items:center;gap:8px;padding:10px 12px 8px;flex:0 0 auto;
+  border-bottom:1px solid var(--line)}
+.fsh b{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--fg-faint);
+  font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fsh button{background:none;border:0;color:var(--fg-faint);cursor:pointer;font:inherit;
+  font-size:13px;padding:2px 5px;border-radius:5px}
+.fsh button:hover{background:var(--bg-alt);color:var(--fg)}
+.tree{flex:1;overflow:auto;padding:6px 0 20px;font-size:13px;width:17rem}
+.tree .row{display:flex;align-items:center;gap:5px;padding:2.5px 10px;cursor:pointer;
+  white-space:nowrap;user-select:none;color:var(--fg-dim)}
+.tree .row:hover{background:var(--bg-alt);color:var(--fg)}
+.tree .row.sel{background:var(--accent-soft);color:var(--accent)}
+.tree .cv{width:11px;flex:0 0 auto;text-align:center;transition:.15s;color:var(--fg-faint)}
+.tree .row.open .cv{transform:rotate(90deg)}
+.tree .ic{width:13px;flex:0 0 auto;text-align:center;opacity:.75;font-size:11px}
+.tree .nm{overflow:hidden;text-overflow:ellipsis}
+.tree .row.touched .nm{color:var(--ok);font-weight:600}
+.tree .row.touched::after{content:"●";font-size:8px;color:var(--ok);margin-left:auto;
+  padding-left:6px}
+.tree .kids{display:none}
+.tree .kids.on{display:block}
+
+/* ---- right panel: file viewer + trajectory ---- */
+aside#side{width:0;flex:0 0 auto;border-left:1px solid var(--line);background:var(--bg-soft);
+  overflow:hidden;transition:width .18s;display:flex;flex-direction:column}
+aside#side.on{width:34rem}
+.tabs{display:flex;gap:0;flex:0 0 auto;border-bottom:1px solid var(--line);background:var(--bg)}
+.tabs button{flex:0 0 auto;background:none;border:0;border-bottom:2px solid transparent;
+  color:var(--fg-faint);font:inherit;font-size:12.5px;padding:9px 15px;cursor:pointer}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+.tabs .sp{flex:1}
+.tabs .x{color:var(--fg-faint);padding:9px 13px}
+.pane{display:none;flex:1;overflow:auto;min-width:34rem}
+.pane.on{display:block}
+
+.fv-h{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);
+  padding:9px 14px;display:flex;align-items:center;gap:10px;z-index:2}
+.fv-h .p{font-family:var(--mono);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;flex:1;direction:rtl;text-align:left}
+.fv-h .m{font-size:11px;color:var(--fg-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
+.fv-h .dt{border:1px solid var(--line);background:var(--bg-soft);color:var(--fg-dim);
+  border-radius:6px;font:inherit;font-size:11.5px;padding:2px 8px;cursor:pointer}
+.fv-h .dt.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.fv{font-family:var(--mono);font-size:12.5px;line-height:1.55;padding:8px 0 40px}
+.fv .ln{display:flex}
+.fv .ln>i{flex:0 0 auto;width:3.6rem;text-align:right;padding-right:12px;color:var(--fg-faint);
+  font-style:normal;user-select:none;font-variant-numeric:tabular-nums}
+.fv .ln>span{white-space:pre;padding-right:16px}
+.fv .ln.add{background:var(--ok-soft)}
+.fv .ln.del{background:var(--bad-soft)}
+.fv .ln.add>i::after{content:"+";color:var(--ok);margin-left:5px}
+.fv .ln.del>i::after{content:"−";color:var(--bad);margin-left:5px}
+.fv .ln.hit{background:var(--accent-soft)}
+.k{color:#a626a4}.s{color:#50a14f}.c{color:var(--fg-faint);font-style:italic}
+.n{color:#986801}.t{color:#4078f2}
+:root[data-theme="dark"] .k,:root:not([data-theme="light"]) .k{color:#c678dd}
+:root[data-theme="dark"] .s,:root:not([data-theme="light"]) .s{color:#98c379}
+:root[data-theme="dark"] .n,:root:not([data-theme="light"]) .n{color:#d19a66}
+:root[data-theme="dark"] .t,:root:not([data-theme="light"]) .t{color:#61afef}
+.fv-empty{padding:3rem 1.5rem;text-align:center;color:var(--fg-faint);font-size:13.5px}
+.tj{padding:16px 16px 40px;font-size:13px}
 .tj h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--fg-faint);
   margin:0 0 12px;font-weight:600}
 .tj .tot{display:grid;grid-template-columns:1fr auto;gap:2px 10px;margin:0 0 18px;
@@ -225,7 +288,8 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
 .opts select{background:var(--bg-alt);border:1px solid var(--line);color:var(--fg);border-radius:6px;
   padding:2px 5px;font:inherit;font-size:12px}
 .opts .hint{margin-left:auto;font-variant-numeric:tabular-nums}
-@media(max-width:900px){ aside.on{width:0} }
+@media(max-width:1100px){ aside#side.on{width:0} }
+@media(max-width:820px){ aside#fs.on{width:0} }
 @media(max-width:640px){ .wrap{padding:18px 14px 30px} .opts .hint{display:none} .ws{display:none} }
 </style>
 </head>
@@ -240,20 +304,34 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
   <div class="ws" id="wsl"></div>
   <div class="sp"></div>
   <span id="stat"></span>
+  <button class="ghost" id="fsb" title="Dateien">Dateien</button>
   <button class="ghost" id="tjb" title="Trajectory">⏱</button>
   <button class="ghost" id="theme" title="Hell / dunkel">◐</button>
   <button class="ghost" id="reset">Neu</button>
 </header>
 
 <div class="shell">
+  <aside id="fs">
+    <div class="fsh"><b id="fstitle">Dateien</b>
+      <button id="fsref" title="Neu einlesen">↻</button></div>
+    <div class="tree" id="tree"></div>
+  </aside>
   <main id="main">
     <div class="wrap" id="chat"></div>
   </main>
-  <aside id="traj"><div class="tj">
-    <h2>Trajectory</h2>
-    <div class="tot" id="tjtot"></div>
-    <div id="tjsteps"></div>
-  </div></aside>
+  <aside id="side">
+    <div class="tabs">
+      <button data-t="file" class="on">Datei</button>
+      <button data-t="traj">Trajectory</button>
+      <div class="sp"></div><button class="x" id="sidex">✕</button>
+    </div>
+    <div class="pane on" id="pfile"><div class="fv-empty">Eine Datei im Baum links auswählen.</div></div>
+    <div class="pane" id="ptraj"><div class="tj">
+      <h2>Trajectory</h2>
+      <div class="tot" id="tjtot"></div>
+      <div id="tjsteps"></div>
+    </div></div>
+  </aside>
 </div>
 
 <footer>
@@ -299,7 +377,171 @@ $('#theme').onclick = () => {
   document.documentElement.dataset.theme = next;
   localStorage.setItem('theme', next);
 };
-$('#tjb').onclick = () => { $('#traj').classList.toggle('on'); $('#tjb').classList.toggle('on'); };
+/* ---------- the panels ---------- */
+function side(tab){
+  const a = $('#side');
+  if (tab){ a.classList.add('on');
+            for (const b of document.querySelectorAll('.tabs button[data-t]'))
+              b.classList.toggle('on', b.dataset.t === tab);
+            $('#pfile').classList.toggle('on', tab === 'file');
+            $('#ptraj').classList.toggle('on', tab === 'traj'); }
+  else a.classList.remove('on');
+  $('#tjb').classList.toggle('on', a.classList.contains('on'));
+}
+for (const b of document.querySelectorAll('.tabs button[data-t]')) b.onclick = () => side(b.dataset.t);
+$('#sidex').onclick = () => side(null);
+$('#tjb').onclick = () => side($('#side').classList.contains('on') ? null : 'traj');
+$('#fsb').onclick = () => {
+  const on = $('#fs').classList.toggle('on');
+  $('#fsb').classList.toggle('on', on);
+  if (on && !$('#tree').children.length) treeLoad('', $('#tree'));
+};
+
+/* ---------- the file tree ----------
+   Lazy: a folder is listed when it is first opened, not before. The whole tree of a real
+   repository is thousands of entries and the point of the panel is to find one file. */
+const touched = new Set();          /* what the agent changed this session */
+let openFile = null;
+
+function icon(name, dir){
+  if (dir) return '▸';
+  const e = (name.split('.').pop() || '').toLowerCase();
+  if (['c','h','cu','cpp','cc','hpp'].includes(e)) return 'c';
+  if (['js','ts','jsx','tsx','mjs'].includes(e))   return 'js';
+  if (['py'].includes(e))                          return 'py';
+  if (['md','txt','rst'].includes(e))              return '¶';
+  if (['json','yml','yaml','toml','ini'].includes(e)) return '{}';
+  if (['sh','bash'].includes(e))                   return '$';
+  return '·';
+}
+
+async function treeLoad(path, host){
+  host.innerHTML = '<div class="row" style="opacity:.5">lädt…</div>';
+  let r;
+  try {
+    r = await fetch('/v1/fs/list?project=' + encodeURIComponent(project)
+                    + '&path=' + encodeURIComponent(path || '.')).then(x => x.json());
+  } catch(e){ host.innerHTML = '<div class="row">Fehler</div>'; return; }
+  if (!r || !r.entries){ host.innerHTML = '<div class="row">—</div>'; return; }
+  host.innerHTML = '';
+  if (!r.entries.length){ host.innerHTML = '<div class="row" style="opacity:.5">(leer)</div>'; return; }
+  const depth = path ? path.split('/').length : 0;
+  for (const e of r.entries){
+    const full = path && path !== '.' ? path + '/' + e.name : e.name;
+    const row = document.createElement('div');
+    row.className = 'row' + (touched.has(full) ? ' touched' : '');
+    row.style.paddingLeft = (10 + depth * 12) + 'px';
+    row.dataset.path = full;
+    row.innerHTML = '<span class="cv">' + (e.dir ? '›' : ' ') + '</span>'
+                  + '<span class="ic">' + esc(e.dir ? '' : icon(e.name, false)) + '</span>'
+                  + '<span class="nm">' + esc(e.name) + '</span>';
+    host.appendChild(row);
+    if (e.dir){
+      const kids = document.createElement('div');
+      kids.className = 'kids';
+      host.appendChild(kids);
+      row.onclick = () => {
+        const on = kids.classList.toggle('on');
+        row.classList.toggle('open', on);
+        if (on && !kids.children.length) treeLoad(full, kids);
+      };
+    } else {
+      row.onclick = () => openInViewer(full);
+    }
+  }
+}
+$('#fsref').onclick = () => treeLoad('', $('#tree'));
+
+function markTouched(path){
+  if (!path) return;
+  touched.add(path.replace(/^\.\//, ''));
+  for (const r of document.querySelectorAll('#tree .row'))
+    if (touched.has(r.dataset.path)) r.classList.add('touched');
+}
+
+/* ---------- syntax colouring ----------
+   Small on purpose, and it escapes BEFORE it colours: the text comes from files the agent may
+   have written, so anything that emitted markup from the raw bytes would be an injection with
+   extra steps. Comments and strings are matched first so a keyword inside either stays plain. */
+const KW = new RegExp('\\b(' + (
+  'if else for while do switch case break continue return goto default sizeof typedef struct '+
+  'union enum static const volatile extern inline register unsigned signed void char short int '+
+  'long float double auto restrict '+
+  'function var let const class new delete typeof instanceof this null true false undefined '+
+  'async await yield export import from as of in try catch finally throw '+
+  'def lambda pass raise with global nonlocal None True False elif print '+
+  'fn pub impl trait mut match use mod crate self Self where'
+).split(' ').filter(Boolean).join('|') + ')\\b', 'g');
+
+function hl(src, name){
+  const e = (name.split('.').pop() || '').toLowerCase();
+  const hashComment = ['py','sh','bash','yml','yaml','toml','ini','mk',''].includes(e)
+                      || name === 'Makefile';
+  const rx = new RegExp(
+      '(\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*'
+      + (hashComment ? '|#[^\\n]*' : '') + ')'
+    + '|("(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|`(?:\\\\.|[^`\\\\])*`)'
+    + '|(^\\s*#[a-z]+)'
+    + '|(\\b\\d[\\w.]*\\b)', 'gm');
+  let out = '', last = 0, m;
+  while ((m = rx.exec(src))){
+    out += esc(src.slice(last, m.index)).replace(KW, '<span class="k">$1</span>');
+    const cls = m[1] ? 'c' : m[2] ? 's' : m[3] ? 't' : 'n';
+    out += '<span class="' + cls + '">' + esc(m[0]) + '</span>';
+    last = m.index + m[0].length;
+    if (!m[0].length) rx.lastIndex++;
+  }
+  out += esc(src.slice(last)).replace(KW, '<span class="k">$1</span>');
+  return out;
+}
+
+/* ---------- the viewer ---------- */
+function renderFile(path, text, hits){
+  const lines = text.split('\n');
+  if (lines.length && lines[lines.length-1] === '') lines.pop();
+  const html = lines.map((L, i) =>
+    '<div class="ln' + (hits && hits.has(i+1) ? ' hit' : '') + '"><i>' + (i+1)
+    + '</i><span>' + hl(L, path) + '</span></div>').join('');
+  return '<div class="fv">' + (html || '<div class="fv-empty">(leer)</div>') + '</div>';
+}
+
+async function openInViewer(path, hitText){
+  side('file');
+  for (const r of document.querySelectorAll('#tree .row'))
+    r.classList.toggle('sel', r.dataset.path === path);
+  const pane = $('#pfile');
+  pane.innerHTML = '<div class="fv-empty">lädt…</div>';
+  let r;
+  try {
+    r = await fetch('/v1/fs/read?project=' + encodeURIComponent(project)
+                    + '&path=' + encodeURIComponent(path)).then(x => x.json());
+  } catch(e){ pane.innerHTML = '<div class="fv-empty">' + esc(String(e)) + '</div>'; return; }
+  if (r.error){ pane.innerHTML = '<div class="fv-empty">' + esc(r.error.message || 'Fehler') + '</div>'; return; }
+  openFile = path;
+  if (r.binary){
+    pane.innerHTML = '<div class="fv-h"><span class="p">' + esc(path) + '</span>'
+      + '<span class="m">' + r.size + ' B</span></div>'
+      + '<div class="fv-empty">Binärdatei — nichts anzuzeigen.</div>';
+    return;
+  }
+  /* if the agent just changed something here, jump to it and mark it */
+  let hits = null;
+  if (hitText){
+    hits = new Set();
+    const first = hitText.split('\n')[0];
+    const ls = r.content.split('\n');
+    for (let i = 0; i < ls.length; i++) if (first && ls[i].includes(first.trim())) hits.add(i+1);
+  }
+  const kb = (r.size/1024).toFixed(r.size < 10240 ? 1 : 0);
+  pane.innerHTML = '<div class="fv-h"><span class="p">' + esc(path) + '</span>'
+    + '<span class="m">' + esc(kb) + ' KB'
+    + (r.truncated ? ' · gekürzt' : '') + '</span></div>'
+    + renderFile(path, r.content, hits);
+  if (hits && hits.size){
+    const el = pane.querySelector('.ln.hit');
+    if (el) el.scrollIntoView({ block:'center' });
+  }
+}
 
 /* ---------- a small markdown renderer ----------
    Deliberately small: fenced code, inline code, headings, lists, quotes, tables, bold/italic,
@@ -693,6 +935,23 @@ async function runTool(call, host){
            (res.ms !== undefined ? res.ms.toFixed(0) + ' ms' : ms.toFixed(0) + ' ms')
              + (res.exit ? ' · exit ' + res.exit : ''),
            text, bad);
+
+  /* A file the agent touched should be one click away from being READ, not just described.
+     The tree marks it and the card opens it at the changed line — the point of the panel is
+     to check the work, and checking means looking at the file, not at the summary of it. */
+  if (!bad && args.path && (name === 'write_file' || name === 'edit_file')){
+    markTouched(args.path);
+    if ($('#fs').classList.contains('on')) treeLoad('', $('#tree'));
+    const b = document.createElement('button');
+    b.className = 'tc-open';
+    b.textContent = 'öffnen';
+    b.onclick = ev => { ev.stopPropagation();
+                        openInViewer(args.path.replace(/^\.\//, ''),
+                                     name === 'edit_file' ? args.new_string : null); };
+    card.querySelector('.tc-caret').before(b);
+    if (openFile === args.path.replace(/^\.\//, '')) openInViewer(openFile);
+  }
+  if (!bad && name === 'bash' && $('#fs').classList.contains('on')) treeLoad('', $('#tree'));
   tj.tool_s += (res.ms || ms)/1000;
   tjPush({ kind:'tool', name, ms: res.ms !== undefined ? res.ms : ms,
            bytes: text.length, exit: res.exit });
@@ -833,7 +1092,12 @@ async function loadProjects(){
 
 $('#proj').onchange = async e => {
   project = e.target.value; localStorage.setItem('project', project);
+  touched.clear(); openFile = null;
+  $('#tree').innerHTML = '';
+  $('#pfile').innerHTML = '<div class="fv-empty">Eine Datei im Baum links auswählen.</div>';
+  $('#fstitle').textContent = project || 'Dateien';
   await loadTools(); applyMode(); newChat();
+  if ($('#fs').classList.contains('on')) treeLoad('', $('#tree'));
 };
 $('#pnew').onclick = async () => {
   const name = prompt('Name des neuen Projekts (Buchstaben, Ziffern, . _ -):');
@@ -850,7 +1114,11 @@ $('#pnew').onclick = async () => {
   if (h) $('#mname').textContent = h.model + ' · ' + (h.speculative ? 'GPU + spekulativ' : h.gpu ? 'GPU' : 'CPU');
   await loadProjects();
   await loadTools();
+  $('#fstitle').textContent = project || 'Dateien';
   applyMode(); newChat();
+  if (toolMode !== 'off'){ $('#fs').classList.add('on'); $('#fsb').classList.add('on');
+                           treeLoad('', $('#tree')); }
+  else { $('#fsb').style.display = 'none'; }
 })();
 ta.focus();
 </script>

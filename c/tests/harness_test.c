@@ -170,6 +170,14 @@ int main(void){
     ok(!strcmp(field(r, "decision"), "deny"), "a MISSING path outside is refused, not reported missing");
     ok(has(r, "content", "outside the workspace"), "and it says so in the same words");
     free(ar); ar = NULL;
+    /* And the same again where not even the PARENT exists outside the tree. The first fix
+     * only covered a missing file whose directory was there; this one is decided lexically,
+     * so the answer no longer depends on the filesystem at all. */
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../../../nowhere/at/all\"}}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a path whose PARENT is also absent and outside is refused");
+    ok(has(r, "content", "outside the workspace"), "and in the same words as an existing one");
+    free(ar); ar = NULL;
+
     r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"inside-but-absent\"}}", &ar, &raw);
     ok(!strcmp(field(r, "decision"), "allow") && has(r, "content", "No such file"),
        "while a missing path INSIDE still says it is missing");

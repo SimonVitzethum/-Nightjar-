@@ -219,10 +219,28 @@ curl localhost:8080/v1/tools/exec -H 'Content-Type: application/json' \
   -d '{"name":"bash","arguments":{"command":"git log --oneline -3"},"approved":true}'
 ```
 
-The UI shows a card per call — the command or the exact two lines an edit swaps, an
-approve/deny row when one is needed, and the output collapsed underneath. The **⏱** button
-opens a trajectory panel with per-step prefill and decode time, tokens, and how many of them
-came from the cache.
+#### The file view
+
+The panel on the left is the project tree, expanded lazily — a real repository is thousands of
+entries and the point of the panel is to find one file. A file the agent writes or edits gets a
+green dot in the tree and an **öffnen** button on its tool card, which opens it in the viewer on
+the right at the line that changed. Line numbers, syntax colouring, and a **Datei / Trajectory**
+tab pair sharing the panel.
+
+```
+GET /v1/fs/list?project=NAME&path=REL     directory entries
+GET /v1/fs/read?project=NAME&path=REL     one file, up to 2 MiB
+```
+
+These are shaped for a person, not for the model: raw bytes, no line numbers, no 4 KiB budget.
+But they are **not a second way into the filesystem** — they go through the same `h_resolve`,
+the same `realpath`, the same workspace fence and the same per-thread project as the tools. A
+second reader with its own idea of what "inside" means is exactly the second door this design
+does not have.
+
+The UI also shows a card per tool call — the command or the exact two lines an edit swaps, an
+approve/deny row when one is needed, and the output collapsed underneath. The **⏱** tab shows
+per-step prefill and decode time, tokens, and how many of them came from the cache.
 
 opencode does not use any of this: it brings its own tools and only needs
 `/v1/chat/completions`. The two can share one server.

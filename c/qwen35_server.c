@@ -772,6 +772,22 @@ static void handle_health(int fd){
     s_free(&b);
 }
 
+/* Percent-decoding, because a path query carries spaces, plus signs and non-ASCII names. Not
+ * a general URL decoder: it decodes into a fixed buffer and stops, and everything it produces
+ * still has to survive h_resolve afterwards. */
+static void url_decode(char *s){
+    char *w = s;
+    for(char *r = s; *r; r++){
+        if(*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])){
+            char h[3] = { r[1], r[2], 0 };
+            *w++ = (char)strtol(h, NULL, 16);
+            r += 2;
+        } else if(*r == '+') *w++ = ' ';
+        else *w++ = *r;
+    }
+    *w = 0;
+}
+
 /* ?project=NAME out of a request target. Only what the caller can legally send: the name is
  * validated in the harness, so nothing here needs to decode anything clever. */
 static void query_arg(const char *path, const char *key, char *out, size_t cap){
@@ -856,6 +872,24 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
         else if(path_is(path, "/v1/projects") || path_is(path, "/projects")){
             Str b = {0}; h_projects_json(&b);
             http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
+        }
+        /* The file view. Same h_resolve, same fence, same per-thread project as the tools —
+         * a second reader with its own idea of "inside" would be the second door. */
+        else if(path_is(path, "/v1/fs/list") || path_is(path, "/v1/fs/read")){
+            char proj[96], rel[1024];
+            query_arg(path, "project", proj, sizeof proj);
+            query_arg(path, "path", rel, sizeof rel);
+            url_decode(rel);
+            const char *err = "no tools on this server";
+            Str b = {0};
+            int ok = 0;
+            if(g_tmode == TM_OFF) err = "tools are disabled on this server";
+            else if(!h_use_project(proj, &err)) ok = 0;
+            else ok = path_is(path, "/v1/fs/list") ? h_fs_list(&b, rel, &err)
+                                                   : h_fs_read(&b, rel, &err);
+            if(ok) http_send(fd, 200, "OK", "application/json", b.p, b.n);
+            else   http_err(fd, 400, "Bad Request", err);
+            s_free(&b);
         }
         else if(path_is(path, "/health") || path_is(path, "/v1/health"))  handle_health(fd);
         else http_err(fd, 404, "Not Found", "no such path");
@@ -996,6 +1030,8 @@ int main(int argc, char **argv){
                 "  GET  /v1/models            model list\n"
                 "  GET  /v1/tools[?project=N] tool schemas + policy + the agent system prompt\n"
                 "  GET  /v1/projects          the projects that exist\n"
+                "  GET  /v1/fs/list           directory listing for the file view\n"
+                "  GET  /v1/fs/read           one file, for the file view\n"
                 "  POST /v1/projects          create one: {name}\n"
                 "  POST /v1/chat/completions  OpenAI-compatible, streaming and not\n"
                 "  POST /v1/tools/exec        run one tool  {name, arguments, approved}\n"

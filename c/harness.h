@@ -146,6 +146,40 @@ static int h_under_root(const char *abs){
     return abs[n] == 0 || abs[n] == '/';
 }
 
+/* Normalize "." and ".." TEXTUALLY, touching no filesystem.
+ *
+ * This exists so the fence decision does not depend on what happens to be on disk. realpath
+ * cannot answer for a path that is not there, so the version before this fell through to
+ * "parent directory does not exist" for ../../../etc/passwd — a different answer than the
+ * "outside the workspace" a path that DOES exist gets, which is an existence oracle one level
+ * further up than the one I closed first. Lexically, the question has an answer either way:
+ * that path leaves the root, and nothing about the disk changes that. */
+static void h_lexical(const char *in, char *out, size_t cap){
+    char *w = out;
+    const char *end = out + cap - 1;
+    *w = 0;
+    for(const char *p = in; *p; ){
+        while(*p == '/') p++;
+        if(!*p) break;
+        const char *seg = p;
+        while(*p && *p != '/') p++;
+        const size_t n = (size_t)(p - seg);
+        if(n == 1 && seg[0] == '.') continue;
+        if(n == 2 && seg[0] == '.' && seg[1] == '.'){
+            char *slash = strrchr(out, '/');       /* pop one component */
+            if(slash) *slash = 0; else out[0] = 0;
+            w = out + strlen(out);
+            continue;
+        }
+        if(w + n + 1 >= end) break;
+        *w++ = '/';
+        memcpy(w, seg, n);
+        w += n;
+        *w = 0;
+    }
+    if(!out[0]){ out[0] = '/'; out[1] = 0; }
+}
+
 /* Resolve a path argument to an absolute, symlink-free path inside the workspace.
  * need_exists=0 means the target itself may be absent — then its PARENT must exist and be
  * inside, which is what a write to a new file needs. */
@@ -157,6 +191,21 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
                            *err = "path too long"; return 0; } }
     else             { if(snprintf(joined, sizeof joined, "%s/%s", h_root(), rel) >= (int)sizeof joined){
                            *err = "path too long"; return 0; } }
+
+    /* The fence, lexically, before anything is looked up. A path that leaves the root on
+     * paper is refused with the same words whether or not it exists — no oracle, and no
+     * filesystem access to produce one with. realpath still runs afterwards, because a
+     * SYMLINK out of the tree is invisible to this and only it can catch that. */
+    if(g_tmode != TM_FULL){
+        char lex[PATH_MAX];
+        h_lexical(joined, lex, sizeof lex);
+        if(!h_under_root(lex)){
+            snprintf(msg, sizeof msg,
+                     "%s resolves to %s, which is outside the workspace %s — refused",
+                     rel, lex, h_root());
+            *err = msg; h_out_of_tree = 1; return 0;
+        }
+    }
 
     if(realpath(joined, out) == NULL){
         /* THE CONFINEMENT DECIDES FIRST, EVEN WHEN THE TARGET IS NOT THERE.
@@ -757,6 +806,97 @@ static int t_grep(jval *a, Str *o, int *code, const char **err){
                                       "narrow the pattern or pass a glob\n", w.hits);
     else if(w.hits >= w.max) s_fmt(o, "\n%d matches, stopped at the limit — narrow the pattern\n", w.hits);
     else s_fmt(o, "\n%d match%s\n", w.hits, w.hits == 1 ? "" : "es");
+    return 1;
+}
+
+/* ---------------- the filesystem view, for the HUMAN ----------------
+ *
+ * The tools above are shaped for the model: numbered lines, a 4 KiB budget, results phrased so
+ * a 27B model knows what to do next. A person reading a file in the UI wants none of that —
+ * they want the bytes, all of them, and a tree to find them in.
+ *
+ * So these are separate endpoints, but NOT a separate path to the filesystem: they go through
+ * the same h_resolve, which means the same realpath, the same workspace fence and the same
+ * per-thread project. A second reader with its own idea of what "inside" means is exactly the
+ * second door this design does not have.
+ *
+ * They are READ class, so --tools ro still serves them and --tools off does not. */
+
+static int h_fs_cmp(const void *a, const void *b){
+    const char *x = *(const char**)a, *y = *(const char**)b;
+    /* directories first (marked by a leading \x01), then case-insensitive by name */
+    if((*x == 1) != (*y == 1)) return *x == 1 ? -1 : 1;
+    return strcasecmp(x + (*x == 1), y + (*y == 1));
+}
+
+static int h_fs_list(Str *o, const char *rel, const char **err){
+    char abs[PATH_MAX];
+    if(!h_resolve(rel && *rel ? rel : ".", 1, abs, err)) return 0;
+    DIR *d = opendir(abs);
+    if(!d){ static __thread char m[PATH_MAX+64];
+            snprintf(m, sizeof m, "%s: %s", rel ? rel : ".", strerror(errno));
+            *err = m; return 0; }
+    char *v[2048]; int n = 0;
+    struct dirent *e;
+    while((e = readdir(d)) && n < 2048){
+        if(!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if(h_skip(e->d_name)) continue;
+        char full[PATH_MAX];
+        if(snprintf(full, sizeof full, "%s/%s", abs, e->d_name) >= (int)sizeof full) continue;
+        struct stat st;
+        if(lstat(full, &st) != 0) continue;
+        char row[512];
+        snprintf(row, sizeof row, "%s%s", S_ISDIR(st.st_mode) ? "\x01" : "", e->d_name);
+        v[n] = strdup(row);
+        if(!v[n]) break;
+        n++;
+    }
+    closedir(d);
+    qsort(v, (size_t)n, sizeof *v, h_fs_cmp);
+
+    s_cat(o, "{\"path\":");
+    s_json(o, h_rel(abs), strlen(h_rel(abs)));
+    s_cat(o, ",\"entries\":[");
+    for(int i = 0; i < n; i++){
+        const int isdir = v[i][0] == 1;
+        const char *nm = v[i] + isdir;
+        char full[PATH_MAX];
+        snprintf(full, sizeof full, "%s/%s", abs, nm);
+        struct stat st; st.st_size = 0; st.st_mtime = 0;
+        lstat(full, &st);
+        if(i) s_cat(o, ",");
+        s_cat(o, "{\"name\":");
+        s_json(o, nm, strlen(nm));
+        s_fmt(o, ",\"dir\":%s,\"size\":%lld,\"mtime\":%lld}",
+              isdir ? "true" : "false", (long long)st.st_size, (long long)st.st_mtime);
+        free(v[i]);
+    }
+    s_cat(o, "]}");
+    return 1;
+}
+
+static int h_fs_read(Str *o, const char *rel, const char **err){
+    char abs[PATH_MAX];
+    if(!h_resolve(rel, 1, abs, err)) return 0;
+    struct stat st;
+    if(stat(abs, &st)){ *err = "cannot stat"; return 0; }
+    if(S_ISDIR(st.st_mode)){ *err = "that is a directory"; return 0; }
+    /* 2 MiB: a person can scroll further than a model can afford to read, but a browser tab
+     * still has to render it, and nothing good is at the bottom of a 200 MiB log */
+    const size_t CAP = 2u<<20;
+    size_t n = 0;
+    char *b = h_slurp(abs, &n, CAP, err);
+    if(!b) return 0;
+    int binary = 0;
+    for(size_t i = 0; i < n && i < 4096; i++) if(!b[i]){ binary = 1; break; }
+    s_cat(o, "{\"path\":");
+    s_json(o, h_rel(abs), strlen(h_rel(abs)));
+    s_fmt(o, ",\"size\":%lld,\"shown\":%zu,\"truncated\":%s,\"binary\":%s,\"content\":",
+          (long long)st.st_size, binary ? (size_t)0 : n,
+          (size_t)st.st_size > n ? "true" : "false", binary ? "true" : "false");
+    s_json(o, binary ? "" : b, binary ? 0 : n);
+    s_cat(o, "}");
+    free(b);
     return 1;
 }
 
