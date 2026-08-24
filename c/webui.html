@@ -198,6 +198,16 @@ aside#fs.on{width:17rem}
 .fsh button{background:none;border:0;color:var(--fg-faint);cursor:pointer;font:inherit;
   font-size:13px;padding:2px 5px;border-radius:5px}
 .fsh button:hover{background:var(--bg-alt);color:var(--fg)}
+.chats{flex:0 0 auto;max-height:34vh;overflow:auto;padding:4px 0 6px;font-size:13px;width:17rem}
+.chats .c{display:flex;align-items:center;gap:6px;padding:5px 10px;cursor:pointer;color:var(--fg-dim)}
+.chats .c:hover{background:var(--bg-alt);color:var(--fg)}
+.chats .c.sel{background:var(--accent-soft);color:var(--accent)}
+.chats .c .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chats .c .n{font-size:10.5px;color:var(--fg-faint);font-variant-numeric:tabular-nums}
+.chats .c .x{opacity:0;color:var(--fg-faint);font-size:12px;padding:0 2px}
+.chats .c:hover .x{opacity:1}
+.chats .c .x:hover{color:var(--bad)}
+.chats .empty2{padding:8px 12px;color:var(--fg-faint);font-size:12px}
 .tree{flex:1;overflow:auto;padding:6px 0 20px;font-size:13px;width:17rem}
 .tree .row{display:flex;align-items:center;gap:5px;padding:2.5px 10px;cursor:pointer;
   white-space:nowrap;user-select:none;color:var(--fg-dim)}
@@ -338,11 +348,13 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
   <button class="ghost" id="fsb" title="Dateien">Dateien</button>
   <button class="ghost" id="tjb" title="Trajectory">⏱</button>
   <button class="ghost" id="theme" title="Hell / dunkel">◐</button>
-  <button class="ghost" id="reset">Neu</button>
+  <button class="ghost" id="reset">Neuer Chat</button>
 </header>
 
 <div class="shell">
   <aside id="fs">
+    <div class="fsh"><b>Chats</b><button id="cnew" title="Neuer Chat">+</button></div>
+    <div class="chats" id="chats"></div>
     <div class="fsh"><b id="fstitle">Dateien</b>
       <button id="fsref" title="Neu einlesen">↻</button></div>
     <div class="tree" id="tree"></div>
@@ -407,6 +419,7 @@ const chat = $('#chat'), main = $('#main'), ta = $('#ta'), send = $('#send');
 let messages = [];          /* append-only: see the note at the top of this file */
 let tools = [], policy = {}, sysPrompt = '', workspace = '', toolMode = 'off';
 let project = localStorage.getItem('project') || '', projectsRoot = '';
+let chatId = '', chatTitle = '', chats = [], saveTimer = null;
 let busy = false, ctrl = null, stopped = false;
 let sessionAllow = new Set();
 let pathGrants  = new Set();   /* paths the human has agreed to, this session, exactly */
@@ -442,6 +455,110 @@ $('#fsb').onclick = () => {
   $('#fsb').classList.toggle('on', on);
   if (on && !$('#tree').children.length) treeLoad('', $('#tree'));
 };
+
+/* ---------- conversations ----------
+   One list per project, stored by the SERVER. That is not where a chat log usually lives, and
+   the reason it lives there is the KV cache: the engine's checkpoints hold the recurrent state
+   for a specific token prefix, and that prefix is exactly this message list. A history that
+   only exists in one browser tab means a reload produces a different prefix and throws away
+   work that costs ~110 s per thousand tokens to rebuild.
+
+   Every request carries the chat id too, so the checkpoint eviction can tell two conversations
+   apart instead of treating them as one drifting sequence. */
+function newId(){
+  return 'c' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+}
+function titleFrom(msgs){
+  const u = msgs.find(m => m.role === 'user');
+  if (!u) return 'Neuer Chat';
+  const t = (typeof u.content === 'string' ? u.content : '').trim().replace(/\s+/g, ' ');
+  return t.slice(0, 60) || 'Neuer Chat';
+}
+
+async function chatsLoad(){
+  const r = await fetch('/v1/chats?project=' + encodeURIComponent(project))
+                  .then(x => x.json()).catch(() => null);
+  chats = (r && r.data) || [];
+  const host = $('#chats');
+  if (!chats.length){ host.innerHTML = '<div class="empty2">noch keine</div>'; return; }
+  host.innerHTML = chats.map(c =>
+    '<div class="c' + (c.id === chatId ? ' sel' : '') + '" data-id="' + esc(c.id) + '">'
+    + '<span class="t">' + esc(c.title || 'Ohne Titel') + '</span>'
+    + '<span class="n">' + c.n + '</span><span class="x" data-del="' + esc(c.id) + '">✕</span></div>'
+  ).join('');
+  for (const el of host.querySelectorAll('.c')){
+    el.onclick = e => {
+      if (e.target.dataset.del){ chatDelete(e.target.dataset.del); return; }
+      chatOpen(el.dataset.id);
+    };
+  }
+}
+
+/* Debounced, because a turn appends an assistant message and then one tool result per call —
+   writing the whole document five times in two seconds is pointless when the last write wins. */
+function chatSave(){
+  if (!chatId || messages.length < 2) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    chatTitle = chatTitle || titleFrom(messages);
+    fetch('/v1/chat/save', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ project, id: chatId, title: chatTitle, messages }) })
+      .then(() => chatsLoad()).catch(()=>{});
+  }, 700);
+}
+
+async function chatDelete(id){
+  await fetch('/v1/chat/delete', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ project, id }) }).catch(()=>{});
+  if (id === chatId){ chatId = ''; newChat(); }
+  chatsLoad();
+}
+
+async function chatOpen(id){
+  if (busy){ stopped = true; ctrl?.abort(); }
+  const r = await fetch('/v1/chat?project=' + encodeURIComponent(project)
+                        + '&id=' + encodeURIComponent(id)).then(x => x.json()).catch(() => null);
+  if (!r || !r.messages){ return; }
+  chatId = id; chatTitle = r.title || '';
+  messages = r.messages;
+  localStorage.setItem('chat:' + project, chatId);
+  tj = { steps: [], model_s:0, tool_s:0, ptok:0, ctok:0, cached:0 };
+  tjRender();
+  renderHistory();
+  chatsLoad();
+}
+
+/* Draw a stored conversation back out. Tool cards are reconstructed from the assistant's
+   tool_calls and the tool results that follow them, collapsed — a transcript you cannot expand
+   is a summary, and the whole point of the cards was being able to check the work. */
+function renderHistory(){
+  chat.innerHTML = '';
+  let v = null;
+  for (let i = 0; i < messages.length; i++){
+    const m = messages[i];
+    if (m.role === 'system') continue;
+    if (m.role === 'user'){ addUser(typeof m.content === 'string' ? m.content : ''); v = null; continue; }
+    if (m.role !== 'assistant') continue;
+    v = addBot(false);
+    if (m.reasoning_content){
+      v.think.style.display = '';
+      v.think.querySelector('summary').textContent = 'Gedankengang';
+      v.inner.textContent = m.reasoning_content;
+    } else v.think.style.display = 'none';
+    v.body.innerHTML = m.content ? md(m.content) : '';
+    for (const tc of (m.tool_calls || [])){
+      let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch {}
+      const card = addCard(v.tools, tc.function.name, args);
+      const res = messages[++i];
+      const text = (res && res.role === 'tool') ? String(res.content || '') : '';
+      if (!res || res.role !== 'tool') i--;
+      const bad = /^(REFUSED|The user declined)/.test(text);
+      cardDone(card, bad ? 'deny' : 'ok', '', text, false);
+    }
+  }
+  if (!messages.some(m => m.role !== 'system')) emptyState();
+  pinned = true; stick();
+}
 
 /* ---------- the file tree ----------
    Lazy: a folder is listed when it is first opened, not before. The whole tree of a real
@@ -979,7 +1096,7 @@ async function streamOnce(v, step, sink){
   ctrl = new AbortController();
 
   const body = {
-    model:'qwen', messages, stream:true,
+    model:'qwen', messages, stream:true, chat: chatId,
     temperature: parseFloat($('#temp').value),
     max_tokens: parseInt($('#maxt').value, 10),
     enable_thinking: $('#think').checked
@@ -1165,6 +1282,7 @@ async function ask(text){
       const am = { role:'assistant', content:res.content, reasoning_content:res.reasoning };
       if (res.calls.length && !died) am.tool_calls = res.calls;
       if (res.content || res.reasoning || am.tool_calls) messages.push(am);
+      chatSave();
 
       if (died || !res.calls.length || stopped) break;
       if (step === maxSteps){
@@ -1177,6 +1295,7 @@ async function ask(text){
       for (const c of res.calls){
         const out = await runTool(c, v.tools);
         messages.push({ role:'tool', tool_call_id: c.id, name: c.function.name, content: out });
+        chatSave();
         if (stopped) break;
       }
       if (stopped) break;
@@ -1228,14 +1347,29 @@ for (const b of document.querySelectorAll('#mode button'))
 
 function newChat(){
   stopped = true; ctrl?.abort();
+  chatId = newId(); chatTitle = '';
+  localStorage.setItem('chat:' + project, chatId);
   messages = [];
   if (mode === 'agent' && toolMode !== 'off' && sysPrompt) messages.push({ role:'system', content: sysPrompt });
   tj = { steps: [], model_s:0, tool_s:0, ptok:0, ctok:0, cached:0 };
   tjRender(); emptyState();
   $('#stat').innerHTML = ''; $('#hint').textContent = '';
+  chatsLoad();
 }
 $('#reset').onclick = newChat;
+$('#cnew').onclick  = newChat;
 $('#temp').oninput = e => $('#tv').textContent = (+e.target.value).toFixed(2);
+
+/* Coming back to a project means coming back to what you were doing in it: the chat you had
+   open last, or the newest one, or a fresh one if it is a new project. */
+async function resumeProject(){
+  await chatsLoad();
+  const want = localStorage.getItem('chat:' + project);
+  const pick = (want && chats.some(c => c.id === want)) ? want
+             : (chats.length ? chats[0].id : null);
+  if (pick) await chatOpen(pick);
+  else newChat();
+}
 
 /* ---------- what the server actually offers ---------- */
 /* The registry is fetched PER PROJECT: the system prompt names the workspace, so it differs,
@@ -1273,7 +1407,8 @@ $('#proj').onchange = async e => {
   $('#tree').innerHTML = '';
   $('#pfile').innerHTML = '<div class="fv-empty">Eine Datei im Baum links auswählen.</div>';
   $('#fstitle').textContent = project || 'Dateien';
-  await loadTools(); applyMode(); newChat();
+  await loadTools(); applyMode();
+  await resumeProject();
   if ($('#fs').classList.contains('on')) treeLoad('', $('#tree'));
 };
 $('#pnew').onclick = async () => {
@@ -1292,7 +1427,8 @@ $('#pnew').onclick = async () => {
   await loadProjects();
   await loadTools();
   $('#fstitle').textContent = project || 'Dateien';
-  applyMode(); newChat();
+  applyMode();
+  await resumeProject();
   if (toolMode !== 'off'){ $('#fs').classList.add('on'); $('#fsb').classList.add('on');
                            treeLoad('', $('#tree')); }
   else { $('#fsb').style.display = 'none'; }

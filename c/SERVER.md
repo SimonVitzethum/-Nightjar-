@@ -101,6 +101,29 @@ make serve ARGS='--workspace /ein/repo' # ein fester Arbeitsbereich statt Projek
 make tools                              # nur die Werkzeugschicht testen, ohne Modell
 ```
 
+**Chats.** Eine Chatliste pro Projekt, vom **Server** gespeichert unter
+`~/QwenEngine/chats/<projekt>/` — neben den Projekten, nicht darin: der Agent arbeitet im
+Projekt, und ein Ordner mit seinen eigenen Transkripten darin ist Rauschen in jedem `list_dir`
+und etwas, das er still kaputtmachen kann.
+
+`localStorage` wären drei Zeilen gewesen und ist der falsche Ort. **Ein Chat ist hier das,
+worauf der KV-Cache schlüsselt**: die Checkpoints halten den rekurrenten Zustand für ein
+bestimmtes Token-Präfix, und dieses Präfix *ist* diese Nachrichtenliste. Ein Verlauf, der nur in
+einem Browsertab existiert, heißt: nach einem Reload ein anderes Präfix und ~110 s pro tausend
+Token neu gerechnet.
+
+Gespeichert wird über eine temporäre Datei mit `rename`. Das Dokument wird bei jedem Zug neu
+geschrieben; ein Absturz mitten in einem 2-MB-Write ließe sonst abgeschnittenes JSON zurück —
+und das verliert nicht den letzten Zug, sondern den ganzen Verlauf samt Präfix.
+
+**Der Cache weiß, in welchem Chat er ist.** Jede Anfrage trägt ein Feld `chat`; das OpenAI-
+Protokoll ignoriert es, opencode und `curl` schicken weiter nichts. Es zählt wegen der
+Verdrängung: die alte Regel „wirf den Checkpoint weg, der einem Nachbarn am nächsten liegt"
+stimmt für Punkte auf **einer** Sequenz und ist falsch, sobald zwei Chats sich den Cache teilen
+— ein Checkpoint von A bei Token 780 und einer von B bei 800 sehen wie Nachbarn aus, und einer
+fliegt, um eine Lücke zu schließen, die es nie gab. Jetzt gilt die Lückenregel *innerhalb* eines
+Chats, und quer darüber behält jeder Chat mindestens einen Fuß in der Tür.
+
 **Projekte.** Eine Engine, viele Arbeitsbereiche. Alles, was die Engine zur Laufzeit besitzt,
 liegt unter `~/QwenEngine` — außerhalb jedes Checkouts:
 

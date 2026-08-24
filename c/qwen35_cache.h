@@ -62,6 +62,7 @@ typedef struct {
     float   *S, *conv;       /* host copies of the recurrent state */
     uint8_t *kv;             /* trunk attention KV for [0,pos), all layers, or NULL */
     uint64_t stamp;
+    uint64_t chat;           /* which conversation this belongs to; 0 = unattributed */
 } Q35Ckpt;
 
 typedef struct {
@@ -80,6 +81,7 @@ typedef struct {
     int       ctx_n, ctx_cap;
 
     int       spacing, next_mark;
+    uint64_t  chat;          /* the conversation the CURRENT request belongs to */
     int       kv_win;        /* tokens of KV a checkpoint can carry (the device window) */
     size_t    kv_stride;     /* bytes of one layer's K (or V) for one token */
     int       kv_layers;     /* TRUNK attention layers only — the draft head's slot is skipped */
@@ -261,23 +263,57 @@ static void q35_cache_reset_state(Q35Cache *C){
 #endif
 }
 
-/* Pick a slot for a checkpoint at `pos`. Prefer an empty one; otherwise evict whichever
- * existing checkpoint sits closest to a neighbour, since dropping it widens the worst gap
- * least. Position 0 is never a checkpoint (resuming there is just a reset). */
+/* Pick a slot for a checkpoint at `pos`.
+ *
+ * THE GAP HEURISTIC IS ONLY MEANINGFUL WITHIN ONE CONVERSATION.
+ *
+ * The original rule was "evict whichever checkpoint sits closest to a neighbour, since dropping
+ * it widens the worst gap least". That is right for points along one sequence and wrong the
+ * moment two conversations share the cache: a checkpoint of chat A at token 780 and one of
+ * chat B at 800 look like neighbours, and one of them gets dropped to widen a gap that does not
+ * exist — because they are not on the same line at all. The chat that lost its foothold then
+ * pays a full prefill on its next turn, which is a hundred seconds and up.
+ *
+ * So: every conversation keeps at least one checkpoint while there are slots to go round, and
+ * the gap rule applies inside a conversation. With N slots and more than N chats, the chat
+ * whose turn was longest ago gives one up — LRU across chats, gap-based within one.
+ *
+ * Position 0 is never a checkpoint (resuming there is just a reset). */
 static int q35_cache_slot_for(Q35Cache *C, int pos){
     for(int i = 0; i < C->n_slots; i++) if(C->ck[i].pos < 0) return i;
-    int worst = -1, worst_gap = 1<<30;
-    for(int i = 0; i < C->n_slots; i++){
-        int lo = 0, hi = pos;
-        for(int j = 0; j < C->n_slots; j++){
-            if(j == i || C->ck[j].pos < 0) continue;
-            if(C->ck[j].pos < C->ck[i].pos && C->ck[j].pos > lo) lo = C->ck[j].pos;
-            if(C->ck[j].pos > C->ck[i].pos && C->ck[j].pos < hi) hi = C->ck[j].pos;
+
+    /* how many slots each conversation currently holds */
+    int mine = 0;
+    for(int i = 0; i < C->n_slots; i++) if(C->ck[i].chat == C->chat) mine++;
+
+    if(mine >= 2){
+        /* inside my own conversation the original argument holds exactly */
+        int worst = -1, worst_gap = 1<<30;
+        for(int i = 0; i < C->n_slots; i++){
+            if(C->ck[i].chat != C->chat) continue;
+            int lo = 0, hi = pos;
+            for(int j = 0; j < C->n_slots; j++){
+                if(j == i || C->ck[j].pos < 0 || C->ck[j].chat != C->chat) continue;
+                if(C->ck[j].pos < C->ck[i].pos && C->ck[j].pos > lo) lo = C->ck[j].pos;
+                if(C->ck[j].pos > C->ck[i].pos && C->ck[j].pos < hi) hi = C->ck[j].pos;
+            }
+            const int gap = hi - lo;
+            if(gap < worst_gap){ worst_gap = gap; worst = i; }
         }
-        const int gap = hi - lo;
-        if(gap < worst_gap){ worst_gap = gap; worst = i; }
+        if(worst >= 0) return worst;
     }
-    return worst < 0 ? 0 : worst;
+
+    /* otherwise take from whoever has the most, oldest first — never from a conversation that
+     * is down to its last foothold unless everyone is */
+    int best = -1, best_count = 0; uint64_t best_stamp = ~0ull;
+    for(int i = 0; i < C->n_slots; i++){
+        int count = 0;
+        for(int j = 0; j < C->n_slots; j++) if(C->ck[j].chat == C->ck[i].chat) count++;
+        if(count > best_count || (count == best_count && C->ck[i].stamp < best_stamp)){
+            best_count = count; best_stamp = C->ck[i].stamp; best = i;
+        }
+    }
+    return best < 0 ? 0 : best;
 }
 
 /* Called after the model has consumed token index `pos-1`, i.e. the state now covers `pos`.
@@ -300,6 +336,7 @@ static void q35_cache_mark(Q35Cache *C, int pos){
     C->ck[s].pos = pos;
     q35_cache_grab(C, &C->ck[s]);
     C->ck[s].stamp = ++C->clock;
+    C->ck[s].chat  = C->chat;
 }
 
 /* ---- the lookup ----
@@ -328,6 +365,10 @@ static int q35_cache_begin(Q35Cache *C, const int *req, int n, int *reused){
     if(best >= 0 && C->ck[best].pos > live){
         q35_cache_put_back(C, &C->ck[best]);
         C->ck[best].stamp = ++C->clock;
+        /* A checkpoint that matched this request BELONGS to this request's conversation,
+         * whatever it was tagged with before — two chats sharing a prefix are, for the purpose
+         * of eviction, the same line. */
+        C->ck[best].chat = C->chat;
         start = C->ck[best].pos;
     } else if(live > 0){
         start = live;                               /* state already correct, nothing to copy */
@@ -341,6 +382,19 @@ static int q35_cache_begin(Q35Cache *C, const int *req, int n, int *reused){
     if(reused) *reused = start;
     return start;
 }
+
+/* Which conversation the next request belongs to. A 64-bit hash of the client's own id, so the
+ * cache never has to hold or understand the string. Requests that carry no id share bucket 0 —
+ * which is correct for opencode and curl, and costs them nothing they had before. */
+static uint64_t q35_cache_chat_id(const char *s){
+    if(!s || !*s) return 0;
+    uint64_t h = 1469598103934665603ull;             /* FNV-1a */
+    for(const unsigned char *p = (const unsigned char*)s; *p; p++){
+        h ^= *p; h *= 1099511628211ull;
+    }
+    return h ? h : 1;
+}
+static void q35_cache_use_chat(Q35Cache *C, const char *id){ C->chat = q35_cache_chat_id(id); }
 
 static void q35_cache_report(const Q35Cache *C, FILE *o){
     if(C->n_slots <= 0){ fprintf(o, "  prefix cache: off\n"); return; }

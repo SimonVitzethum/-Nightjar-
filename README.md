@@ -122,6 +122,47 @@ make serve ARGS='--workspace /one/repo'      # one fixed workspace instead of pr
 make tools                                   # test the tool layer alone — no model needed
 ```
 
+#### Conversations
+
+One list of chats per project, stored by the **server** and resumed when you come back to it.
+
+```
+GET  /v1/chats?project=N      the conversations, newest first
+GET  /v1/chat?project=&id=    one of them
+POST /v1/chat/save            {project, id, title, messages}
+POST /v1/chat/delete          {project, id}
+```
+
+`localStorage` would have been three lines, and it is the wrong place. **A conversation here is
+what the KV cache is keyed on**: the engine's checkpoints hold the recurrent state for a
+specific token prefix, and that prefix *is* this message list. A history that lives only in one
+browser tab means a reload, a second tab or a restart produces a different prefix and throws
+away work that costs about 110 s per thousand tokens to rebuild.
+
+They are stored **beside** the projects (`~/QwenEngine/chats/<project>/`), not inside them. The
+agent reads and writes in the project, and a folder of its own transcripts in there is both
+noise in every `list_dir` and something it can quietly corrupt.
+
+Each save is written to a temporary file and renamed. The document is rewritten on every turn,
+and a crash halfway through a 2 MB write would otherwise leave truncated JSON — which loses not
+the last turn but the whole history, including the prefix the cache is keyed on.
+
+#### The KV cache knows which conversation it is in
+
+Every request carries a `chat` field — an extra the OpenAI protocol ignores, which is why
+opencode and `curl` can keep sending nothing.
+
+It matters because of how checkpoints are evicted. The original rule was *"drop whichever
+checkpoint sits closest to a neighbour, since that widens the worst gap least"*, which is exactly
+right for points along **one** sequence and wrong the moment two conversations share the cache:
+a checkpoint of chat A at token 780 and one of chat B at 800 look like neighbours, and one gets
+dropped to widen a gap that does not exist — because they were never on the same line. The chat
+that lost its foothold then pays a full prefill on its next turn.
+
+So the gap rule now applies *within* a conversation, and across conversations the policy is:
+every chat keeps at least one checkpoint while there are slots to go round; past that, the chat
+whose turn was longest ago gives one up. `QWEN_CACHE_GB` buys more slots.
+
 #### Projects
 
 One engine, many workspaces. Everything the engine owns at runtime lives under

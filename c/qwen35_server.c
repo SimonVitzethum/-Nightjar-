@@ -59,6 +59,7 @@
 /* The tool half of the agent loop. It needs Str, s_json and now(), which is why it is included
  * here and not at the top with the rest. */
 #include "harness.h"
+#include "chatstore.h"
 
 /* ---------------- global engine state ---------------- */
 
@@ -501,6 +502,15 @@ static void handle_chat(int fd, const char *body, size_t blen){
     if(max_tokens <= 0 || max_tokens > 32768) max_tokens = 2048;
     jval *tools = json_get(root, "tools");
 
+    /* WHICH CONVERSATION THIS IS, for the prefix cache.
+     *
+     * An extra field, ignored by every other client, and that is the point: without it two
+     * conversations in the same project look like one drifting sequence to the checkpoint
+     * eviction, which then drops one chat's foothold to "widen a gap" between points that were
+     * never on the same line. opencode and curl send nothing and share bucket 0, exactly as
+     * before. */
+    q35_cache_use_chat(&g_C, (jt = json_get(root, "chat")) && jt->t == J_STR ? jt->str : NULL);
+
     Str prompt = {0};
     build_prompt(&prompt, msgs, tools, think);
 
@@ -846,6 +856,20 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             Str b = {0}; h_projects_json(&b);
             http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
         }
+        else if(path_is(path, "/v1/chats")){
+            char proj[96]; query_arg(path, "project", proj, sizeof proj);
+            Str b = {0}; cs_list_json(&b, proj);
+            http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
+        }
+        else if(path_is(path, "/v1/chat")){
+            char proj[96], id[96];
+            query_arg(path, "project", proj, sizeof proj);
+            query_arg(path, "id", id, sizeof id);
+            Str b = {0};
+            if(cs_get(&b, proj, id)) http_send(fd, 200, "OK", "application/json", b.p, b.n);
+            else                     http_err(fd, 404, "Not Found", "no such chat");
+            s_free(&b);
+        }
         /* The file view. Same h_resolve, same fence, same per-thread project as the tools —
          * a second reader with its own idea of "inside" would be the second door. */
         else if(path_is(path, "/v1/term")){
@@ -903,6 +927,24 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
                 http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
             } else http_err(fd, 400, "Bad Request", perr);
             free(arena); free(body);
+        } else if(path_is(path, "/v1/chat/save") || path_is(path, "/v1/chat/delete")){
+            char *body = strndup(req.p + hdr_end, clen);
+            char *arena = NULL;
+            jval *r = body ? json_parse(body, &arena) : NULL;
+            const char *proj = r ? a_str(r, "project", "") : "";
+            const char *id   = r ? a_str(r, "id", NULL) : NULL;
+            int ok = 0;
+            if(id && path_is(path, "/v1/chat/delete")) ok = cs_delete(proj, id);
+            else if(id){
+                jval *m = json_get(r, "messages");
+                Str mj = {0};
+                if(m) j_emit(&mj, m); else s_cat(&mj, "[]");
+                ok = cs_save(proj, id, a_str(r, "title", ""), m ? m->len : 0, mj.p);
+                s_free(&mj);
+            }
+            free(arena); free(body);
+            if(ok) http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 13);
+            else   http_err(fd, 400, "Bad Request", "could not store the chat");
         } else if(path_is(path, "/v1/term/input") || path_is(path, "/v1/term/signal")){
             /* Whatever arrives here goes down the PTY and nowhere else. It is not logged, not
              * echoed, and not put anywhere the model can read it: when it carries a sudo
@@ -1048,6 +1090,10 @@ int main(int argc, char **argv){
                 "  GET  /v1/models            model list\n"
                 "  GET  /v1/tools[?project=N] tool schemas + policy + the agent system prompt\n"
                 "  GET  /v1/projects          the projects that exist\n"
+                "  GET  /v1/chats?project=N   the conversations of a project\n"
+                "  GET  /v1/chat?project=&id= one conversation\n"
+                "  POST /v1/chat/save         {project, id, title, messages}\n"
+                "  POST /v1/chat/delete       {project, id}\n"
                 "  GET  /v1/fs/list           directory listing for the file view\n"
                 "  GET  /v1/fs/read           one file, for the file view\n"
                 "  GET  /v1/fs/raw            the bytes, for images the view can show\n"
@@ -1097,6 +1143,10 @@ int main(int argc, char **argv){
          * rest of the machine. */
         { char up[PATH_MAX]; snprintf(up, sizeof up, "%s/..", g_proot);
           if(!realpath(up, g_home)) g_home[0] = 0; }
+        /* Beside the projects, never inside one: the agent works in there, and a folder of its
+         * own transcripts is noise in every listing and something it can corrupt. */
+        if(g_home[0]){ snprintf(g_chat_root, sizeof g_chat_root, "%s/chats", g_home);
+                       mkdir(g_chat_root, 0700); }
     }
     if(workspace){                                   /* explicit single-workspace mode */
         g_proot[0] = 0;
