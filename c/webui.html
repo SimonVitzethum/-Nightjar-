@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Colibrì · Qwen3.5-27B</title>
+<style>
+:root{
+  --bg:#ffffff; --bg-alt:#f7f7f8; --bg-soft:#fafafa;
+  --fg:#1f1f22; --fg-dim:#6b6b76; --fg-faint:#9a9aa5;
+  --line:#e6e6ea; --accent:#c96442; --accent-soft:#f6ede9;
+  --code-bg:#f4f4f6; --user-bg:#f0f0f2;
+  --radius:14px; --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#1b1b1d; --bg-alt:#232326; --bg-soft:#1f1f22;
+    --fg:#e9e9ec; --fg-dim:#a0a0ab; --fg-faint:#70707c;
+    --line:#313136; --accent:#d97757; --accent-soft:#2c231f;
+    --code-bg:#232326; --user-bg:#2a2a2e;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#1b1b1d; --bg-alt:#232326; --bg-soft:#1f1f22;
+  --fg:#e9e9ec; --fg-dim:#a0a0ab; --fg-faint:#70707c;
+  --line:#313136; --accent:#d97757; --accent-soft:#2c231f;
+  --code-bg:#232326; --user-bg:#2a2a2e;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+  font-size:15.5px;line-height:1.65;-webkit-font-smoothing:antialiased;
+  display:flex;flex-direction:column;overflow:hidden}
+
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);
+  background:var(--bg);flex:0 0 auto}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;letter-spacing:-.01em}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex:0 0 auto;
+  box-shadow:0 0 0 3px var(--accent-soft)}
+.brand small{font-weight:400;color:var(--fg-dim);font-size:12.5px}
+header .sp{flex:1}
+button.ghost{background:none;border:1px solid var(--line);color:var(--fg-dim);border-radius:8px;
+  padding:5px 11px;font:inherit;font-size:13px;cursor:pointer;transition:.14s}
+button.ghost:hover{background:var(--bg-alt);color:var(--fg)}
+#stat{font-size:12px;color:var(--fg-faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+main{flex:1;overflow-y:auto;overscroll-behavior:contain;scroll-behavior:smooth}
+.wrap{max-width:46rem;margin:0 auto;padding:26px 20px 40px}
+
+.empty{text-align:center;padding:14vh 0 0;color:var(--fg-dim)}
+.empty h1{font-size:25px;font-weight:600;color:var(--fg);margin:0 0 8px;letter-spacing:-.02em}
+.empty p{margin:0 0 26px;font-size:14.5px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:34rem;margin:0 auto}
+.chip{border:1px solid var(--line);background:var(--bg-soft);border-radius:999px;padding:7px 14px;
+  font-size:13.5px;cursor:pointer;color:var(--fg-dim);transition:.14s}
+.chip:hover{border-color:var(--accent);color:var(--fg)}
+
+.msg{margin:0 0 26px}
+.msg.user{display:flex;justify-content:flex-end}
+.msg.user .body{background:var(--user-bg);border-radius:var(--radius);padding:11px 15px;max-width:82%;
+  white-space:pre-wrap;word-wrap:break-word}
+.msg.bot .role{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--fg-faint);
+  margin-bottom:7px;font-weight:500}
+.msg.bot .role .dot{width:7px;height:7px;box-shadow:none}
+.body{word-wrap:break-word;overflow-wrap:anywhere}
+.body>*:first-child{margin-top:0}.body>*:last-child{margin-bottom:0}
+.body p{margin:0 0 .85em}
+.body h1,.body h2,.body h3{margin:1.3em 0 .5em;line-height:1.3;font-weight:600;letter-spacing:-.01em}
+.body h1{font-size:1.35em}.body h2{font-size:1.2em}.body h3{font-size:1.06em}
+.body ul,.body ol{margin:0 0 .85em;padding-left:1.5em}
+.body li{margin:.2em 0}
+.body blockquote{margin:0 0 .85em;padding-left:1em;border-left:3px solid var(--line);color:var(--fg-dim)}
+.body a{color:var(--accent)}
+.body hr{border:0;border-top:1px solid var(--line);margin:1.4em 0}
+.body table{border-collapse:collapse;margin:0 0 .85em;font-size:.94em;display:block;overflow-x:auto}
+.body th,.body td{border:1px solid var(--line);padding:5px 10px;text-align:left}
+.body th{background:var(--bg-alt);font-weight:600}
+code{font-family:var(--mono);font-size:.88em;background:var(--code-bg);padding:.13em .38em;border-radius:5px}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;padding:13px 14px;
+  overflow-x:auto;margin:0 0 .9em;position:relative}
+pre code{background:none;padding:0;font-size:13px;line-height:1.55}
+pre .copy{position:absolute;top:7px;right:7px;opacity:0;transition:.14s;font-size:11.5px;
+  padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);
+  color:var(--fg-dim);cursor:pointer}
+pre:hover .copy{opacity:1}
+
+details.think{border:1px solid var(--line);border-radius:10px;margin:0 0 12px;background:var(--bg-soft)}
+details.think>summary{cursor:pointer;padding:8px 13px;font-size:13px;color:var(--fg-dim);
+  list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+details.think>summary::-webkit-details-marker{display:none}
+details.think>summary::before{content:"›";display:inline-block;transition:.18s;font-size:16px;line-height:1}
+details.think[open]>summary::before{transform:rotate(90deg)}
+details.think .inner{padding:0 13px 11px;font-size:13.5px;color:var(--fg-dim);white-space:pre-wrap}
+.tool{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;
+  background:var(--bg-soft);padding:9px 12px;margin:0 0 11px;font-family:var(--mono);font-size:12.5px}
+.tool b{font-family:var(--sans);color:var(--accent)}
+
+.cursor{display:inline-block;width:7px;height:1.05em;background:var(--fg);vertical-align:text-bottom;
+  animation:blink 1.05s steps(2,start) infinite;margin-left:1px;border-radius:1px}
+@keyframes blink{to{visibility:hidden}}
+
+footer{flex:0 0 auto;border-top:1px solid var(--line);background:var(--bg);padding:12px 20px 16px}
+.composer{max-width:46rem;margin:0 auto}
+.box{display:flex;align-items:flex-end;gap:9px;border:1px solid var(--line);border-radius:var(--radius);
+  background:var(--bg-soft);padding:8px 8px 8px 14px;transition:.14s}
+.box:focus-within{border-color:var(--accent)}
+textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);font:inherit;
+  max-height:190px;padding:5px 0;line-height:1.5}
+.send{flex:0 0 auto;width:33px;height:33px;border-radius:9px;border:0;background:var(--accent);
+  color:#fff;cursor:pointer;display:grid;place-items:center;transition:.14s}
+.send:disabled{opacity:.32;cursor:default}
+.send svg{width:16px;height:16px}
+.opts{display:flex;align-items:center;gap:14px;margin-top:9px;font-size:12px;color:var(--fg-faint);
+  flex-wrap:wrap}
+.opts label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.opts input[type=range]{width:78px;accent-color:var(--accent)}
+.opts input[type=number]{width:62px;background:var(--bg-alt);border:1px solid var(--line);
+  color:var(--fg);border-radius:6px;padding:2px 6px;font:inherit;font-size:12px}
+.opts .hint{margin-left:auto}
+@media(max-width:640px){ .wrap{padding:18px 14px 30px} .opts .hint{display:none} }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span>Colibrì <small id="mname">…</small></div>
+  <div class="sp"></div>
+  <span id="stat"></span>
+  <button class="ghost" id="theme" title="Hell / dunkel">◐</button>
+  <button class="ghost" id="reset">Neuer Chat</button>
+</header>
+
+<main id="main">
+  <div class="wrap" id="chat">
+    <div class="empty" id="empty">
+      <h1>Womit kann ich helfen?</h1>
+      <p>Läuft lokal auf dieser Maschine — GPU und CPU teilen sich jede Schicht.</p>
+      <div class="chips">
+        <div class="chip">Erklär mir Gated DeltaNet in drei Sätzen.</div>
+        <div class="chip">Schreib eine Python-Funktion für Binärsuche.</div>
+        <div class="chip">Was begrenzt Inferenzgeschwindigkeit auf einem Laptop?</div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="composer">
+    <div class="box">
+      <textarea id="ta" rows="1" placeholder="Nachricht schreiben…  (Enter senden, Shift+Enter neue Zeile)"></textarea>
+      <button class="send" id="send" title="Senden">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      </button>
+    </div>
+    <div class="opts">
+      <label title="0 = deterministisch">Temp <input type="range" id="temp" min="0" max="1.5" step="0.05" value="0.7"><span id="tv">0.70</span></label>
+      <label>Max <input type="number" id="maxt" value="1024" min="16" step="128"></label>
+      <label><input type="checkbox" id="think" checked> Denken zeigen</label>
+      <span class="hint" id="hint"></span>
+    </div>
+  </div>
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const chat = $('#chat'), main = $('#main'), ta = $('#ta'), send = $('#send');
+let messages = [], busy = false, ctrl = null;
+
+/* ---------- theme ---------- */
+const savedTheme = localStorage.getItem('theme');
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$('#theme').onclick = () => {
+  const cur = document.documentElement.dataset.theme
+    || (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('theme', next);
+};
+
+/* ---------- a small markdown renderer ----------
+   Deliberately small: fenced code, inline code, headings, lists, quotes, tables, bold/italic,
+   links. Everything is escaped first, so nothing the model writes can inject markup. */
+function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function inline(s){
+  return esc(s)
+    .replace(/`([^`\n]+)`/g, (_,c) => '<code>'+c+'</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
+function md(src){
+  const out = [];
+  const lines = src.split('\n');
+  let i = 0;
+  while (i < lines.length){
+    const L = lines[i];
+    const fence = L.match(/^```(\w*)/);
+    if (fence){
+      const lang = fence[1]; const buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++;
+      out.push('<pre><button class="copy">kopieren</button><code data-lang="'+esc(lang)+'">'
+               + esc(buf.join('\n')) + '</code></pre>');
+      continue;
+    }
+    const h = L.match(/^(#{1,3})\s+(.*)$/);
+    if (h){ const n = h[1].length; out.push('<h'+n+'>'+inline(h[2])+'</h'+n+'>'); i++; continue; }
+    if (/^\s*([-*+]|\d+\.)\s+/.test(L)){
+      const ordered = /^\s*\d+\./.test(L);
+      const items = [];
+      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i]))
+        items.push(inline(lines[i++].replace(/^\s*([-*+]|\d+\.)\s+/, '')));
+      out.push('<'+(ordered?'ol':'ul')+'>'+items.map(t=>'<li>'+t+'</li>').join('')+'</'+(ordered?'ol':'ul')+'>');
+      continue;
+    }
+    if (/^>\s?/.test(L)){
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/,''));
+      out.push('<blockquote>'+md(buf.join('\n'))+'</blockquote>');
+      continue;
+    }
+    if (/^\|.*\|/.test(L) && i+1 < lines.length && /^\|[\s:|-]+\|/.test(lines[i+1])){
+      const row = r => r.trim().replace(/^\||\|$/g,'').split('|').map(c=>c.trim());
+      const head = row(lines[i]); i += 2;
+      const body = [];
+      while (i < lines.length && /^\|.*\|/.test(lines[i])) body.push(row(lines[i++]));
+      out.push('<table><thead><tr>'+head.map(c=>'<th>'+inline(c)+'</th>').join('')+'</tr></thead><tbody>'
+        + body.map(r=>'<tr>'+r.map(c=>'<td>'+inline(c)+'</td>').join('')+'</tr>').join('')
+        + '</tbody></table>');
+      continue;
+    }
+    if (/^\s*---+\s*$/.test(L)){ out.push('<hr>'); i++; continue; }
+    if (!L.trim()){ i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^```|^#{1,3}\s|^\s*([-*+]|\d+\.)\s|^>|^\|/.test(lines[i]))
+      buf.push(lines[i++]);
+    out.push('<p>'+inline(buf.join('\n')).replace(/\n/g,'<br>')+'</p>');
+  }
+  return out.join('');
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('.copy');
+  if (!b) return;
+  navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent);
+  b.textContent = 'kopiert'; setTimeout(()=>b.textContent='kopieren', 1200);
+});
+
+/* ---------- rendering ---------- */
+function addUser(text){
+  $('#empty')?.remove();
+  const d = document.createElement('div');
+  d.className = 'msg user';
+  d.innerHTML = '<div class="body"></div>';
+  d.querySelector('.body').textContent = text;
+  chat.appendChild(d);
+  stick();
+}
+function addBot(){
+  const d = document.createElement('div');
+  d.className = 'msg bot';
+  d.innerHTML = '<div class="role"><span class="dot"></span>Qwen3.5</div>'
+              + '<details class="think" style="display:none"><summary>Denkt nach…</summary>'
+              + '<div class="inner"></div></details>'
+              + '<div class="tools"></div><div class="body"></div>';
+  chat.appendChild(d);
+  stick();
+  return { el:d, think:d.querySelector('details'), inner:d.querySelector('.inner'),
+           tools:d.querySelector('.tools'), body:d.querySelector('.body') };
+}
+let pinned = true;
+main.addEventListener('scroll', () => {
+  pinned = main.scrollHeight - main.scrollTop - main.clientHeight < 90;
+});
+function stick(){ if (pinned) main.scrollTop = main.scrollHeight; }
+
+/* ---------- talking to /v1/chat/completions ---------- */
+async function ask(text){
+  if (busy) return;
+  busy = true; send.disabled = true;
+  addUser(text);
+  messages.push({ role:'user', content:text });
+
+  const v = addBot();
+  let content = '', reasoning = '', firstTok = 0, nTok = 0;
+  const t0 = performance.now();
+  ctrl = new AbortController();
+
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method:'POST', headers:{'Content-Type':'application/json'}, signal:ctrl.signal,
+      body: JSON.stringify({
+        model:'qwen', messages, stream:true,
+        temperature: parseFloat($('#temp').value),
+        max_tokens: parseInt($('#maxt').value, 10),
+        enable_thinking: $('#think').checked
+      })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' — ' + (await r.text()).slice(0,200));
+
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for(;;){
+      const { done, value } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream:true });
+      let nl;
+      while ((nl = buf.indexOf('\n\n')) >= 0){
+        const frame = buf.slice(0, nl); buf = buf.slice(nl + 2);
+        if (!frame.startsWith('data:')) continue;
+        const payload = frame.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let j; try { j = JSON.parse(payload); } catch { continue; }
+        const d = j.choices?.[0]?.delta; if (!d) continue;
+        if (d.reasoning_content){
+          if (!firstTok) firstTok = performance.now();
+          reasoning += d.reasoning_content;
+          v.think.style.display = '';
+          if (!v.think.open) v.think.open = true;
+          v.inner.textContent = reasoning; nTok++; stick();
+        }
+        if (d.content){
+          if (!firstTok) firstTok = performance.now();
+          if (!content && reasoning){ v.think.open = false;
+            v.think.querySelector('summary').textContent = 'Gedankengang'; }
+          content += d.content; nTok++;
+          v.body.innerHTML = md(content) + '<span class="cursor"></span>';
+          stick();
+        }
+        if (d.tool_calls){
+          for (const t of d.tool_calls){
+            const el = document.createElement('div');
+            el.className = 'tool';
+            el.innerHTML = '<b>' + esc(t.function.name) + '</b> ' + esc(t.function.arguments);
+            v.tools.appendChild(el);
+          }
+          stick();
+        }
+        const u = j.usage;
+        if (u) $('#stat').textContent = u.prompt_tokens + ' prompt · ' + u.completion_tokens + ' gen';
+      }
+    }
+    v.body.innerHTML = md(content);
+    if (reasoning) v.think.querySelector('summary').textContent = 'Gedankengang';
+    else v.think.style.display = 'none';
+    messages.push({ role:'assistant', content, reasoning_content:reasoning });
+    const dt = (performance.now() - (firstTok || t0)) / 1000;
+    if (dt > 0.2) $('#hint').textContent = (nTok/dt).toFixed(1) + ' tok/s · '
+      + ((firstTok - t0)/1000).toFixed(1) + ' s bis zum ersten Token';
+  } catch (e){
+    if (e.name !== 'AbortError'){
+      v.body.innerHTML = '<p style="color:var(--accent)">' + esc(e.message) + '</p>';
+    } else {
+      v.body.innerHTML = md(content) + '<p style="color:var(--fg-faint);font-size:13px">abgebrochen</p>';
+      messages.push({ role:'assistant', content });
+    }
+  } finally {
+    busy = false; send.disabled = false; ctrl = null;
+    setSendIcon(false); ta.focus();
+  }
+}
+
+function setSendIcon(stop){
+  send.innerHTML = stop
+    ? '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
+}
+
+function submit(){
+  if (busy){ ctrl?.abort(); return; }
+  const t = ta.value.trim();
+  if (!t) return;
+  ta.value = ''; ta.style.height = 'auto';
+  setSendIcon(true); send.disabled = false;
+  ask(t);
+}
+send.onclick = submit;
+ta.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(); }
+});
+ta.addEventListener('input', () => {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 190) + 'px';
+});
+chat.addEventListener('click', e => {
+  if (e.target.classList.contains('chip')){ ta.value = e.target.textContent; submit(); }
+});
+$('#reset').onclick = () => {
+  ctrl?.abort(); messages = [];
+  chat.innerHTML = '<div class="empty" id="empty"><h1>Womit kann ich helfen?</h1>'
+    + '<p>Läuft lokal auf dieser Maschine — GPU und CPU teilen sich jede Schicht.</p>'
+    + '<div class="chips"><div class="chip">Erklär mir Gated DeltaNet in drei Sätzen.</div>'
+    + '<div class="chip">Schreib eine Python-Funktion für Binärsuche.</div>'
+    + '<div class="chip">Was begrenzt Inferenzgeschwindigkeit auf einem Laptop?</div></div></div>';
+  $('#stat').textContent = ''; $('#hint').textContent = '';
+};
+$('#temp').oninput = e => $('#tv').textContent = (+e.target.value).toFixed(2);
+
+fetch('/health').then(r=>r.json()).then(h=>{
+  $('#mname').textContent = h.model + ' · ' + (h.speculative ? 'GPU + spekulativ' : h.gpu ? 'GPU' : 'CPU');
+}).catch(()=>{});
+ta.focus();
+</script>
+</body>
+</html>
