@@ -204,6 +204,9 @@ static void q35_forward_cu_batch_ex(Q35CuBatch *Z, const int *toks, int S, int p
         q35cu_h2d(Z->xB + (size_t)s*Dm, R->x, sizeof(float)*Dm);
     }
 
+    /* A batch uses each weight S times, so the CPU side is compute-bound where decode was
+     * bandwidth-bound, and the GPU should take a much larger share. */
+    G->stream_batch = (S > 1);
     if(G->stream_on){
         const int f0 = q35cu_next_stream_layer(G, 0);
         G->stage_half = 0;

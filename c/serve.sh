@@ -9,7 +9,7 @@ PORT="${PORT:-8080}"
 CTX="${CTX:-32768}"
 LOG="${LOG:-$HERE/server.log}"
 
-pkill -f "qwen35_server .*--port $PORT" 2>/dev/null
+pkill -x qwen35_server 2>/dev/null   # -x: match the process NAME, not any command line containing it
 for i in $(seq 1 60); do
     ss -ltn 2>/dev/null | grep -q ":$PORT " || break
     sleep 0.5

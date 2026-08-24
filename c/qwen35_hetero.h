@@ -88,7 +88,18 @@ typedef struct {
     int64_t  stage_bytes;
     float   *sg, *su, *st;       /* device: gate/up partials and the output */
     float   *hg, *hu, *ht2;      /* pinned host: the CPU's partials */
-    double   stream_f;           /* fraction of rows given to the GPU, 0 = off */
+    /* TWO split fractions, because decode and prefill are bound by different things.
+     *
+     * Decode reads each weight once and uses it once: both sides move bytes, the CPU at
+     * ~38 GB/s and the DMA at 27.7, and the balance lands near 0.60.
+     *
+     * Prefill reads each weight once and uses it S times. Measured, the weights stream at
+     * only 12.5 GB/s during prefill against 59 in decode — the CPU has stopped being
+     * bandwidth-bound and is doing 8x the arithmetic per byte, while the GPU side is still
+     * only a DMA and costs what it always did. At 0.60 that leaves the CPU the straggler by
+     * 3.7x. Balancing PCIe time against CPU compute time puts prefill near 0.85. */
+    double   stream_f, stream_f_b;
+    int      stream_batch;       /* which of the two is in force right now */
     struct { int64_t gb, db; int r, s_unused; } slice[2];
     int      stage_half;
     double   t_cpu_side, t_gpu_side;
@@ -269,6 +280,10 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
         const char *se = getenv("COLIBRI_CUDA_STREAM");
         G->stream_f = se ? atof(se) : 0.60;
         if(G->stream_f > 0.9) G->stream_f = 0.9;
+        { const char *pe = getenv("COLIBRI_CUDA_STREAM_PREFILL");
+          G->stream_f_b = pe ? atof(pe) : 0.85;
+          if(G->stream_f_b > 0.92) G->stream_f_b = 0.92;
+          if(G->stream_f_b < G->stream_f) G->stream_f_b = G->stream_f; }
         if(G->stream_f > 0){
             q35cu_mem(&vfree, &vtot);
             int64_t cap = (int64_t)vfree - (160<<20);
@@ -277,7 +292,8 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
                 const Q35Layer *S = &M->L[il];
                 const int64_t g = q35_tbytes(S->ffn_gate), u = q35_tbytes(S->ffn_up),
                               d = q35_tbytes(S->ffn_down);
-                const int64_t t = 2*(int64_t)(G->stream_f*1.05*(double)(g + u + d));
+                const double fmx = G->stream_f_b > G->stream_f ? G->stream_f_b : G->stream_f;
+                const int64_t t = 2*(int64_t)(fmx*1.05*(double)(g + u + d));
                 if(t > need) need = t;
             }
             if(need > cap) need = cap;
@@ -417,6 +433,9 @@ static void q35cu_state_reset(Q35Cu *G){
     q35cu_sync();
 }
 
+typedef struct { int64_t gb, db; int r, s_unused; } Q35Slice;
+static Q35Slice q35cu_slice(const Q35Cu *G, const Q35Layer *L, double f);
+
 static void q35cu_report(const Q35Cu *G, FILE *o){
     size_t f = 0, t = 0; q35cu_mem(&f, &t);
     fprintf(o, "\n  device: %s\n", q35cu_name());
@@ -426,10 +445,19 @@ static void q35cu_report(const Q35Cu *G, FILE *o){
             G->vram_work/1073741824.0);
     fprintf(o, "    vram %.2f used / %.2f GiB, %.2f free\n",
             (t-f)/1073741824.0, t/1073741824.0, f/1073741824.0);
-    if(G->stream_on)
-        fprintf(o, "    streamed ffn: %.0f%% of each non-resident layer to the GPU over PCIe,"
-                   " %.0f MiB staging%s\n", 100*G->stream_f, G->stage_bytes/1048576.0,
+    if(G->stream_on){
+        /* Print BOTH fractions and the slice they actually produce. The staging area caps the
+         * slice, so a fraction that does not fit is silently reduced — and a split that did
+         * not happen looks exactly like a split that did not help. */
+        const Q35Layer *L0 = NULL;
+        for(int il = 0; il < G->M->c.n_layer; il++) if(!G->L[il].ffn_gpu){ L0 = &G->M->L[il]; break; }
+        int rd = 0, rp = 0;
+        if(L0){ rd = q35cu_slice(G, L0, G->stream_f).r; rp = q35cu_slice(G, L0, G->stream_f_b).r; }
+        fprintf(o, "    streamed ffn: decode %.0f%% (r=%d), prefill %.0f%% (r=%d),"
+                   " %.0f MiB staging%s\n",
+                100*G->stream_f, rd, 100*G->stream_f_b, rp, G->stage_bytes/1048576.0,
                 G->host_pinned ? ", weights pinned" : ", NOT PINNED (slow)");
+    }
 }
 
 /* ---------------- the CPU's half of a split context ----------------
@@ -529,7 +557,6 @@ static void q35_attn_host_partial(Q35State *R, const float *qg, int slot,
  *
  * r is a multiple of 256 because that is a k-quant super-block: cutting inside one would
  * mean decoding a block from the middle, which the format does not allow. */
-typedef struct { int64_t gb, db; int r, s_unused; } Q35Slice;
 
 static Q35Slice q35cu_slice(const Q35Cu *G, const Q35Layer *L, double f){
     const Q35Cfg *c = &G->M->c;
@@ -558,7 +585,7 @@ static void q35cu_stream_issue(Q35Cu *G, int il, int half){
     Q35Slice *S = (Q35Slice*)&G->slice[half];
     const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
     const Q35Layer *L = &M->L[il];
-    *S = q35cu_slice(G, L, G->stream_f);
+    *S = q35cu_slice(G, L, G->stream_batch ? G->stream_f_b : G->stream_f);
     if(!S->r){ q35cu_copy_mark(half); return; }
     const int64_t grb = kq_row_bytes(L->ffn_gate->type, c->d_model);
     const int64_t drb = kq_row_bytes(L->ffn_down->type, c->d_ff);
@@ -747,6 +774,7 @@ static void q35_forward_cu(Q35Cu *G, Q35State *R, int tok, int pos, float *logit
         q35cu_h2d(G->x, R->x, sizeof(float)*c->d_model);
         if(g_q35_stage_timing) g_t_embd += q35_clk()-t0; }
 
+    G->stream_batch = 0;      /* the single-token path is the decode regime */
     if(G->stream_on){
         const int f0 = q35cu_next_stream_layer(G, 0);
         G->stage_half = 0;
