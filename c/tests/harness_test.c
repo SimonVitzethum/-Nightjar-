@@ -412,6 +412,111 @@ int main(void){
          "but the transcript DOES say that something was typed");
       free(a2); s_free(&t); }
 
+    /* ---- 6d. THE BROWSER. Against a local file:// page, so the gate is deterministic and
+     *          needs no network: what is being tested is whether the model can operate a form,
+     *          not whether some website is up today. ---- */
+    puts("\n6d. the browser");
+    if(system("command -v firefox >/dev/null 2>&1") != 0){
+        puts("  --    firefox not installed, skipped");
+    } else {
+      wr("form.html",
+        "<html><head><title>Testformular</title></head><body>"
+        "<h1>Anmeldung</h1>"
+        "<form id=f onsubmit=\"document.getElementById('out').textContent="
+        "  'GESENDET:'+name.value+'/'+ort.value+'/'+magst.checked; return false\">"
+        "<label for=name>Ihr Name</label><input id=name name=name placeholder=\"Name\">"
+        "<select id=ort><option>Berlin</option><option>Hamburg</option><option>München</option></select>"
+        "<input id=magst type=checkbox>"
+        "<textarea id=nach placeholder=\"Nachricht\"></textarea>"
+        "<input id=datei type=file>"
+        "<button id=go type=submit>Absenden</button>"
+        "</form><div id=out></div>"
+        "<div id=slider style=\"width:300px;height:30px;background:#eee\"></div>"
+        "<script>var s=document.getElementById('slider');var down=false,x0=0;"
+        "s.onmousedown=function(e){down=true;x0=e.clientX};"
+        "document.onmouseup=function(e){if(down){down=false;"
+        " document.getElementById('out').textContent+=' GEZOGEN:'+Math.round(e.clientX-x0)}};"
+        "document.getElementById('datei').onchange=function(e){"
+        " document.getElementById('out').textContent+=' DATEI:'+e.target.files[0].name};"
+        "</script></body></html>");
+      wr("hochladen.txt", "inhalt\n");
+
+      char url[PATH_MAX + 16];
+      snprintf(url, sizeof url, "file://%s/form.html", g_root);
+      Str req = {0};
+      s_cat(&req, "{\"name\":\"web_open\",\"arguments\":{\"url\":");
+      s_json(&req, url, strlen(url));
+      s_cat(&req, "},\"approved\":true}");
+      r = call(req.p, &ar, &raw);
+      s_free(&req);
+      const int up = !strcmp(field(r, "decision"), "allow") && has(r, "content", "Testformular");
+      ok(up, "a headless firefox opens a page and reports its title");
+      if(!up) printf("     (%s)\n", (field(r,"content")[0] ? field(r,"content") : field(r,"reason")));
+      ok(has(r, "content", "Anmeldung"), "the VISIBLE TEXT comes back, not the HTML");
+      ok(has(r, "content", "[0] text"), "and the operable elements are numbered");
+      ok(has(r, "content", "Berlin | Hamburg"), "a select lists its options");
+      free(ar); ar = NULL;
+
+      if(up){
+        /* filling in — the thing this exists for */
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"type\",\"target\":0,"
+                 "\"text\":\"Simon\"},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "=Simon"), "typing into a field lands in its value");
+        free(ar); ar = NULL;
+
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"select\",\"target\":1,"
+                 "\"text\":\"München\"},\"approved\":true}", &ar, &raw);
+        ok(!has(r, "content", "no option"), "an option is picked by its text");
+        free(ar); ar = NULL;
+
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"click\",\"target\":2},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "[x]"), "a checkbox can be clicked");
+        free(ar); ar = NULL;
+
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"type\",\"target\":3,"
+                 "\"text\":\"Hallo Welt\"},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "=Hallo Welt"), "a textarea too");
+        free(ar); ar = NULL;
+
+        /* upload: the workspace fence applies to the local side of it */
+        r = call("{\"name\":\"web_file\",\"arguments\":{\"action\":\"upload\",\"target\":4,"
+                 "\"path\":\"hochladen.txt\"},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "DATEI:hochladen.txt"), "a file input takes a file and the page reacts");
+        free(ar); ar = NULL;
+        r = call("{\"name\":\"web_file\",\"arguments\":{\"action\":\"upload\",\"target\":4,"
+                 "\"path\":\"/etc/passwd\"},\"approved\":true}", &ar, &raw);
+        ok(!strcmp(field(r, "decision"), "ask"),
+           "and uploading from outside the workspace asks first");
+        free(ar); ar = NULL;
+
+        /* submit, and check the PAGE agrees about what it received */
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"click\",\"target\":5},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "GESENDET:Simon/München/true"),
+           "the form submits with everything that was filled in");
+        free(ar); ar = NULL;
+
+        /* MOVING. A press, a move and a release, which is the only thing a drag listener sees;
+         * assigning a property from script produces no events at all. The slider here is a bare
+         * div with a handler attached from JS — it has no semantics for the numbering to find,
+         * which is exactly why web_do also takes a CSS selector. */
+        r = call("{\"name\":\"web_do\",\"arguments\":{\"action\":\"drag\","
+                 "\"selector\":\"#slider\",\"dx\":120,\"dy\":0},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "GEZOGEN:"), "a drag on a bare div produces real pointer events");
+        free(ar); ar = NULL;
+
+        r = call("{\"name\":\"web_file\",\"arguments\":{\"action\":\"screenshot\","
+                 "\"path\":\"schuss.png\"},\"approved\":true}", &ar, &raw);
+        ok(has(r, "content", "bytes PNG"), "a screenshot is written into the workspace");
+        { char png[PATH_MAX]; snprintf(png, sizeof png, "%s/schuss.png", g_root);
+          FILE *pf = fopen(png, "rb"); unsigned char sig[8] = {0};
+          if(pf){ if(fread(sig, 1, 8, pf)){} fclose(pf); }
+          ok(sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G',
+             "and it really is a PNG, not base64 text"); }
+        free(ar); ar = NULL;
+      }
+      web_stop();
+    }
+
     /* ---- 7. the escaper: a tool result goes into a JSON body ---- */
     puts("\n7. escaping");
     wr("nasty.txt", "quote \" backslash \\ newline\ttab\nsecond\x01line\n");

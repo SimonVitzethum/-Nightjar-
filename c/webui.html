@@ -564,6 +564,16 @@ async function openInViewer(path, hitText){
   } catch(e){ pane.innerHTML = '<div class="fv-empty">' + esc(String(e)) + '</div>'; return; }
   if (r.error){ pane.innerHTML = '<div class="fv-empty">' + esc(r.error.message || 'Fehler') + '</div>'; return; }
   openFile = path;
+  /* An image is shown, not described. The agent takes screenshots into the workspace, and a
+     screenshot you cannot look at is a log line. */
+  if (r.mime && r.mime.startsWith('image/')){
+    pane.innerHTML = '<div class="fv-h"><span class="p">' + esc(path) + '</span>'
+      + '<span class="m">' + (r.size/1024).toFixed(0) + ' KB</span></div>'
+      + '<div style="padding:12px;background:var(--bg)"><img style="max-width:100%;'
+      + 'border:1px solid var(--line);border-radius:8px" src="/v1/fs/raw?project='
+      + encodeURIComponent(project) + '&path=' + encodeURIComponent(path) + '"></div>';
+    return;
+  }
   if (r.binary){
     pane.innerHTML = '<div class="fv-h"><span class="p">' + esc(path) + '</span>'
       + '<span class="m">' + r.size + ' B</span></div>'
@@ -1103,7 +1113,10 @@ async function runTool(call, host){
   /* A file the agent touched should be one click away from being READ, not just described.
      The tree marks it and the card opens it at the changed line — the point of the panel is
      to check the work, and checking means looking at the file, not at the summary of it. */
-  if (!bad && args.path && (name === 'write_file' || name === 'edit_file')){
+  if (!bad && (name === 'web_file' || name === 'web_open' || name === 'web_do')
+      && $('#fs').classList.contains('on')) treeLoad('', $('#tree'));
+  if (!bad && args.path && (name === 'write_file' || name === 'edit_file'
+                            || (name === 'web_file' && args.action !== 'upload'))){
     markTouched(args.path);
     if ($('#fs').classList.contains('on')) treeLoad('', $('#tree'));
     const b = document.createElement('button');

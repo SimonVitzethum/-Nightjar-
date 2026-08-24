@@ -55,8 +55,38 @@
 #define PATH_MAX 4096
 #endif
 
+/* jval -> JSON text. It lives here, next to the parser, rather than in the HTTP server where
+ * it started: the browser client needs it as well, and a second copy of a serializer is the
+ * same duplicate-truth bug as a second copy of a schema. */
+static void j_emit(Str *out, jval *v);
+static void j_emit_obj(Str *out, jval *v){
+    s_cat(out, "{");
+    for(int i = 0; i < v->len; i++){
+        if(i) s_cat(out, ",");
+        s_json(out, v->keys[i], strlen(v->keys[i]));
+        s_cat(out, ":");
+        j_emit(out, v->kids[i]);
+    }
+    s_cat(out, "}");
+}
+static void j_emit(Str *out, jval *v){
+    if(!v){ s_cat(out, "null"); return; }
+    switch(v->t){
+        case J_NULL: s_cat(out, "null"); break;
+        case J_BOOL: s_cat(out, v->boolean ? "true" : "false"); break;
+        case J_NUM:  { double d = v->num;
+                       if(d == (double)(long long)d) s_fmt(out, "%lld", (long long)d);
+                       else s_fmt(out, "%.17g", d); } break;
+        case J_STR:  s_json(out, v->str, strlen(v->str)); break;
+        case J_ARR:  s_cat(out, "[");
+                     for(int i = 0; i < v->len; i++){ if(i) s_cat(out, ","); j_emit(out, v->kids[i]); }
+                     s_cat(out, "]"); break;
+        case J_OBJ:  j_emit_obj(out, v); break;
+    }
+}
+
 typedef enum { TM_OFF = 0, TM_RO, TM_WS, TM_FULL } ToolMode;
-typedef enum { TCL_READ = 0, TCL_WRITE, TCL_EXEC } ToolClass;
+typedef enum { TCL_READ = 0, TCL_WRITE, TCL_EXEC, TCL_NET } ToolClass;
 typedef enum { TD_ALLOW = 0, TD_ASK, TD_DENY }    ToolDecision;
 
 static ToolMode g_tmode = TM_WS;
@@ -113,17 +143,27 @@ static int h_mode_parse(const char *s, ToolMode *m){
 /* The gate. Read is free; writing is free but confined; running a command is the one that
  * needs a human, because it is the only one whose blast radius is not visible in its
  * arguments — "make" can do anything at all. */
+static int g_web_on_fwd(void);          /* defined with the browser, below */
+
 static ToolDecision h_policy(ToolClass c, const char **why){
+    /* --web off does not merely refuse the browser tools, it stops OFFERING them: their
+     * schemas would otherwise be prefilled on every turn of a session that cannot use them. */
+    if(c == TCL_NET && !g_web_on_fwd()){ *why = "the browser tools are off (--web off)"; return TD_DENY; }
     switch(g_tmode){
         case TM_OFF:
             *why = "tools are disabled on this server (--tools off)";
             return TD_DENY;
         case TM_RO:
             if(c == TCL_READ) return TD_ALLOW;
+            if(c == TCL_NET){ *why = "opens a browser and reaches the network"; return TD_ASK; }
             *why = "the server runs read-only (--tools ro): this call would change the machine";
             return TD_DENY;
         case TM_WS:
             if(c == TCL_EXEC){ *why = "runs a shell command"; return TD_ASK; }
+            /* The network is the one direction the workspace fence does not cover: a URL can
+             * carry the contents of a file out. Same treatment as the shell — asked once, then
+             * "always this session" if the user wants it. */
+            if(c == TCL_NET){ *why = "opens a browser and reaches the network"; return TD_ASK; }
             return TD_ALLOW;
         case TM_FULL:
             return TD_ALLOW;
@@ -982,6 +1022,11 @@ static int t_grep(jval *a, Str *o, int *code, const char **err){
     return 1;
 }
 
+/* The browser. Included here, after h_resolve and the argument helpers it uses, and before the
+ * registry that names its tools. */
+#include "webtool.h"
+static int g_web_on_fwd(void){ return g_web_on; }
+
 /* ---------------- the filesystem view, for the HUMAN ----------------
  *
  * The tools above are shaped for the model: numbered lines, a 4 KiB budget, results phrased so
@@ -1048,6 +1093,28 @@ static int h_fs_list(Str *o, const char *rel, const char **err){
     return 1;
 }
 
+/* The bytes themselves, for the things a JSON string cannot carry: a screenshot the agent just
+ * took, an image in the repository. Same h_resolve, same fence — it is a different Content-Type,
+ * not a different door. */
+static const char *h_mime(const char *p){
+    const char *d = strrchr(p, '.');
+    if(!d) return NULL;
+    if(!strcasecmp(d, ".png"))  return "image/png";
+    if(!strcasecmp(d, ".jpg") || !strcasecmp(d, ".jpeg")) return "image/jpeg";
+    if(!strcasecmp(d, ".gif"))  return "image/gif";
+    if(!strcasecmp(d, ".webp")) return "image/webp";
+    if(!strcasecmp(d, ".svg"))  return "image/svg+xml";
+    if(!strcasecmp(d, ".pdf"))  return "application/pdf";
+    return NULL;
+}
+static char *h_fs_raw(const char *rel, size_t *len, const char **mime, const char **err){
+    char abs[PATH_MAX];
+    if(!h_resolve(rel, 1, abs, err)) return NULL;
+    *mime = h_mime(abs);
+    if(!*mime){ *err = "not a previewable type"; return NULL; }
+    return h_slurp(abs, len, 24u<<20, err);
+}
+
 static int h_fs_read(Str *o, const char *rel, const char **err){
     char abs[PATH_MAX];
     if(!h_resolve(rel, 1, abs, err)) return 0;
@@ -1062,8 +1129,10 @@ static int h_fs_read(Str *o, const char *rel, const char **err){
     if(!b) return 0;
     int binary = 0;
     for(size_t i = 0; i < n && i < 4096; i++) if(!b[i]){ binary = 1; break; }
+    const char *mime = h_mime(abs);
     s_cat(o, "{\"path\":");
     s_json(o, h_rel(abs), strlen(h_rel(abs)));
+    if(mime) s_fmt(o, ",\"mime\":\"%s\"", mime);
     s_fmt(o, ",\"size\":%lld,\"shown\":%zu,\"truncated\":%s,\"binary\":%s,\"content\":",
           (long long)st.st_size, binary ? (size_t)0 : n,
           (size_t)st.st_size > n ? "true" : "false", binary ? "true" : "false");
@@ -1152,6 +1221,49 @@ static const Tool g_tools[] = {
   "\"ignore_case\":{\"type\":\"boolean\"},"
   "\"max_results\":{\"type\":\"integer\"}"
   "},\"required\":[\"pattern\"]}", t_grep },
+
+/* THE BROWSER, IN THREE TOOLS. Fifteen verbs would be ~2 KB of schema prefilled on every turn
+ * of every session — a minute of prefill each time, whether the browser is used or not (§12.3).
+ * So the verbs are an enum on one tool. Worse as an API, right for this engine. */
+{ "web_open", TCL_NET,
+  "Open a URL in a real (headless) Firefox and read the page back: title, visible text, and a "
+  "NUMBERED list of everything that can be operated. Address those numbers with web_do. Start "
+  "here; the numbers change whenever the page does.",
+  "{\"type\":\"object\",\"properties\":{"
+  "\"url\":{\"type\":\"string\"}"
+  "},\"required\":[\"url\"]}", t_web_open },
+
+{ "web_do", TCL_NET,
+  "Operate the open page and read it back. action: click | type | select | press | scroll | "
+  "drag | move | back | forward | reload | wait. `target` is the [n] from the last page listing. "
+  "type fills a field with real key events (enter=true to submit); select picks an option by its "
+  "text; press sends a key like Enter or Tab; drag presses at `target` and releases at `to` or "
+  "at dx/dy; scroll takes up/down/top/bottom, or a target to bring into view.",
+  "{\"type\":\"object\",\"properties\":{"
+  "\"action\":{\"type\":\"string\"},"
+  "\"target\":{\"type\":\"integer\",\"description\":\"the [n] of an element\"},"
+  "\"selector\":{\"type\":\"string\",\"description\":\"CSS selector, for what the "
+  "numbering cannot see (a bare div slider, a canvas)\"},"
+  "\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},"
+  "\"text\":{\"type\":\"string\",\"description\":\"what to type, pick, or press\"},"
+  "\"enter\":{\"type\":\"boolean\",\"description\":\"press Enter after typing\"},"
+  "\"append\":{\"type\":\"boolean\",\"description\":\"keep what is in the field\"},"
+  "\"to\":{\"type\":\"integer\",\"description\":\"drag target\"},"
+  "\"to_selector\":{\"type\":\"string\"},"
+  "\"dx\":{\"type\":\"integer\"},\"dy\":{\"type\":\"integer\"},"
+  "\"amount\":{\"type\":\"integer\",\"description\":\"scroll pixels, or wait ms\"}"
+  "},\"required\":[\"action\"]}", t_web_do },
+
+{ "web_file", TCL_NET,
+  "Move files between the page and the workspace. action: screenshot (PNG of the whole page to "
+  "`path`), upload (`path` from the workspace into the file input at `target`), download (`url` "
+  "or click `target`, saved to `path`). Every path stays inside the workspace.",
+  "{\"type\":\"object\",\"properties\":{"
+  "\"action\":{\"type\":\"string\"},"
+  "\"path\":{\"type\":\"string\"},"
+  "\"target\":{\"type\":\"integer\"},"
+  "\"url\":{\"type\":\"string\"}"
+  "},\"required\":[\"action\"]}", t_web_file },
 };
 static const int g_ntools = (int)(sizeof g_tools / sizeof *g_tools);
 
@@ -1161,7 +1273,8 @@ static const Tool *h_find(const char *name){
     return NULL;
 }
 static const char *h_cls_name(ToolClass c){
-    return c == TCL_READ ? "read" : c == TCL_WRITE ? "write" : "exec";
+    return c == TCL_READ ? "read" : c == TCL_WRITE ? "write"
+         : c == TCL_NET  ? "net"  : "exec";
 }
 static const char *h_dec_name(ToolDecision d){
     return d == TD_ALLOW ? "allow" : d == TD_ASK ? "ask" : "deny";

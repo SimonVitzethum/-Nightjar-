@@ -216,6 +216,75 @@ is shown, and that saying yes binds to *that* path. Consent to `/etc/hostname` i
 to `/etc/hosts`; the next one asks again. And it never upgrades the policy class — agreeing to
 a path does not buy a write in `--tools ro`.
 
+#### The browser
+
+Three tools drive a **headless Firefox** — filling forms, clicking, dragging, uploading,
+downloading, screenshotting.
+
+```
+web_open  {url}
+web_do    {action: click|type|select|press|scroll|drag|move|back|forward|reload|wait,
+           target|selector, text, enter, to|to_selector, dx, dy, x, y, amount}
+web_file  {action: screenshot|upload|download, path, target, url}
+```
+
+**Marionette, not Selenium or Playwright.** Marionette is Firefox's own remote protocol and it
+is already in the browser you have: length-prefixed JSON over TCP, `<bytes>:<json>`. No driver
+binary to version-match, no Node or Python in the runtime of an engine that has neither. The
+client is [`c/webtool.h`](c/webtool.h), speaking it with the socket code and JSON parser that
+were already here. It runs on a **private profile with `--no-remote` on a non-default port** —
+without all three it attaches to the Firefox you already have open and starts driving your tabs.
+
+**Three tools and not fifteen, and that is a measurement.** Every schema is prefilled on every
+turn (§12.3): fifteen browser verbs would be ~2 KB ≈ 550 tokens ≈ most of a minute added to
+every request in the session, used or not. So the verbs are an `action` enum on one tool — a
+worse API in the abstract and the right one here. `--web off` removes them from the prompt
+entirely.
+
+**The page comes back as a numbered index, not as HTML.** A login page is 200 KB of markup
+around four interesting elements, which at a 4 KiB budget the model would never reach. After
+every action the page is digested into visible text plus a numbered list of what can be
+operated:
+
+```
+Live-Probe
+file:///…/probe.html
+
+Formular
+
+Bedienbare Elemente:
+[0] text "Name" =Simon
+[1] select "blau" {rot | blau}
+[2] button "Los"
+```
+
+The model addresses those numbers, and the same call that changed the page renumbers it —
+an index that survives a navigation clicks the wrong button.
+
+**Typing is real key events** (`WebDriver:ElementSendKeys`), not `el.value = x`. Sites built on
+React ignore a value that was assigned rather than typed, and the form then submits empty.
+**Dragging is a real press-move-release** (`WebDriver:PerformActions`), which is the only thing
+a slider, a canvas or an HTML5 drag target reacts to.
+
+**And what the numbering cannot see, a selector can.** A slider is often a bare `div` with a
+handler attached from script — no role, no semantics, nothing to number. So `web_do` also takes
+a CSS `selector`, and drag additionally takes viewport `x`/`y`. That gap was found by the gate,
+not by reasoning: the first version could fill every form on the test page and could not move
+the slider on it.
+
+Uploads and downloads keep the workspace fence: the local side of an upload goes through
+`h_resolve` like any other path, so uploading `/etc/passwd` asks for consent first. Downloads
+are fetched **by the browser** — it has the cookies and the session that got to the page — and
+then moved into the workspace.
+
+Screenshots are written into the project as PNG and the file view renders them
+(`GET /v1/fs/raw`); a screenshot you cannot look at is a log line.
+
+The browser tools are class `net`, which **asks** in `workspace` mode like the shell does: the
+network is the one direction the workspace fence does not cover, since a URL can carry the
+contents of a file out. Firefox starts on first use, not at boot — it costs half a gigabyte and
+several seconds, and most sessions never touch it.
+
 #### The four modes
 
 | `--tools` | read | write | shell |

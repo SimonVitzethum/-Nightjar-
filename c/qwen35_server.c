@@ -195,33 +195,6 @@ static void render_content(Str *out, jval *c){
     }
 }
 
-static void j_emit(Str *out, jval *v);
-static void j_emit_obj(Str *out, jval *v){
-    s_cat(out, "{");
-    for(int i = 0; i < v->len; i++){
-        if(i) s_cat(out, ",");
-        s_json(out, v->keys[i], strlen(v->keys[i]));
-        s_cat(out, ":");
-        j_emit(out, v->kids[i]);
-    }
-    s_cat(out, "}");
-}
-static void j_emit(Str *out, jval *v){
-    if(!v){ s_cat(out, "null"); return; }
-    switch(v->t){
-        case J_NULL: s_cat(out, "null"); break;
-        case J_BOOL: s_cat(out, v->boolean ? "true" : "false"); break;
-        case J_NUM:  { double d = v->num;
-                       if(d == (double)(long long)d) s_fmt(out, "%lld", (long long)d);
-                       else s_fmt(out, "%.17g", d); } break;
-        case J_STR:  s_json(out, v->str, strlen(v->str)); break;
-        case J_ARR:  s_cat(out, "[");
-                     for(int i = 0; i < v->len; i++){ if(i) s_cat(out, ","); j_emit(out, v->kids[i]); }
-                     s_cat(out, "]"); break;
-        case J_OBJ:  j_emit_obj(out, v); break;
-    }
-}
-
 /* messages[] + tools[] -> the exact string the model was trained on */
 static void build_prompt(Str *out, jval *msgs, jval *tools, int think){
     jval *first = (msgs && msgs->len) ? msgs->kids[0] : NULL;
@@ -880,6 +853,18 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             Str b = {0}; h_term_json(&b, sn[0] ? strtoull(sn, NULL, 10) : 0);
             http_send(fd, 200, "OK", "application/json", b.p, b.n); s_free(&b);
         }
+        else if(path_is(path, "/v1/fs/raw")){
+            char proj[96], rel[1024];
+            query_arg(path, "project", proj, sizeof proj);
+            query_arg(path, "path", rel, sizeof rel);
+            url_decode(rel);
+            const char *err = "tools are disabled on this server", *mime = NULL;
+            size_t n = 0; char *b = NULL;
+            if(g_tmode != TM_OFF && h_use_project(proj, &err))
+                b = h_fs_raw(rel, &n, &mime, &err);
+            if(b){ http_send(fd, 200, "OK", mime, b, n); free(b); }
+            else   http_err(fd, 400, "Bad Request", err);
+        }
         else if(path_is(path, "/v1/fs/list") || path_is(path, "/v1/fs/read")){
             char proj[96], rel[1024];
             query_arg(path, "project", proj, sizeof proj);
@@ -969,6 +954,10 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
 
 static void on_sig(int s){ (void)s; g_abort = 1; }
 
+/* Firefox is a child process, and a child process that outlives its parent is a half-gigabyte
+ * leak nobody will connect to this server an hour later. */
+static void on_exit_cleanup(void){ web_stop(); }
+
 static void *conn_thread(void *arg){
     const int fd = (int)(intptr_t)arg;
     if(!serve(fd)) close(fd);        /* a handed-off fd belongs to the engine thread */
@@ -1032,6 +1021,7 @@ int main(int argc, char **argv){
         }
         else if(!strcmp(a,"--tool-timeout") && i+1 < argc) g_ttmo = atoi(argv[++i]);
         else if(!strcmp(a,"--tool-output")  && i+1 < argc) g_tmax = (size_t)atol(argv[++i]);
+        else if(!strcmp(a,"--web") && i+1 < argc) g_web_on = strcmp(argv[++i], "off") != 0;
         else if(!strcmp(a,"--quiet")) g_verbose = 0;
         else if(!strcmp(a,"-h") || !strcmp(a,"--help")){
             fprintf(stderr,
@@ -1049,6 +1039,8 @@ int main(int argc, char **argv){
                 "                   full       everything, anywhere, unapproved\n"
                 "  --projects D   root holding one subdirectory per project; the client picks\n"
                 "                 one by NAME. Default $HOME/QwenEngine/projects.\n"
+                "  --web on|off   the headless-Firefox tools. Off removes them from the prompt\n"
+                "                 entirely, which is ~250 tokens a turn.\n"
                 "  --workspace D  a single fixed workspace instead of projects.\n"
                 "                 Either way paths are resolved with realpath before they are\n"
                 "                 compared to the root, so .. and symlinks cannot leave it.\n\n"
@@ -1058,6 +1050,7 @@ int main(int argc, char **argv){
                 "  GET  /v1/projects          the projects that exist\n"
                 "  GET  /v1/fs/list           directory listing for the file view\n"
                 "  GET  /v1/fs/read           one file, for the file view\n"
+                "  GET  /v1/fs/raw            the bytes, for images the view can show\n"
                 "  GET  /v1/term?since=N      the live terminal transcript\n"
                 "  POST /v1/term/input        type into the running command (sudo password)\n"
                 "  POST /v1/term/signal       {sig:\"int\"|\"kill\"}\n"
@@ -1137,6 +1130,7 @@ int main(int argc, char **argv){
     fix_omp_env(argv);
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);
+    atexit(on_exit_cleanup);
 
     double t_boot = now(), t_ph = t_boot;
 #define PHASE(name) do{ const double _n = now(); \
@@ -1281,6 +1275,7 @@ int main(int argc, char **argv){
         else { if(!serve(fd)) close(fd); }
     }
     fprintf(stderr, "\n  shutting down\n");
+    web_stop();
     close(srv);
     return 0;
 }

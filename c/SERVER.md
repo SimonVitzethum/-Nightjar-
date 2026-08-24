@@ -148,6 +148,40 @@ Dateisystem. Kein Passwort: der Prozess läuft ohnehin als dieser Benutzer, ein 
 Theater. Das Ja bindet an genau diesen Pfad — `/etc/hostname` erlaubt nicht `/etc/hosts` — und
 hebt nie die Policy-Klasse an: Zustimmung zu einem Pfad erlaubt kein Schreiben in `--tools ro`.
 
+**Der Browser.** Drei Werkzeuge steuern ein **headless Firefox**: Formulare ausfüllen, klicken,
+ziehen, hoch- und runterladen, Screenshots.
+
+```
+web_open  {url}
+web_do    {action: click|type|select|press|scroll|drag|move|back|forward|reload|wait, …}
+web_file  {action: screenshot|upload|download, path, target, url}
+```
+
+Über **Marionette**, Firefox' eigenes Fernsteuerungsprotokoll — längenpräfigiertes JSON über
+TCP, schon im Browser vorhanden. Kein geckodriver, kein Selenium, kein Node oder Python in der
+Laufzeit einer Engine, die beides nicht hat. Eigenes Profil, `--no-remote`, eigener Port: ohne
+alle drei hängt es sich an das Firefox, das gerade offen ist, und fährt dessen Tabs.
+
+**Drei Werkzeuge statt fünfzehn, und das ist eine Messung.** Jedes Schema wird in jedem Zug
+vorgefüllt; fünfzehn Verben wären ~2 KB ≈ 550 Token ≈ fast eine Minute pro Anfrage, ob der
+Browser benutzt wird oder nicht. Also sind die Verben ein `action`-Enum. `--web off` nimmt sie
+ganz aus dem Prompt.
+
+**Die Seite kommt als nummerierter Index zurück, nicht als HTML** — sichtbarer Text plus eine
+Liste dessen, was bedienbar ist. Das Modell spricht die Nummern an, und derselbe Aufruf, der die
+Seite verändert, nummeriert neu.
+
+**Getippt wird mit echten Tastenereignissen**, nicht mit `el.value = x`: React-Seiten ignorieren
+einen zugewiesenen Wert und schicken das Formular leer ab. **Gezogen wird mit echtem
+Drücken-Bewegen-Loslassen** — das Einzige, worauf ein Slider oder ein Canvas reagiert. Und was
+die Nummerierung nicht sieht, erreicht ein CSS-`selector`: ein Slider ist oft ein nacktes `div`
+mit einem Handler aus dem Skript. Diese Lücke hat das Gate gefunden, nicht das Nachdenken.
+
+Der Zaun gilt weiter: die lokale Seite eines Uploads geht durch `h_resolve`, `/etc/passwd`
+hochladen fragt also erst. Heruntergeladen wird **vom Browser** (er hat die Cookies der
+Sitzung) und dann in den Arbeitsbereich verschoben. Screenshots landen als PNG im Projekt und
+werden in der Datei-Ansicht angezeigt.
+
 | `--tools` | lesen | schreiben | Shell |
 |---|---|---|---|
 | `off` | — | — | — |
