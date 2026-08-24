@@ -263,6 +263,24 @@ static void q35_cache_reset_state(Q35Cache *C){
 #endif
 }
 
+/* IS THIS CHECKPOINT ON THE SAME LINE AS THE CURRENT REQUEST?
+ *
+ * Every site that compares two checkpoint positions has to ask this first, and the reason is
+ * that a position is not a number — it is a number PLUS the conversation it counts within.
+ * Positions from two chats share only the axis label; token 2048 of chat A and token 2048 of
+ * chat B are different points in different spaces, and in C they look identical.
+ *
+ * There is exactly one place where comparing across chats is legitimate: q35_cache_begin, and
+ * only because every candidate there has been memcmp'd against the SAME request prefix first.
+ * That memcmp is what puts them on one line; without it, use this.
+ *
+ * (The structural answer is to put the chat into the position type so a cross-chat comparison
+ * cannot be written at all. With two comparison sites a named predicate is the honest size of
+ * the fix; if a third appears, the type is worth the churn.) */
+static inline int q35_ck_mine(const Q35Cache *C, int i){
+    return C->ck[i].pos >= 0 && C->ck[i].chat == C->chat;
+}
+
 /* Pick a slot for a checkpoint at `pos`.
  *
  * THE GAP HEURISTIC IS ONLY MEANINGFUL WITHIN ONE CONVERSATION.
@@ -284,16 +302,16 @@ static int q35_cache_slot_for(Q35Cache *C, int pos){
 
     /* how many slots each conversation currently holds */
     int mine = 0;
-    for(int i = 0; i < C->n_slots; i++) if(C->ck[i].chat == C->chat) mine++;
+    for(int i = 0; i < C->n_slots; i++) if(q35_ck_mine(C, i)) mine++;
 
     if(mine >= 2){
         /* inside my own conversation the original argument holds exactly */
         int worst = -1, worst_gap = 1<<30;
         for(int i = 0; i < C->n_slots; i++){
-            if(C->ck[i].chat != C->chat) continue;
+            if(!q35_ck_mine(C, i)) continue;
             int lo = 0, hi = pos;
             for(int j = 0; j < C->n_slots; j++){
-                if(j == i || C->ck[j].pos < 0 || C->ck[j].chat != C->chat) continue;
+                if(j == i || !q35_ck_mine(C, j)) continue;
                 if(C->ck[j].pos < C->ck[i].pos && C->ck[j].pos > lo) lo = C->ck[j].pos;
                 if(C->ck[j].pos > C->ck[i].pos && C->ck[j].pos < hi) hi = C->ck[j].pos;
             }
@@ -326,7 +344,13 @@ static void q35_cache_mark(Q35Cache *C, int pos){
      * window covers every prompt an agent sends. */
     if(C->kv_bytes && pos > C->kv_win) return;
     C->next_mark = pos + C->spacing;
-    for(int i = 0; i < C->n_slots; i++) if(C->ck[i].pos == pos) return;
+    /* "is there already a checkpoint here" is a question about MY conversation. Without the
+     * chat test this compared positions across chats, and the case is not hypothetical: two
+     * conversations in one project share the system prompt and the tool schemas, so their marks
+     * land on exactly the same positions — 512, 1024, 1536 — and whichever got there first
+     * silently stopped the other from ever checkpointing at all. The 9.1x in Plan.md 19.2 was
+     * measured with this bug still in place. */
+    for(int i = 0; i < C->n_slots; i++) if(C->ck[i].pos == pos && q35_ck_mine(C, i)) return;
     const int s = q35_cache_slot_for(C, pos);
     /* pos FIRST. q35_cache_grab reads k->pos to size both the KV copy and the token memcpy,
      * and a fresh slot holds -1 — which as a size_t is 18 exabytes. It segfaulted inside libc
@@ -353,6 +377,11 @@ static int q35_cache_begin(Q35Cache *C, const int *req, int n, int *reused){
     /* Checkpoints are self-contained, so each is matched against its OWN token prefix rather
      * than against whatever ran last. That is what lets a long agent prompt survive the short
      * unrelated request opencode interleaves at session start. */
+    /* THE ONE PLACE WHERE COMPARING ACROSS CHATS IS CORRECT. Every candidate is memcmp'd
+     * against THIS request's token prefix, and that is what puts them all on one line — a
+     * checkpoint that matches is a prefix of this request whichever conversation created it,
+     * which is exactly what makes a shared system prompt free for everyone. The `<=` skip
+     * before the memcmp only drops candidates that could not win anyway. */
     int best = -1;
     for(int i = 0; i < C->n_slots; i++){
         const Q35Ckpt *k = &C->ck[i];

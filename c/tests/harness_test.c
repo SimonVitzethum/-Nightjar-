@@ -589,6 +589,17 @@ int main(void){
       char probe[PATH_MAX]; snprintf(probe, sizeof probe, "%s/chats/proj/c1.json.tmp", g_root);
       struct stat st;
       ok(stat(probe, &st) != 0, "a save leaves no temporary file behind"); }
+    /* rename() is atomic for visibility, not for durability: without the fsync before it, a
+     * power cut can leave the NAME pointing at an inode whose blocks were never written. The
+     * test cannot pull the plug, but it can check the file is complete and parseable the moment
+     * save() returns — which is what the fsync makes true rather than likely. */
+    ok(cs_save("proj", "c1", "Erster Chat", 2,
+               "[{\"role\":\"user\",\"content\":\"hallo\"}]"), "a rewrite over an existing chat works");
+    { Str t = {0}; cs_get(&t, "proj", "c1");
+      char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      ok(j && j->t == J_OBJ && json_get(j, "messages"),
+         "and the document is complete the instant save returns");
+      free(a2); s_free(&t); }
     ok(cs_delete("proj", "c1"), "a chat deletes");
     { Str t = {0};
       ok(!cs_get(&t, "proj", "c1"), "and is then gone");

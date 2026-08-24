@@ -132,10 +132,20 @@ static int cs_get(Str *o, const char *project, const char *id){
     return 1;
 }
 
-/* Written to a temporary file and renamed. A conversation is overwritten on every turn, and a
- * crash halfway through a 2 MB write would otherwise leave a truncated JSON document — which
- * loses not just the last turn but the whole history, including the prefix the KV cache is
- * keyed on. rename() within a directory is atomic. */
+/* Written to a temporary file, FSYNCED, and then renamed. A conversation is overwritten on every
+ * turn, and a crash halfway through a 2 MB write would otherwise leave a truncated JSON
+ * document — which loses not the last turn but the whole history, including the prefix the KV
+ * cache is keyed on.
+ *
+ * rename() is atomic for VISIBILITY and not for DURABILITY, and on ext4 the difference is easy
+ * to miss. Without the fsync on the temporary file BEFORE the rename, a power cut can leave a
+ * directory entry pointing at an inode whose data blocks were never written — the name is
+ * there, the content is zeroes. A process crash is survived by the rename alone; a machine
+ * crash is not. The directory itself is synced afterwards, because the entry that now points at
+ * good data is only a promise until it too is on disk.
+ *
+ * Same argument as the raw write(2) in q35_oom: a path that exists to survive a failure must not
+ * depend on machinery that is failing at that moment. */
 static int cs_save(const char *project, const char *id, const char *title,
                    int n_msgs, const char *messages_json){
     char path[PATH_MAX], tmp[PATH_MAX];
@@ -151,12 +161,19 @@ static int cs_save(const char *project, const char *id, const char *title,
     s_fmt(&head, ",\"updated\":%ld,\"n\":%d,\"project\":", (long)time(NULL), n_msgs);
     s_json(&head, project ? project : "", project ? strlen(project) : 0);
     s_cat(&head, ",\"messages\":");
-    const int ok = fwrite(head.p, 1, head.n, f) == head.n
-                && fputs(messages_json ? messages_json : "[]", f) >= 0
-                && fputs("}", f) >= 0;
+    int ok = fwrite(head.p, 1, head.n, f) == head.n
+          && fputs(messages_json ? messages_json : "[]", f) >= 0
+          && fputs("}", f) >= 0;
     s_free(&head);
+    if(ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     fclose(f);
     if(!ok || rename(tmp, path) != 0){ unlink(tmp); return 0; }
+    { char dir[PATH_MAX];
+      snprintf(dir, sizeof dir, "%s", path);
+      char *slash = strrchr(dir, '/');
+      if(slash){ *slash = 0;
+                 const int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+                 if(dfd >= 0){ fsync(dfd); close(dfd); } } }
     return 1;
 }
 
