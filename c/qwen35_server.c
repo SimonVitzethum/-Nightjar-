@@ -948,6 +948,8 @@ int main(int argc, char **argv){
             fprintf(stderr,
                 "usage: %s <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 8192]\n"
                 "          [--www webui.html] [--api-key KEY] [--name ID] [--cpu] [--quiet]\n\n"
+                "  --ctx N   INITIAL context, not a limit. It grows on demand and stops\n"
+                "            only at the memory floor (COLIBRI_MEM_FLOOR_GB, 2 GiB).\n\n"
                 "  GET  /                     the chat UI\n"
                 "  GET  /v1/models            model list\n"
                 "  POST /v1/chat/completions  OpenAI-compatible, streaming and not\n"
@@ -972,9 +974,35 @@ int main(int argc, char **argv){
     T_TOOL_O   = tok_id_of(&g_T, "<tool_call>");
     T_TOOL_C   = tok_id_of(&g_T, "</tool_call>");
 
-    const int64_t kvb = q35_kv_bytes_per_token(c, Q35_KV_Q8_0)*(int64_t)g_n_ctx + (32<<20);
+    /* THE CONTEXT IS NOT CAPPED, AND --ctx IS NOT A LIMIT.
+     *
+     * --ctx sizes the FIRST allocation. From there the store grows on demand: kvt_grow
+     * extends it, checks q35_mem_room() before every extension, and refuses — keeping the
+     * context where it is and saying so — the moment MemAvailable would drop under the floor
+     * (COLIBRI_MEM_FLOOR_GB, 2 GiB by default). Nothing else stops it.
+     *
+     * What --ctx really decides is how much of the KV stays in RAM rather than on the spill
+     * tier, because the hot arena is sized once at open. So it is chosen from the memory that
+     * will actually be spare AFTER residency — which is known here, since the weights that are
+     * about to become resident are exactly the FFN and the embedding table. Sizing it from
+     * MemAvailable as measured now would over-promise by 9.3 GiB and is how this process got
+     * OOM-killed once already. */
+    Q35Bytes BY; q35_bytes(&g_M, &BY);
+    const int64_t per_tok  = q35_kv_bytes_per_token(c, Q35_KV_Q8_0);
+    const int64_t will_use = BY.ffn + BY.embd + BY.mtp;
+    int64_t spare = q35_ram_avail_bytes() - will_use - q35_reserve_bytes() - q35_mem_floor();
+    int64_t kvb   = spare > 0 ? spare/2 : (64<<20);
+    const int64_t kv_250k = per_tok*250000;
+    if(kvb > kv_250k) kvb = kv_250k;           /* no point reserving past the plan's horizon */
+    if(kvb < per_tok*(int64_t)g_n_ctx + (32<<20)) kvb = per_tok*(int64_t)g_n_ctx + (32<<20);
     if(!q35_state_init_ex(&g_R, &g_M, g_n_ctx, Q35_KV_Q8_0, kvb, getenv("COLIBRI_KV_SPILL"), 4096)){
         fprintf(stderr, "kv init failed\n"); return 1; }
+    fprintf(stderr, "  context: %d initial, UNBOUNDED — grows on demand and stops only when\n"
+                    "           MemAvailable reaches the %.2f GiB floor. Hot KV tier %.2f GiB"
+                    " (%lld tokens), the rest spills to %s\n",
+            g_n_ctx, q35_mem_floor()/1073741824.0, kvb/1073741824.0,
+            (long long)(kvb/per_tok),
+            getenv("COLIBRI_KV_SPILL") ? getenv("COLIBRI_KV_SPILL") : "the spill tier");
 
 #ifndef COLIBRI_NO_CUDA
     if(!cpu_only && q35cu_model_init(&g_G, &g_M, g_n_ctx, g_R.kv.fmt)){
@@ -1035,7 +1063,7 @@ int main(int argc, char **argv){
 
     fprintf(stderr,
         "\n  qwen35_server ready\n"
-        "    model    %s  (%d layers, %d ctx, %s)\n"
+        "    model    %s  (%d layers, ctx from %d and growing, %s)\n"
         "    web UI   http://%s:%d/\n"
         "    API      http://%s:%d/v1   (OpenAI-compatible)\n"
         "    opencode  point a provider at the /v1 URL above; any api key works%s\n\n",

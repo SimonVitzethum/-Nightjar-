@@ -48,10 +48,12 @@ The full design record, including everything that was measured and rejected, is 
 ### Build
 
 ```bash
-cd c
-make                 # everything; CUDA is detected, not assumed
+make                 # from the repo root, the workspace root, or c/ — all forward to c/
 make -j8             # faster
 ```
+
+Every target below works from any of those three directories. `make help` at the workspace
+root lists them.
 
 Without `nvcc` on PATH the same sources build a CPU-only engine (`-DCOLIBRI_NO_CUDA`); nothing
 else changes. Override the GPU target if you are not on Blackwell:
@@ -64,9 +66,9 @@ make CUDA_HOME=/usr/local/cuda
 ### The server: web UI + OpenAI-compatible API
 
 ```bash
-make serve                              # http://127.0.0.1:8080/ , 8k context
+make serve                              # http://127.0.0.1:8080/
 make serve PORT=9000                    # another port
-make serve CTX=16384                    # larger starting context (it grows on demand anyway)
+make serve CTX=16384                    # larger FIRST allocation — see below
 make serve MODEL=/path/to/other.gguf    # another model — see below
 make stop                               # stop it
 make serve                              # restarting is just serve again; it waits for the
@@ -82,6 +84,22 @@ MODEL=/models/qwen35-27b-Q4_K_M.gguf PORT=8080 CTX=8192 ./serve.sh
 Startup takes 45 s to a few minutes: 5.1 GiB of weights go to VRAM, 9.3 GiB become resident in
 RAM and get pinned for DMA. `serve.sh` polls until `/health` answers and prints the placement
 it chose. Logs go to `c/server.log`.
+
+**`--ctx` is the first allocation, not a limit.** The context grows on demand and stops only
+when `MemAvailable` reaches the floor — 2 GiB by default, `COLIBRI_MEM_FLOOR_GB` to change it.
+At that point the store says so and keeps the context where it is, rather than allocating into
+the floor. What `--ctx` actually influences is how much KV stays in RAM instead of the spill
+tier, because that hot arena is sized once at open; the server reports both:
+
+```
+context: 8192 initial, UNBOUNDED — grows on demand and stops only when
+         MemAvailable reaches the 2.00 GiB floor. Hot KV tier 3.17 GiB (97707 tokens),
+         the rest spills to ../../kvspill
+```
+
+The hot tier is sized from the memory that will be spare **after** residency, not from
+MemAvailable as measured before it — the difference is 9.3 GiB, and getting it wrong is how
+this process was OOM-killed once.
 
 For anything beyond localhost, bind explicitly **and set a key** — without one the endpoint is
 open:
