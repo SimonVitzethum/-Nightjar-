@@ -7,7 +7,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${MODEL:-/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-8192}"      # the context still grows past this; see qwen35_server.c
-LOG="${LOG:-$HERE/server.log}"
+ENGINE_HOME="${ENGINE_HOME:-$HOME/QwenEngine}"
+LOG="${LOG:-$ENGINE_HOME/logs/server.log}"
+KV_SPILL="${KV_SPILL:-$ENGINE_HOME/kvspill}"
 
 pkill -x qwen35_server 2>/dev/null   # -x: match the process NAME, not any command line containing it
 
@@ -42,9 +44,9 @@ if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
     echo "port $PORT is still held by something else" >&2; exit 1
 fi
 
-mkdir -p "$HERE/../../kvspill"
+mkdir -p "$KV_SPILL" "$(dirname "$LOG")"
 : > "$LOG"
-setsid env COLIBRI_KV_SPILL="$HERE/../../kvspill" COLIBRI_RESERVE_GB="${RESERVE:-4}" \
+setsid env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-4}" \
     "$HERE/qwen35_server" "$MODEL" --port "$PORT" --ctx "$CTX" "$@" \
     >> "$LOG" 2>&1 < /dev/null &
 

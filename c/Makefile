@@ -42,9 +42,15 @@ CULIBS  ?= -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
 HAVE_CUDA := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo 1)
 
 MODEL ?= /home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf
-# The KV spill tier MUST NOT point at tmpfs — it would put the "disk" tier back in the RAM it
-# exists to free. kv_tier.h warns if it detects one.
-KV_SPILL ?= $(CURDIR)/../../kvspill
+# Everything the engine owns at runtime lives under one directory in $HOME, not inside this
+# checkout: projects the agent works in, the KV spill tier, logs. A coding agent whose
+# workspace is the directory holding its own source is a footgun waiting for the first
+# "tidy up this repo".
+#
+# The KV spill tier MUST NOT point at tmpfs — that would put the "disk" tier back in the RAM it
+# exists to free. $HOME is on disk; kv_tier.h warns if it ever is not.
+ENGINE_HOME ?= $(HOME)/QwenEngine
+KV_SPILL    ?= $(ENGINE_HOME)/kvspill
 
 HDRS = qwen35.h qwen35_plan.h qwen35_cpu.h qwen35_batch.h qwen35_mtp.h kv_tier.h kv_tier_simd.h \
        kquant_simd.h kquant.h gguf.h iq_grids.h tok.h tok_gguf.h tok_unicode.h \
@@ -82,9 +88,9 @@ qwen35_server: qwen35_server.c $(HDRS) $(CUHDRS) qwen35_cuda.o
 	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
 else
 qwen35_run: qwen35_run.c $(HDRS)
-	$(CC) $(CFLAGS) -DCOLIBRI_NO_CUDA -I. -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -DQWEN_NO_CUDA -I. -o $@ $< $(LDFLAGS)
 qwen35_server: qwen35_server.c $(HDRS)
-	$(CC) $(CFLAGS) -DCOLIBRI_NO_CUDA -I. -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -DQWEN_NO_CUDA -I. -o $@ $< $(LDFLAGS)
 endif
 
 # Fast checks. kquant_simd needs no model; the others read geometry only.
@@ -116,16 +122,18 @@ gates: all
 # worth 20%, and libgomp reads those variables before main() could set them.
 run: qwen35_run
 	@mkdir -p "$(KV_SPILL)"
-	COLIBRI_KV_SPILL="$(KV_SPILL)" ./qwen35_run "$(MODEL)" $(ARGS)
+	QWEN_KV_SPILL="$(KV_SPILL)" ./qwen35_run "$(MODEL)" $(ARGS)
 
 # The HTTP server: a web chat UI at / and an OpenAI-compatible API at /v1. serve.sh waits for
 # a previous instance to actually release the port and the CUDA context — a fixed sleep races
 # the teardown and the new process then dies on "address already in use" with its VRAM already
 # half-claimed by the old one.
-# WORKSPACE is the directory the agent may touch. It defaults to the repository root rather
-# than to c/, because an agent confined to the directory holding its own source is not useful.
+# PROJECTS holds one subdirectory per project; the web UI picks one by name and the agent is
+# confined to it. Nothing outside the chosen project is reachable.
 serve: qwen35_server webui.html
-	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) ./serve.sh --workspace "$(WORKSPACE)" --tools $(TOOLS)
+	@mkdir -p "$(PROJECTS)" "$(ENGINE_HOME)/logs"
+	MODEL="$(MODEL)" PORT=$(PORT) CTX=$(CTX) LOG="$(ENGINE_HOME)/logs/server.log" \
+	    KV_SPILL="$(KV_SPILL)" ./serve.sh --projects "$(PROJECTS)" --tools $(TOOLS)
 
 # -x matches the process NAME. The -f form matches any command line CONTAINING
 # "qwen35_server", which includes the shell running this rule.
@@ -144,17 +152,17 @@ fwd: tests/qwen35_fwd_test
 	OMP_NUM_THREADS=16 ./tests/qwen35_fwd_test "$(MODEL)" 760,6511,314,9338,369
 
 batch: tests/qwen35_batch_test
-	COLIBRI_RESERVE_GB=4 OMP_NUM_THREADS=16 ./tests/qwen35_batch_test "$(MODEL)" 24 8
+	QWEN_RESERVE_GB=4 OMP_NUM_THREADS=16 ./tests/qwen35_batch_test "$(MODEL)" 24 8
 
 mtp: tests/qwen35_mtp_test
-	COLIBRI_RESERVE_GB=4 OMP_NUM_THREADS=16 ./tests/qwen35_mtp_test "$(MODEL)" 24
+	QWEN_RESERVE_GB=4 OMP_NUM_THREADS=16 ./tests/qwen35_mtp_test "$(MODEL)" 24
 
 clean:
 	rm -f $(CPU_TESTS) $(CU_TESTS) qwen35_cuda.o qwen35_run qwen35_server
 
 PORT      ?= 8080
 CTX       ?= 8192
-WORKSPACE ?= $(CURDIR)/../..
+PROJECTS  ?= $(ENGINE_HOME)/projects
 TOOLS     ?= workspace
 
 .PHONY: all test gates run serve stop tools bench fwd batch mtp clean

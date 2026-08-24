@@ -50,7 +50,7 @@ static char *rd(const char *rel){
 }
 
 int main(void){
-    char tmpl[] = "/tmp/colibri_harness_XXXXXX";
+    char tmpl[] = "/tmp/qwen_harness_XXXXXX";
     const char *dir = mkdtemp(tmpl);
     if(!dir){ perror("mkdtemp"); return 1; }
     if(!realpath(dir, g_root)){ perror("realpath"); return 1; }
@@ -162,6 +162,19 @@ int main(void){
     ok(has(r, "content", "outside the workspace"), "a write above the root is refused");
     free(ar); ar = NULL;
 
+    /* NO EXISTENCE ORACLE ACROSS THE FENCE. Reading a path outside must answer the same way
+     * whether or not it is there — otherwise the two error messages tell the caller exactly
+     * what the confinement exists to withhold. The earlier tests all used /etc/passwd, which
+     * EXISTS, so they never exercised this branch. */
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../does-not-exist-at-all\"}}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a MISSING path outside is refused, not reported missing");
+    ok(has(r, "content", "outside the workspace"), "and it says so in the same words");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"inside-but-absent\"}}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "allow") && has(r, "content", "No such file"),
+       "while a missing path INSIDE still says it is missing");
+    free(ar); ar = NULL;
+
     r = call("{\"name\":\"glob\",\"arguments\":{\"pattern\":\"*\",\"path\":\"/\"}}", &ar, &raw);
     ok(has(r, "content", "outside the workspace"), "the search root itself is confined");
     free(ar); ar = NULL;
@@ -248,6 +261,52 @@ int main(void){
     { const char *c = field(r, "content");
       ok(strlen(c) <= g_tmax + 512, "and stays inside the budget"); }
     free(ar); ar = NULL;
+
+    /* ---- 6b. PROJECTS. A second confinement, and a different one: the caller no longer
+     *          names a directory at all, it names a project, and everything that is not a
+     *          plain name has to bounce before it reaches the filesystem. ---- */
+    puts("\n6b. projects");
+    { char pr[PATH_MAX];
+      snprintf(pr, sizeof pr, "%s/projects", g_root);
+      mkdir(pr, 0755);
+      realpath(pr, g_proot);
+      char a1[PATH_MAX], a2[PATH_MAX];
+      snprintf(a1, sizeof a1, "%s/alpha", g_proot); mkdir(a1, 0755);
+      snprintf(a2, sizeof a2, "%s/beta",  g_proot); mkdir(a2, 0755);
+      FILE *f = fopen("/dev/null", "r"); if(f) fclose(f);
+      char af[PATH_MAX]; snprintf(af, sizeof af, "%s/only-in-alpha.txt", a1);
+      f = fopen(af, "wb"); if(f){ fputs("alpha\n", f); fclose(f); } }
+
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"alpha\"}", &ar, &raw);
+    ok(has(r, "content", "only-in-alpha.txt"), "a project scopes the workspace to itself");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"beta\"}", &ar, &raw);
+    ok(!has(r, "content", "only-in-alpha.txt"), "and the next project cannot see it");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"read_file\",\"arguments\":{\"path\":\"../alpha/only-in-alpha.txt\"},"
+             "\"project\":\"beta\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "one project cannot climb into its sibling");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"../..\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a dot-dot project name is refused");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"a/b\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a project name with a slash is refused");
+    free(ar); ar = NULL;
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"nope\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a project that does not exist is refused");
+    free(ar); ar = NULL;
+    /* a symlink IN the projects root pointing at / would otherwise make everything a project */
+    { char lk[PATH_MAX]; snprintf(lk, sizeof lk, "%s/sneaky", g_proot);
+      ok(symlink("/etc", lk) == 0, "(made a project that is a symlink to /etc)"); }
+    r = call("{\"name\":\"list_dir\",\"arguments\":{},\"project\":\"sneaky\"}", &ar, &raw);
+    ok(!strcmp(field(r, "decision"), "deny"), "a project symlinked out of the root is refused");
+    free(ar); ar = NULL;
+    { Str t = {0}; h_projects_json(&t); char *a2 = NULL; jval *j = json_parse(t.p, &a2);
+      jval *d = j ? json_get(j, "data") : NULL;
+      ok(d && d->t == J_ARR && d->len >= 2, "the project list is JSON and finds them");
+      free(a2); s_free(&t); }
+    g_proot[0] = 0; t_root[0] = 0;
 
     /* ---- 7. the escaper: a tool result goes into a JSON body ---- */
     puts("\n7. escaping");

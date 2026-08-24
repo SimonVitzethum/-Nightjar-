@@ -32,8 +32,8 @@
  * DEPENDS ON, and must be included after: Str + s_add/s_cat/s_fmt/s_json/s_free, j_emit(),
  * json.h, and now(). It is a part of qwen35_server.c that happens to live in its own file.
  */
-#ifndef COLIBRI_HARNESS_H
-#define COLIBRI_HARNESS_H
+#ifndef QWEN_HARNESS_H
+#define QWEN_HARNESS_H
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -57,7 +57,22 @@ typedef enum { TCL_READ = 0, TCL_WRITE, TCL_EXEC } ToolClass;
 typedef enum { TD_ALLOW = 0, TD_ASK, TD_DENY }    ToolDecision;
 
 static ToolMode g_tmode = TM_WS;
-static char     g_root[PATH_MAX] = "";
+static char     g_root[PATH_MAX]  = "";   /* the default workspace */
+static char     g_proot[PATH_MAX] = "";   /* the projects root; "" = single-workspace mode */
+
+/* THE ACTIVE WORKSPACE IS PER REQUEST, AND THEREFORE PER THREAD.
+ *
+ * Tool calls run on connection threads and two can be in flight at once, so the workspace a
+ * call is confined to cannot be a plain global — a second request switching project mid-call
+ * would move the fence under the first one. It is thread-local, set from the request, and
+ * falls back to the default.
+ *
+ * The client never sends a PATH for this. It sends a project NAME, which the server joins to
+ * the projects root and resolves; a name with a slash or a dot-dot in it is rejected before it
+ * gets that far. Accepting a path here would hand the caller the one thing the confinement
+ * exists to withhold. */
+static __thread char t_root[PATH_MAX] = "";
+static const char *h_root(void){ return t_root[0] ? t_root : g_root; }
 /* THE OUTPUT BUDGET IS SET BY PREFILL, NOT BY TASTE.
  *
  * Measured on this machine: 10.5 tok/s of prefill. A tool result of B bytes is about B/3.6
@@ -124,9 +139,10 @@ static ToolDecision h_policy(ToolClass c, const char **why){
 static __thread int h_out_of_tree = 0;
 
 static int h_under_root(const char *abs){
-    const size_t n = strlen(g_root);
+    const char *root = h_root();
+    const size_t n = strlen(root);
     if(!n) return 0;
-    if(strncmp(abs, g_root, n)) return 0;
+    if(strncmp(abs, root, n)) return 0;
     return abs[n] == 0 || abs[n] == '/';
 }
 
@@ -139,14 +155,19 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
     if(!rel || !*rel){ *err = "path is empty"; return 0; }
     if(rel[0] == '/'){ if(snprintf(joined, sizeof joined, "%s", rel) >= (int)sizeof joined){
                            *err = "path too long"; return 0; } }
-    else             { if(snprintf(joined, sizeof joined, "%s/%s", g_root, rel) >= (int)sizeof joined){
+    else             { if(snprintf(joined, sizeof joined, "%s/%s", h_root(), rel) >= (int)sizeof joined){
                            *err = "path too long"; return 0; } }
 
     if(realpath(joined, out) == NULL){
-        if(need_exists){
-            snprintf(msg, sizeof msg, "%s: %s", rel, strerror(errno));
-            *err = msg; return 0;
-        }
+        /* THE CONFINEMENT DECIDES FIRST, EVEN WHEN THE TARGET IS NOT THERE.
+         *
+         * The obvious order — report ENOENT for a missing file, check the fence only for one
+         * that exists — builds an existence oracle across the fence: "../secrets/x" answers
+         * "No such file or directory" when it is absent and "outside the workspace" when it is
+         * present, which tells the caller exactly what it was not allowed to learn. So the
+         * parent is resolved and checked in BOTH cases, and ENOENT is only ever reported for a
+         * path that was inside to begin with. */
+        const int missing = need_exists;
         /* split off the last component and resolve the directory instead */
         char dir[PATH_MAX];
         snprintf(dir, sizeof dir, "%s", joined);
@@ -165,11 +186,21 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
         }
         if(snprintf(out, PATH_MAX, "%s/%s", rdir, basecopy) >= PATH_MAX){
             *err = "path too long"; return 0; }
+        if(g_tmode != TM_FULL && !h_under_root(out)){
+            snprintf(msg, sizeof msg,
+                     "%s resolves to %s, which is outside the workspace %s — refused",
+                     rel, out, h_root());
+            *err = msg; h_out_of_tree = 1; return 0;
+        }
+        if(missing){                      /* inside, and genuinely not there */
+            snprintf(msg, sizeof msg, "%s: %s", rel, strerror(ENOENT));
+            *err = msg; return 0;
+        }
     }
     if(g_tmode != TM_FULL && !h_under_root(out)){
         snprintf(msg, sizeof msg,
                  "%s resolves to %s, which is outside the workspace %s — refused",
-                 rel, out, g_root);
+                 rel, out, h_root());
         *err = msg; h_out_of_tree = 1; return 0;
     }
     return 1;
@@ -177,9 +208,103 @@ static int h_resolve(const char *rel, int need_exists, char *out, const char **e
 
 /* Path as the model should see it: relative to the workspace when it is inside. */
 static const char *h_rel(const char *abs){
-    const size_t n = strlen(g_root);
-    if(!strncmp(abs, g_root, n) && abs[n] == '/') return abs + n + 1;
+    const char *root = h_root();
+    const size_t n = strlen(root);
+    if(!strncmp(abs, root, n) && abs[n] == '/') return abs + n + 1;
     return abs;
+}
+
+/* ---------------- projects ----------------
+ *
+ * One engine, many workspaces. A project is a direct subdirectory of the projects root and is
+ * addressed by NAME, never by path — the validation below is the whole security boundary for
+ * that, and it is deliberately a whitelist: anything not in [A-Za-z0-9._-] is refused rather
+ * than escaped or stripped. Stripping produces a different name that still resolves somewhere,
+ * which is how a "sanitizer" turns into a directory traversal. */
+static int h_pname_ok(const char *n){
+    if(!n || !*n || strlen(n) > 64) return 0;
+    if(n[0] == '.') return 0;                      /* no ".", "..", no hidden directories */
+    for(const char *p = n; *p; p++)
+        if(!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-')) return 0;
+    return 1;
+}
+
+/* Point this thread at a project for the duration of one request. Returns 0 and leaves the
+ * thread on the default workspace if the name is bad or the directory is not there. */
+static int h_use_project(const char *name, const char **err){
+    static __thread char msg[PATH_MAX + 96];
+    t_root[0] = 0;
+    if(!name || !*name) return 1;                  /* no project asked for: the default */
+    if(!g_proot[0]){ *err = "this server runs a single workspace, not projects"; return 0; }
+    if(!h_pname_ok(name)){ *err = "a project name is letters, digits, dot, dash, underscore"; return 0; }
+    char joined[PATH_MAX], real[PATH_MAX];
+    if(snprintf(joined, sizeof joined, "%s/%s", g_proot, name) >= (int)sizeof joined){
+        *err = "name too long"; return 0; }
+    if(!realpath(joined, real)){
+        snprintf(msg, sizeof msg, "no project \"%s\"", name); *err = msg; return 0; }
+    /* resolved, then checked: a symlink in the projects root pointing at / would otherwise
+     * make the whole filesystem a "project" */
+    const size_t n = strlen(g_proot);
+    if(strncmp(real, g_proot, n) || real[n] != '/'){
+        snprintf(msg, sizeof msg, "project \"%s\" resolves outside the projects root", name);
+        *err = msg; return 0; }
+    struct stat st;
+    if(stat(real, &st) || !S_ISDIR(st.st_mode)){ *err = "not a directory"; return 0; }
+    snprintf(t_root, sizeof t_root, "%s", real);
+    return 1;
+}
+
+static int h_make_project(const char *name, const char **err){
+    static __thread char msg[PATH_MAX + 96];
+    if(!g_proot[0]){ *err = "this server runs a single workspace, not projects"; return 0; }
+    if(!h_pname_ok(name)){ *err = "a project name is letters, digits, dot, dash, underscore"; return 0; }
+    char joined[PATH_MAX];
+    if(snprintf(joined, sizeof joined, "%s/%s", g_proot, name) >= (int)sizeof joined){
+        *err = "name too long"; return 0; }
+    if(mkdir(joined, 0755) != 0 && errno != EEXIST){
+        snprintf(msg, sizeof msg, "%s: %s", name, strerror(errno)); *err = msg; return 0; }
+    return 1;
+}
+
+/* GET /v1/projects — what exists, and how big each one is in files. Sorted, because a list
+ * that reorders itself between reloads is a list nobody trusts. */
+static int h_pcmp(const void *a, const void *b){ return strcmp(*(const char**)a, *(const char**)b); }
+static void h_projects_json(Str *o){
+    s_cat(o, "{\"root\":");
+    s_json(o, g_proot, strlen(g_proot));
+    s_cat(o, ",\"data\":[");
+    if(g_proot[0]){
+        DIR *d = opendir(g_proot);
+        char *names[512]; int n = 0;
+        if(d){
+            struct dirent *e;
+            while((e = readdir(d)) && n < 512){
+                if(e->d_name[0] == '.') continue;
+                char full[PATH_MAX];
+                if(snprintf(full, sizeof full, "%s/%s", g_proot, e->d_name) >= (int)sizeof full) continue;
+                struct stat st;
+                if(stat(full, &st) || !S_ISDIR(st.st_mode)) continue;
+                names[n++] = strdup(e->d_name);
+            }
+            closedir(d);
+        }
+        qsort(names, (size_t)n, sizeof *names, h_pcmp);
+        for(int i = 0; i < n; i++){
+            char full[PATH_MAX];
+            snprintf(full, sizeof full, "%s/%s", g_proot, names[i]);
+            int files = 0;
+            DIR *pd = opendir(full);
+            if(pd){ struct dirent *e;
+                    while((e = readdir(pd)) && files < 10000){ if(e->d_name[0] != '.') files++; }
+                    closedir(pd); }
+            if(i) s_cat(o, ",");
+            s_cat(o, "{\"name\":");
+            s_json(o, names[i], strlen(names[i]));
+            s_fmt(o, ",\"entries\":%d}", files);
+            free(names[i]);
+        }
+    }
+    s_cat(o, "]}");
 }
 
 /* ---------------- output budget ---------------- */
@@ -232,7 +357,7 @@ static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
         dup2(pfd[1], 1); dup2(pfd[1], 2); close(pfd[1]);
         const int nul = open("/dev/null", O_RDONLY);
         if(nul >= 0){ dup2(nul, 0); close(nul); }
-        if(chdir(g_root) != 0) _exit(126);
+        if(chdir(h_root()) != 0) _exit(126);
         setenv("TERM", "dumb", 1);          /* no colour escapes in the model's context */
         setenv("PAGER", "cat", 1);
         setenv("GIT_PAGER", "cat", 1);
@@ -736,7 +861,7 @@ static void h_system_prompt(Str *o);
  * function objects: everything inside those is prefilled verbatim into the prompt. */
 static void h_tools_json(Str *o){
     s_cat(o, "{\"object\":\"list\",\"workspace\":");
-    s_json(o, g_root, strlen(g_root));
+    s_json(o, h_root(), strlen(h_root()));
     s_fmt(o, ",\"mode\":\"%s\",\"max_output\":%zu,\"data\":[", h_mode_name(), g_tmax);
     int first = 1;
     for(int i = 0; i < g_ntools; i++){
@@ -772,6 +897,16 @@ static void h_exec_json(Str *o, const char *body){
     if(!t){
         s_cat(o, "{\"decision\":\"deny\",\"ok\":false,\"error\":");
         s_json(o, "no such tool", 12);
+        s_cat(o, "}");
+        free(arena);
+        return;
+    }
+    /* Pick the workspace BEFORE the gate: a denial should name the project it was denied in,
+     * and a bad project name must not run anything anywhere. */
+    const char *perr = NULL;
+    if(!h_use_project(a_str(req, "project", NULL), &perr)){
+        s_cat(o, "{\"decision\":\"deny\",\"ok\":false,\"reason\":");
+        s_json(o, perr, strlen(perr));
         s_cat(o, "}");
         free(arena);
         return;
@@ -834,7 +969,7 @@ static void h_system_prompt(Str *o){
       "- Say in one short line what you are about to do, then call the tool. No essays.\n"
       "- When a tool fails, read the error — it usually says exactly what to fix.\n"
       "- When the task is done, say what changed and stop calling tools.\n",
-      g_root);
+      h_root());
 }
 
-#endif /* COLIBRI_HARNESS_H */
+#endif /* QWEN_HARNESS_H */

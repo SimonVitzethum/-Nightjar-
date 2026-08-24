@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Colibrì · Qwen3.5-27B</title>
+<title>QwenEngine · Qwen3.5-27B</title>
 <!--
   The harness UI.
 
@@ -80,6 +80,9 @@ button.ghost.on{border-color:var(--accent);color:var(--accent);background:var(--
 .seg button{background:none;border:0;font:inherit;font-size:13px;padding:5px 13px;color:var(--fg-dim);
   cursor:pointer;transition:.14s}
 .seg button.on{background:var(--accent);color:#fff}
+#proj{background:var(--bg-soft);border:1px solid var(--line);color:var(--fg);border-radius:8px;
+  padding:4px 8px;font:inherit;font-size:13px;max-width:14rem}
+#proj:focus{outline:0;border-color:var(--accent)}
 .ws{font-family:var(--mono);font-size:11.5px;color:var(--fg-faint);white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis;max-width:22rem;direction:rtl;text-align:left}
 
@@ -228,10 +231,12 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot"></span>Colibrì <small id="mname">…</small></div>
+  <div class="brand"><span class="dot"></span>QwenEngine <small id="mname">…</small></div>
   <div class="seg" id="mode">
     <button data-m="chat">Chat</button><button data-m="agent" class="on">Agent</button>
   </div>
+  <select id="proj" title="Projekt"></select>
+  <button class="ghost" id="pnew" title="Neues Projekt">+</button>
   <div class="ws" id="wsl"></div>
   <div class="sp"></div>
   <span id="stat"></span>
@@ -279,6 +284,7 @@ const chat = $('#chat'), main = $('#main'), ta = $('#ta'), send = $('#send');
 
 let messages = [];          /* append-only: see the note at the top of this file */
 let tools = [], policy = {}, sysPrompt = '', workspace = '', toolMode = 'off';
+let project = localStorage.getItem('project') || '', projectsRoot = '';
 let busy = false, ctrl = null, stopped = false;
 let sessionAllow = new Set();
 let mode = localStorage.getItem('mode') || 'agent';
@@ -651,7 +657,7 @@ async function runTool(call, host){
 
   const post = approved => fetch('/v1/tools/exec', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ name, arguments: call.function.arguments || '{}', approved })
+    body: JSON.stringify({ name, arguments: call.function.arguments || '{}', approved, project })
   }).then(r => r.json());
 
   let pre = ($('#appr').value === 'auto') || sessionAllow.has(name);
@@ -796,19 +802,56 @@ $('#reset').onclick = newChat;
 $('#temp').oninput = e => $('#tv').textContent = (+e.target.value).toFixed(2);
 
 /* ---------- what the server actually offers ---------- */
-Promise.all([
-  fetch('/health').then(r=>r.json()).catch(()=>null),
-  fetch('/v1/tools').then(r=>r.json()).catch(()=>null)
-]).then(([h, t]) => {
-  if (h) $('#mname').textContent = h.model + ' · ' + (h.speculative ? 'GPU + spekulativ' : h.gpu ? 'GPU' : 'CPU');
+/* The registry is fetched PER PROJECT: the system prompt names the workspace, so it differs,
+   and it is the first thing in the prompt. Switching project therefore changes the cached
+   prefix — which is why it also starts a new conversation rather than pretending it can
+   continue one. */
+async function loadTools(){
+  const t = await fetch('/v1/tools' + (project ? '?project=' + encodeURIComponent(project) : ''))
+                  .then(r => r.json()).catch(() => null);
   if (t){
     tools = t.data || []; policy = t.policy || {};
     sysPrompt = t.system || ''; workspace = t.workspace || ''; toolMode = t.mode || 'off';
     $('#wsl').textContent = workspace + '  ·  ' + toolMode;
     if (toolMode === 'off') mode = 'chat';
   } else { toolMode = 'off'; mode = 'chat'; }
+}
+
+async function loadProjects(){
+  const p = await fetch('/v1/projects').then(r=>r.json()).catch(()=>null);
+  const sel = $('#proj');
+  if (!p || !p.root){ sel.style.display = 'none'; $('#pnew').style.display = 'none'; return; }
+  projectsRoot = p.root;
+  const list = p.data || [];
+  if (!list.some(x => x.name === project)) project = list.length ? list[0].name : '';
+  sel.innerHTML = list.length
+    ? list.map(x => '<option value="' + esc(x.name) + '"' + (x.name === project ? ' selected' : '')
+        + '>' + esc(x.name) + ' · ' + x.entries + '</option>').join('')
+    : '<option value="">(kein Projekt)</option>';
+  localStorage.setItem('project', project);
+}
+
+$('#proj').onchange = async e => {
+  project = e.target.value; localStorage.setItem('project', project);
+  await loadTools(); applyMode(); newChat();
+};
+$('#pnew').onclick = async () => {
+  const name = prompt('Name des neuen Projekts (Buchstaben, Ziffern, . _ -):');
+  if (!name) return;
+  const r = await fetch('/v1/projects', { method:'POST',
+              headers:{'Content-Type':'application/json'}, body: JSON.stringify({name}) });
+  if (!r.ok){ alert((await r.json()).error?.message || 'ging nicht'); return; }
+  project = name; localStorage.setItem('project', project);
+  await loadProjects(); await loadTools(); applyMode(); newChat();
+};
+
+(async () => {
+  const h = await fetch('/health').then(r=>r.json()).catch(()=>null);
+  if (h) $('#mname').textContent = h.model + ' · ' + (h.speculative ? 'GPU + spekulativ' : h.gpu ? 'GPU' : 'CPU');
+  await loadProjects();
+  await loadTools();
   applyMode(); newChat();
-});
+})();
 ta.focus();
 </script>
 </body>
