@@ -101,6 +101,20 @@ open:
 | `POST /v1/tools/exec` | run one tool: `{name, arguments, approved}` |
 | `GET /health` | device, context, VRAM, cache state |
 
+**Live throughput.** While an answer streams, the header shows cache hit rate, decode tok/s and
+**two** throughput figures — never their sum: `dram+pcie 56.4 / 64.8 GB/s`, with the VRAM share
+in the tooltip. Summed they read ~84 GB/s and no bus in this machine does 84; the DRAM half has
+the measured 64.8 ceiling and the VRAM half runs at 283.7, so one combined number hides the only
+one worth watching. Both are derived from the placement (weight bytes per token × tok/s), not
+measured on the bus, and the tooltip says so. During prefill — which can be minutes — the same
+line shows `prefill 3200 / 8000` instead of nothing at all.
+
+**A reload does not cancel anything.** A turn that names its conversation is held by the server:
+the text goes into a buffer as it is generated, the page may reload and pick it up
+(`GET /v1/live?chat=ID`), and only the stop button really ends it (`POST /v1/live/cancel`). A
+client with no chat id cannot come back for anything, so for opencode and `curl` a dropped
+connection still aborts immediately.
+
 An aborted request is actually aborted. The server checks whether the client is still there
 during prefill and during generation, which it did not before: a cancelled turn kept prefilling
 for minutes, and since one request runs at a time the next prompt queued silently behind it.

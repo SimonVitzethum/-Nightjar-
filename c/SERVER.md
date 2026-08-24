@@ -82,6 +82,22 @@ Für interaktive Nutzung ist die Oberfläche deshalb angenehmer als ein Agent: k
 sofortige Antwort. Für opencode lohnt es sich, eine Sitzung offen zu lassen statt viele neue
 zu starten.
 
+**Live-Anzeige.** Oben rechts stehen während der Antwort Cache-Trefferquote, Decode-Tempo und
+Durchsatz — und zwar **zwei** Durchsatzzahlen, nie ihre Summe: `dram+pcie 56,4 / 64,8 GB/s`
+neben dem VRAM-Anteil im Tooltip. Die Summe wären ~84 GB/s, und kein Bus dieser Maschine macht
+84; die DRAM-Hälfte hat die gemessene 64,8er-Decke, die VRAM-Hälfte läuft bei 283,7. Eine
+kombinierte Zahl versteckt genau die, auf die es ankommt. Beide sind aus der Platzierung
+abgeleitet (Gewichtsbytes pro Token × tok/s), nicht am Bus gemessen — der Tooltip sagt das.
+
+Während des Prefills, der Minuten dauern kann, zeigt dieselbe Zeile `prefill 3200 / 8000` statt
+gar nichts.
+
+**Neu laden bricht nichts ab.** Ein Zug, der seine Konversation benennt, wird serverseitig
+gehalten: der Text landet beim Erzeugen in einem Puffer, die Seite darf jederzeit neu laden und
+holt ihn ab, und nur der Stopp-Knopf beendet ihn wirklich (`POST /v1/live/cancel`). Ein Client
+ohne Chat-ID — opencode, curl — kann nicht wiederkommen, für den beendet ein Verbindungsabbruch
+den Zug weiterhin sofort.
+
 **Abgebrochen heißt abgebrochen.** Bricht die Seite einen Zug ab, schließt der Browser die
 Verbindung, und der Server merkt das jetzt — im Prefill wie beim Generieren. Vorher tat er es
 nicht: er rechnete fünfeinhalb Minuten an einer Antwort weiter, die niemand mehr liest, und weil

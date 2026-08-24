@@ -62,6 +62,86 @@
 #include "harness.h"
 #include "chatstore.h"
 
+/* WEIGHT BYTES PER GENERATED TOKEN, from the placement plan.
+ *
+ * Decoding one token reads every weight once: the tensors resident in VRAM, the FFN (whether the
+ * CPU reads it in place or the GPU pulls it over PCIe — the bytes leave DRAM either way), and one
+ * row of the embedding table. So a live GB/s is bytes_per_token x tok/s.
+ *
+ * It is DERIVED, not measured on the bus, and the display says so. What makes it worth showing
+ * anyway is that it is the number this engine is built around: 59 GB/s against a DRAM controller
+ * that tops out at 64.8. A tok/s figure alone does not say whether you are near the wall or
+ * leaving the machine idle. This does. */
+static int64_t g_bytes_per_tok = 0;   /* everything a token touches */
+static int64_t g_bytes_dram    = 0;   /* the half that crosses the DRAM controller */
+static int64_t g_bytes_vram    = 0;   /* the half already on the card */
+static int     g_prefill_sb    = 8;   /* weights are read once per batch, not once per token */
+
+/* THE TURN OUTLIVES THE CONNECTION.
+ *
+ * A turn here takes minutes. Tying it to the socket means a page reload throws away work that
+ * cannot be redone cheaply — and reloading is the first thing anyone does when a UI looks
+ * stuck. So a turn that names its conversation is held HERE: the text goes into this buffer as
+ * it is generated, the browser can come back and read it from the start, and only an explicit
+ * cancel stops the engine.
+ *
+ * That is the exact opposite of the disconnect rule one screen up, and both are right for their
+ * case. A client with no chat id — opencode, curl — cannot come back for anything, so its
+ * disconnect still aborts. A client that CAN come back gets to.
+ *
+ * One turn at a time, because there is one engine. */
+typedef struct {
+    pthread_mutex_t mu;
+    char     chat[96];
+    int      live, cancel, done, had_error;
+    uint64_t seq;
+    Str      content, reasoning, tools;
+    int      gen, prompt, cached, pre_done;
+    double   pre_s, dec_s, started, pre_tps;
+} LiveTurn;
+static LiveTurn g_live = { PTHREAD_MUTEX_INITIALIZER, {0}, 0,0,0,0, 0, {0},{0},{0}, 0,0,0, 0,0,0 };
+
+static void live_begin(const char *chat){
+    pthread_mutex_lock(&g_live.mu);
+    snprintf(g_live.chat, sizeof g_live.chat, "%s", chat ? chat : "");
+    g_live.content.n = g_live.reasoning.n = g_live.tools.n = 0;
+    g_live.live = 1; g_live.cancel = 0; g_live.done = 0; g_live.had_error = 0;
+    g_live.gen = g_live.prompt = g_live.cached = g_live.pre_done = 0;
+    g_live.pre_tps = 0;
+    g_live.pre_s = g_live.dec_s = 0; g_live.started = now();
+    g_live.seq++;
+    pthread_mutex_unlock(&g_live.mu);
+}
+static void live_add(int reasoning, const char *b, size_t n){
+    pthread_mutex_lock(&g_live.mu);
+    if(g_live.live) s_add(reasoning ? &g_live.reasoning : &g_live.content, b, n);
+    pthread_mutex_unlock(&g_live.mu);
+}
+static void live_prefill(int done, int total, double tps){
+    pthread_mutex_lock(&g_live.mu);
+    g_live.pre_done = done; g_live.prompt = total; g_live.pre_tps = tps;
+    pthread_mutex_unlock(&g_live.mu);
+}
+static void live_stats(int gen, double dec_s, int prompt, int cached, double pre_s){
+    pthread_mutex_lock(&g_live.mu);
+    g_live.gen = gen; g_live.dec_s = dec_s;
+    g_live.prompt = prompt; g_live.cached = cached; g_live.pre_s = pre_s;
+    pthread_mutex_unlock(&g_live.mu);
+}
+static void live_end(const char *tools_json){
+    pthread_mutex_lock(&g_live.mu);
+    g_live.tools.n = 0;
+    if(tools_json) s_cat(&g_live.tools, tools_json);
+    g_live.live = 0; g_live.done = 1;
+    pthread_mutex_unlock(&g_live.mu);
+}
+static int live_cancelled(void){
+    pthread_mutex_lock(&g_live.mu);
+    const int c = g_live.cancel;
+    pthread_mutex_unlock(&g_live.mu);
+    return c;
+}
+
 /* ---------------- global engine state ---------------- */
 
 static Q35Model  g_M;
@@ -392,7 +472,7 @@ static int parse_tool_call(const char *s, size_t n, ToolCall *tc){
 }
 
 typedef struct {
-    int   fd, stream, sent_role, dead;
+    int   fd, stream, sent_role, dead, resumable;
     char  id[48];
     long  created;
     Str   content, reasoning, toolbuf;
@@ -414,8 +494,27 @@ static void sse_delta(Gen *g, const char *field, const char *b, size_t n){
     s_free(&f);
 }
 
+/* An extra key on an otherwise ordinary chunk. Clients that do not know it ignore it — which
+ * is every client but this page — so the live readout costs no second request and no protocol
+ * of its own. */
+static void sse_stats(Gen *g, int gen, double dec_s, int prompt, int cached, double pre_s){
+    if(!g->stream || dec_s <= 0) return;
+    const double tps = gen / dec_s;
+    Str f = {0};
+    s_fmt(&f, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+              "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],"
+              "\"qwen\":{\"gen\":%d,\"decode_s\":%.3f,\"tok_s\":%.3f,\"gbps\":%.2f,"
+              "\"gbps_vram\":%.2f,\"prompt\":%d,\"cached\":%d,\"prefill_s\":%.3f,"
+              "\"phase\":\"decode\"}}\n\n",
+          g->id, g->created, g_model_name, gen, dec_s, tps,
+          g_bytes_dram * tps / 1e9, g_bytes_vram * tps / 1e9, prompt, cached, pre_s);
+    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
+    s_free(&f);
+}
+
 static void emit(Gen *g, Str *acc, Str *pend, const char *field, const char *b, size_t n){
     s_add(acc, b, n);
+    if(g->resumable) live_add(field[0] == 'r', b, n);
     if(!g->stream) return;
     s_add(pend, b, n);
     const size_t cut = utf8_complete(pend->p, pend->n);
@@ -444,7 +543,9 @@ static int ensure_ctx(int need){
     return g_R.att != NULL;
 }
 
-static int prefill(int fd, const int *req, int n, float *logits, double *t_out, int *reused){
+static int prefill(int fd, int resumable, const int *req, int n, float *logits,
+                   double *t_out, int *reused){
+    #define PF_STOP() (resumable ? live_cancelled() : client_gone(fd))
     const int start = q35_cache_begin(&g_C, req, n, reused);
     /* ensure_ctx grows the KV store, and for a 20k prompt that is seconds of allocation and
      * spilling before a single token is computed. Checked on both sides of it, which is as
@@ -456,9 +557,9 @@ static int prefill(int fd, const int *req, int n, float *logits, double *t_out, 
      * one uninterruptible call. Worth naming rather than rounding away: the window exists, it
      * is bounded by how much the store has to grow, and it shrinks to nothing once the context
      * has reached its working size. */
-    if(client_gone(fd)) return 0;
+    if(PF_STOP()) return -1;
     if(!ensure_ctx(n + 4)) return 0;
-    if(client_gone(fd)) return 0;
+    if(PF_STOP()) return -1;
     const double t0 = now();
     int i = start;
 #ifndef QWEN_NO_CUDA
@@ -468,7 +569,10 @@ static int prefill(int fd, const int *req, int n, float *logits, double *t_out, 
         float *hh   = (float*)malloc(sizeof(float)*g_M.c.d_model);
         /* checked once per batch of 8, so a five-minute prefill for a client that left ends
          * within a fraction of a second rather than at the end */
-        for(; i + SB <= n - 1 && !g_abort && !client_gone(fd); i += SB){
+        for(; i + SB <= n - 1 && !g_abort; i += SB){
+            if(PF_STOP()) break;
+            if(resumable && (i & 127) < SB)
+                live_prefill(i, n, (i - start) / (now() - t0 + 1e-9));
             q35_forward_cu_batch_ex(&g_Z, (int*)req + i, SB, i, NULL, 0, xall);
             for(int s = 0; s < SB; s++){
                 q35_rmsnorm(hh, xall + (size_t)s*g_M.c.d_model, g_M.output_norm,
@@ -481,8 +585,9 @@ static int prefill(int fd, const int *req, int n, float *logits, double *t_out, 
         free(xall); free(hh);
     }
 #endif
+    int aborted = 0;
     for(; i < n && !g_abort; i++){
-        if((i & 63) == 0 && client_gone(fd)) break;
+        if((i & 63) == 0 && PF_STOP()){ aborted = 1; break; }
         forward1(req[i], i, (i == n-1) ? logits : NULL);
 #ifndef QWEN_NO_CUDA
         if(g_spec){ float h[8192]; q35_hidden(&g_R, h); q35_mtp_prefill_kv(&g_P, h, req[i], i); }
@@ -491,7 +596,19 @@ static int prefill(int fd, const int *req, int n, float *logits, double *t_out, 
         q35_cache_mark(&g_C, i + 1);
     }
     *t_out = now() - t0;
-    return 1;
+    /* AN ABORTED PREFILL MUST NOT LOOK LIKE A FINISHED ONE.
+     *
+     * The first version broke out of the loop and returned 1 all the same — but `logits` is only
+     * written at i == n-1, so the caller went straight into sample() on a malloc'd buffer that
+     * had never been touched. It did not crash; it drew a token from uninitialised memory and
+     * fed it to the speculative decoder, which then ran a batched forward with a snapshot
+     * against a state that meant nothing. The engine wedged afterwards — 0% CPU, GPU idle, every
+     * thread in futex, no error anywhere — and each later request queued behind it forever.
+     *
+     * Reading uninitialised memory is the kind of defect nothing complains about, which is why
+     * this returns a distinct code and the caller stops rather than carries on. */
+    #undef PF_STOP
+    return (aborted || i < n) ? -1 : 1;
 }
 
 /* One generated token through the state machine. Control tokens switch mode and are never
@@ -544,7 +661,9 @@ static void handle_chat(int fd, const char *body, size_t blen){
      * eviction, which then drops one chat's foothold to "widen a gap" between points that were
      * never on the same line. opencode and curl send nothing and share bucket 0, exactly as
      * before. */
-    q35_cache_use_chat(&g_C, (jt = json_get(root, "chat")) && jt->t == J_STR ? jt->str : NULL);
+    const char *chat_id = (jt = json_get(root, "chat")) && jt->t == J_STR ? jt->str : NULL;
+    q35_cache_use_chat(&g_C, chat_id);
+    if(chat_id && *chat_id) live_begin(chat_id);
 
     Str prompt = {0};
     build_prompt(&prompt, msgs, tools, think);
@@ -562,13 +681,21 @@ static void handle_chat(int fd, const char *body, size_t blen){
     if(!logits || !lg2 || !cbuf){ http_err(fd, 500, "Internal Server Error", "out of memory"); goto done; }
 
     double t_pre = 0; int reused = 0;
-    if(!prefill(fd, req, np, logits, &t_pre, &reused)){
+    const int pf = prefill(fd, chat_id && *chat_id, req, np, logits, &t_pre, &reused);
+    if(pf < 0){
+        if(g_verbose) fprintf(stderr, "  %d of %d prompt tokens in %.2fs, then it was dropped\n",
+                              g_C.ctx_n, np, t_pre);
+        if(chat_id && *chat_id) live_end("[]");
+        goto done;
+    }
+    if(!pf){
         http_err(fd, 507, "Insufficient Storage", "context does not fit in memory");
         goto done;
     }
 
     Gen g; memset(&g, 0, sizeof g);
     g.fd = fd; g.stream = stream; g.in_think = think; g.created = (long)time(NULL);
+    g.resumable = chat_id && *chat_id;
     snprintf(g.id, sizeof g.id, "chatcmpl-%08lx%04x", (unsigned long)time(NULL), rand() & 0xffff);
 
     if(stream){
@@ -591,7 +718,14 @@ static void handle_chat(int fd, const char *body, size_t blen){
         if(!ensure_ctx(pos + 8)) break;
         /* g.dead is set by the SSE writer the first time a send() fails; client_gone catches
          * the non-streaming case, where nothing is written until the end. */
-        if(g.dead || ((ngen & 15) == 0 && client_gone(fd))){ gone = 1; break; }
+        if((ngen & 7) == 0){
+            sse_stats(&g, ngen, now() - t_dec0, np, reused, t_pre);
+            if(g.resumable) live_stats(ngen, now() - t_dec0, np, reused, t_pre);
+        }
+        if(g.resumable){
+            /* the page may be reloading; keep going and let it come back for the text */
+            if(live_cancelled()){ gone = 1; break; }
+        } else if(g.dead || ((ngen & 15) == 0 && client_gone(fd))){ gone = 1; break; }
 
 #ifndef QWEN_NO_CUDA
         /* One speculative round: the MTP head drafts, and the trunk verifies BOTH positions
@@ -694,6 +828,23 @@ static void handle_chat(int fd, const char *body, size_t blen){
         http_send(fd, 200, "OK", "application/json", out.p, out.n);
     }
     s_free(&out);
+
+    if(g.resumable){
+        Str tj = {0};
+        s_cat(&tj, "[");
+        for(int i = 0; i < g.n_tc; i++){
+            if(i) s_cat(&tj, ",");
+            s_fmt(&tj, "{\"id\":\"call_%s_%d\",\"type\":\"function\",\"function\":{\"name\":", g.id+9, i);
+            s_json(&tj, g.tc[i].name, strlen(g.tc[i].name));
+            s_cat(&tj, ",\"arguments\":");
+            s_json(&tj, g.tc[i].args.p, g.tc[i].args.n);
+            s_cat(&tj, "}}");
+        }
+        s_cat(&tj, "]");
+        live_stats(ngen, t_dec, np, reused, t_pre);
+        live_end(tj.p);
+        s_free(&tj);
+    }
 
     if(g_verbose){
         /* On an abort the prompt was NOT prefilled — only as far as g_C.ctx_n got. Reporting
@@ -918,6 +1069,39 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
         }
         /* The file view. Same h_resolve, same fence, same per-thread project as the tools —
          * a second reader with its own idea of "inside" would be the second door. */
+        /* Whatever the live turn has produced so far. The whole text each time rather than a
+         * delta: a turn is a few KB, this is localhost, and an offset protocol over two
+         * interleaved streams would be more to get wrong than it saves. */
+        else if(path_is(path, "/v1/live")){
+            char want[96]; query_arg(path, "chat", want, sizeof want);
+            Str b = {0};
+            pthread_mutex_lock(&g_live.mu);
+            const int mine = want[0] && !strcmp(want, g_live.chat);
+            s_fmt(&b, "{\"seq\":%llu,\"live\":%s,\"done\":%s,\"mine\":%s,\"chat\":",
+                  (unsigned long long)g_live.seq,
+                  g_live.live ? "true" : "false", g_live.done ? "true" : "false",
+                  mine ? "true" : "false");
+            s_json(&b, g_live.chat, strlen(g_live.chat));
+            if(mine){
+                s_cat(&b, ",\"content\":");
+                s_json(&b, g_live.content.p ? g_live.content.p : "", g_live.content.n);
+                s_cat(&b, ",\"reasoning\":");
+                s_json(&b, g_live.reasoning.p ? g_live.reasoning.p : "", g_live.reasoning.n);
+                s_fmt(&b, ",\"tool_calls\":%s", g_live.tools.n ? g_live.tools.p : "[]");
+                const double tps = g_live.dec_s > 0 ? g_live.gen / g_live.dec_s : 0;
+                s_fmt(&b, ",\"gen\":%d,\"decode_s\":%.3f,\"tok_s\":%.3f,\"gbps\":%.2f,"
+                          "\"gbps_vram\":%.2f,\"prompt\":%d,\"cached\":%d,\"prefill_s\":%.3f,"
+                          "\"elapsed\":%.1f,\"pre_done\":%d,\"pre_tok_s\":%.2f,\"phase\":\"%s\"",
+                      g_live.gen, g_live.dec_s, tps, g_bytes_dram * tps / 1e9,
+                      g_bytes_vram * tps / 1e9, g_live.prompt, g_live.cached, g_live.pre_s,
+                      now() - g_live.started, g_live.pre_done, g_live.pre_tps,
+                      g_live.live ? (g_live.gen ? "decode" : "prefill") : "done");
+            }
+            s_cat(&b, "}");
+            pthread_mutex_unlock(&g_live.mu);
+            http_send(fd, 200, "OK", "application/json", b.p, b.n);
+            s_free(&b);
+        }
         else if(path_is(path, "/v1/term")){
             char sn[32]; query_arg(path, "since", sn, sizeof sn);
             Str b = {0}; h_term_json(&b, sn[0] ? strtoull(sn, NULL, 10) : 0);
@@ -991,6 +1175,12 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             free(arena); free(body);
             if(ok) http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 13);
             else   http_err(fd, 400, "Bad Request", "could not store the chat");
+        } else if(path_is(path, "/v1/live/cancel")){
+            /* The explicit stop, which is now the ONLY thing that ends a resumable turn. */
+            pthread_mutex_lock(&g_live.mu);
+            g_live.cancel = 1;
+            pthread_mutex_unlock(&g_live.mu);
+            http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 13);
         } else if(path_is(path, "/v1/term/input") || path_is(path, "/v1/term/signal")){
             /* Whatever arrives here goes down the PTY and nowhere else. It is not logged, not
              * echoed, and not put anywhere the model can read it: when it carries a sudo
@@ -1136,6 +1326,8 @@ int main(int argc, char **argv){
                 "  GET  /v1/models            model list\n"
                 "  GET  /v1/tools[?project=N] tool schemas + policy + the agent system prompt\n"
                 "  GET  /v1/projects          the projects that exist\n"
+                "  GET  /v1/live?chat=ID      the turn in flight, so a reload can pick it up\n"
+                "  POST /v1/live/cancel       stop it — the only thing that does\n"
                 "  GET  /v1/chats?project=N   the conversations of a project\n"
                 "  GET  /v1/chat?project=&id= one conversation\n"
                 "  POST /v1/chat/save         {project, id, title, messages}\n"
@@ -1319,6 +1511,24 @@ int main(int argc, char **argv){
 #endif
     PHASE("prefix cache");
     q35_cache_report(&g_C, stderr);
+    /* TWO NUMBERS, NOT ONE. Summing them gives 84 GB/s at 5.3 tok/s, which reads like the
+     * machine is doing 84 — and there is no bus here that does 84. The FFN half crosses the
+     * DRAM controller (whether the CPU reads it in place or the GPU pulls it over PCIe) and
+     * that is the half with the 64.8 GB/s ceiling this engine is built against. The rest is
+     * already on the card at 283.7. One combined figure hides exactly the thing worth
+     * watching. */
+    { Q35Bytes B2; q35_bytes(&g_M, &B2);
+      g_bytes_dram = B2.ffn + B2.embd / (g_M.c.vocab > 0 ? g_M.c.vocab : 1);
+      g_bytes_vram = 0;
+#ifndef QWEN_NO_CUDA
+      if(g_gpu){ g_bytes_vram = g_G.vram_weights; g_prefill_sb = g_Z.S_max > 0 ? g_Z.S_max : 8; }
+      else
+#endif
+      g_bytes_dram += B2.gdn + B2.attn + B2.out + B2.norms;
+      g_bytes_per_tok = g_bytes_dram + g_bytes_vram;
+      fprintf(stderr, "  per generated token: %.2f GiB from DRAM/PCIe (ceiling 64.8 GB/s), "
+                      "%.2f GiB from VRAM\n",
+              g_bytes_dram/1073741824.0, g_bytes_vram/1073741824.0); }
 
     if(!www){
         static char guess[1024];

@@ -73,6 +73,7 @@ button.ghost.on{border-color:var(--accent);color:var(--accent);background:var(--
   letter-spacing:.05em}
 #stat .kv b{font-weight:600;font-size:12px}
 #stat .kv.hit b{color:var(--ok)} #stat .kv.spd b{color:var(--accent)}
+#stat .kv.gb b{color:var(--accent)}
 #stat .kv.cold b{color:var(--fg-dim)}
 
 /* segmented Chat / Agent */
@@ -836,6 +837,14 @@ function addBot(cont){
               + '<div class="inner"></div></details>'
               + '<div class="body"></div><div class="tools"></div>';
   chat.appendChild(d); stick();
+  /* Once the READER touches it, the automatic open/collapse stops fighting them — but a
+     `toggle` event fires for a programmatic `.open = …` too, so the first version marked the
+     block as hand-held the instant the code opened it. It then never collapsed and the summary
+     never stopped saying "Denkt nach…". The flag distinguishes the two. */
+  d.querySelector('details').addEventListener('toggle', e => {
+    if (e.target.dataset.auto){ delete e.target.dataset.auto; return; }
+    e.target.dataset.held = '1';
+  });
   return { el:d, think:d.querySelector('details'), inner:d.querySelector('.inner'),
            tools:d.querySelector('.tools'), body:d.querySelector('.body') };
 }
@@ -1084,6 +1093,33 @@ function tjRender(){
    that decides whether a long agent run is bearable: a single turn can be 100% or 0% by luck
    of where the prefix broke, and neither tells you anything. Decode tok/s is per turn — it is
    a property of the machine and does not average usefully. */
+/* The live pair, updated every 8 tokens while the answer is being written. GB/s is weight bytes
+   per token times tok/s — derived from the placement, not measured on the bus, which the title
+   says out loud. It is worth showing because it is the number this engine is built around: 59
+   GB/s against a DRAM controller that tops out at 64.8. tok/s alone does not tell you whether
+   you are near the wall or leaving the machine idle. */
+function statLive(q){
+  const hit = q.prompt ? 100*(q.cached||0)/q.prompt : 0;
+  const pre = q.phase === 'prefill';
+  /* Two throughput numbers and never their sum. Adding them gives ~84 GB/s, and no bus in this
+     machine does 84 — the DRAM half has a measured ceiling of 64.8 and the VRAM half runs at
+     283.7. One combined figure hides the only one worth watching. */
+  const bus = pre
+    ? '<span class="kv"><u>prefill</u><b>' + (q.pre_done||0) + ' / ' + (q.prompt||0)
+      + '</b></span><span class="kv spd"><u>tempo</u><b>'
+      + (q.pre_tok_s||0).toFixed(1) + ' tok/s</b></span>'
+    : '<span class="kv spd"><u>decode</u><b>' + (q.tok_s||0).toFixed(2) + ' tok/s</b></span>'
+      + '<span class="kv gb" title="Gewichtsbytes pro Token x tok/s, aus der Platzierung '
+      + 'abgeleitet — nicht am Bus gemessen. VRAM daneben: ' + (q.gbps_vram||0).toFixed(0)
+      + ' GB/s von 283,7">'
+      + '<u>dram+pcie</u><b>' + (q.gbps||0).toFixed(1) + ' / 64,8 GB/s</b></span>';
+  $('#stat').innerHTML =
+      '<span class="kv ' + (hit >= 50 ? 'hit' : 'cold') + '"><u>cache</u><b>'
+        + hit.toFixed(0) + ' %</b></span>' + bus
+    + '<span class="kv"><u>' + (pre ? 'wartet' : 'gen') + '</u><b>'
+      + (pre ? Math.round(q.elapsed||0) + ' s' : (q.gen||0)) + '</b></span>';
+}
+
 function statLine(u){
   const hit = tj.ptok ? 100*tj.cached/tj.ptok : 0;
   const dec = u ? u.completion_tokens/Math.max(u.decode_s||.001,.001) : 0;
@@ -1119,10 +1155,20 @@ async function streamOnce(v, step, sink){
   };
   if (mode === 'agent' && tools.length) body.tools = tools;
 
-  const r = await fetch('/v1/chat/completions', {
+  /* Nothing is streamed during prefill, and prefill is minutes. Without this the page looks
+     dead for exactly as long as the part that takes longest. */
+  let preTimer = null;
+  if (chatId) preTimer = setInterval(() => {
+    fetch('/v1/live?chat=' + encodeURIComponent(chatId)).then(x => x.json())
+      .then(q => { if (q && q.mine && q.phase === 'prefill') statLive(q); }).catch(()=>{});
+  }, 1000);
+  const stopPre = () => { if (preTimer){ clearInterval(preTimer); preTimer = null; } };
+
+  let r;
+  try { r = await fetch('/v1/chat/completions', {
     method:'POST', headers:{'Content-Type':'application/json'},
     signal: ctrl.signal, body: JSON.stringify(body)
-  });
+  }); } catch(e){ stopPre(); throw e; }
   if (!r.ok) throw new Error('HTTP ' + r.status + ' — ' + (await r.text()).slice(0,300));
 
   const rd = r.body.getReader(), dec = new TextDecoder();
@@ -1143,21 +1189,36 @@ async function streamOnce(v, step, sink){
         if (!firstTok) firstTok = performance.now();
         sink.reasoning += d.reasoning_content;
         v.think.style.display = '';
-        if (!v.think.open) v.think.open = true;
-        v.inner.textContent = sink.reasoning; stick();
+        if (!v.think.open && !v.think.dataset.held){ v.think.dataset.auto = '1'; v.think.open = true; }
+        v.inner.textContent = sink.reasoning;
+        v.think.querySelector('summary').textContent =
+          'Denkt nach… ' + sink.reasoning.length + ' Zeichen';
+        stick();
       }
       if (d?.content){
         if (!firstTok) firstTok = performance.now();
-        if (!sink.content && sink.reasoning){ v.think.open = false;
-          v.think.querySelector('summary').textContent = 'Gedankengang'; }
+        /* Collapse the thinking only when REAL content starts, and only if the reader has not
+           opened it themselves. The first version collapsed on the first content delta of any
+           kind — and this model's answers begin with "\n\n", so the block shut the moment
+           thinking ended and before a single visible character arrived. Watched in the headless
+           browser: display=block, open=false, body empty. From the outside that is
+           "thinking is not shown". */
+        if (!sink.content.trim() && (sink.content + d.content).trim() && sink.reasoning
+            && !v.think.dataset.held){
+          if (v.think.open) v.think.dataset.auto = '1';
+          v.think.open = false;
+          v.think.querySelector('summary').textContent = 'Gedankengang';
+        }
         sink.content += d.content;
         v.body.innerHTML = md(sink.content) + '<span class="cursor"></span>';
         stick();
       }
       if (d?.tool_calls) for (const t of d.tool_calls) sink.calls.push(t);
       if (j.usage) usage = j.usage;
+      if (j.qwen){ stopPre(); statLive(j.qwen); }   /* an extra key other clients ignore */
     }
   }
+  stopPre();
   v.body.innerHTML = sink.content ? md(sink.content) : '';
   if (sink.reasoning) v.think.querySelector('summary').textContent = 'Gedankengang';
   else v.think.style.display = 'none';
@@ -1271,10 +1332,15 @@ async function runTool(call, host){
 /* ---------- the agent loop ---------- */
 async function ask(text){
   if (busy) return;
-  busy = true; stopped = false; setSendIcon(true);
   addUser(text);
   messages.push({ role:'user', content:text });
+  chatSave();
+  await continueAgent();
+}
 
+async function continueAgent(){
+  if (busy) return;
+  busy = true; stopped = false; setSendIcon(true);
   const maxSteps = mode === 'agent' ? Math.max(1, parseInt($('#steps').value,10) || 24) : 1;
   try {
     for (let step = 1; step <= maxSteps; step++){
@@ -1337,6 +1403,9 @@ function submit(fromStopButton){
       return;
     }
     stopped = true; ctrl?.abort();
+    /* The server keeps a resumable turn alive through a dropped connection on purpose, so
+       closing the socket is no longer a stop signal. Say it explicitly. */
+    fetch('/v1/live/cancel', { method:'POST' }).catch(()=>{});
     for (const r of pendingAsks.splice(0)) r('no');   /* nothing may stay waiting on a click */
     return;
   }
@@ -1388,6 +1457,60 @@ $('#reset').onclick = newChat;
 $('#cnew').onclick  = newChat;
 $('#temp').oninput = e => $('#tv').textContent = (+e.target.value).toFixed(2);
 
+/* A TURN THAT WAS ALREADY RUNNING WHEN THE PAGE LOADED.
+   Turns here take minutes, and reloading is the first thing anyone does when a UI looks stuck —
+   so the server holds the turn and the page picks it up instead of losing it. Polled rather
+   than re-streamed: the whole text each time, which for a few KB on localhost is simpler than
+   an offset protocol over two interleaved streams. */
+async function attachLive(){
+  const first = await fetch('/v1/live?chat=' + encodeURIComponent(chatId))
+                      .then(r => r.json()).catch(() => null);
+  if (!first || !first.mine || !first.live) return false;
+  busy = true; setSendIcon(true);
+  const v = addBot(messages.length > 1);
+  v.el.insertAdjacentHTML('afterbegin',
+    '<div class="stepline">läuft weiter seit dem Neuladen</div>');
+  let r = first;
+  for(;;){
+    if (r.reasoning){
+      v.think.style.display = '';
+      if (!v.think.dataset.held && v.think.open !== !r.content.trim()){
+        v.think.dataset.auto = '1'; v.think.open = !r.content.trim(); }
+      v.inner.textContent = r.reasoning;
+      v.think.querySelector('summary').textContent =
+        r.content.trim() ? 'Gedankengang' : 'Denkt nach… ' + r.reasoning.length + ' Zeichen';
+    }
+    v.body.innerHTML = r.content ? md(r.content) + (r.live ? '<span class="cursor"></span>' : '')
+                                 : '';
+    statLive(r); stick();
+    if (!r.live) break;
+    await new Promise(z => setTimeout(z, 500));
+    r = await fetch('/v1/live?chat=' + encodeURIComponent(chatId))
+              .then(x => x.json()).catch(() => null);
+    if (!r || !r.mine){ break; }
+  }
+  const calls = (r && r.tool_calls) || [];
+  const am = { role:'assistant', content:(r && r.content) || '',
+               reasoning_content:(r && r.reasoning) || '' };
+  if (calls.length) am.tool_calls = calls;
+  if (am.content || am.reasoning_content || am.tool_calls) messages.push(am);
+  chatSave();
+  busy = false; setSendIcon(false);
+  /* the tools of a resumed turn still have to run, and then the loop carries on as normal */
+  if (calls.length && mode === 'agent'){
+    busy = true; setSendIcon(true);
+    try {
+      for (const c of calls){
+        const out = await runTool(c, v.tools);
+        messages.push({ role:'tool', tool_call_id:c.id, name:c.function.name, content:out });
+        chatSave();
+      }
+    } finally { busy = false; setSendIcon(false); }
+    await continueAgent();
+  }
+  return true;
+}
+
 /* Coming back to a project means coming back to what you were doing in it: the chat you had
    open last, or the newest one, or a fresh one if it is a new project. */
 async function resumeProject(){
@@ -1397,6 +1520,7 @@ async function resumeProject(){
              : (chats.length ? chats[0].id : null);
   if (pick) await chatOpen(pick);
   else newChat();
+  await attachLive();          /* was something already running when we loaded? */
 }
 
 /* ---------- what the server actually offers ---------- */
