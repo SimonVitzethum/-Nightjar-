@@ -113,6 +113,8 @@ open:
 | `GET /` | the chat UI |
 | `GET /v1/models` | model list |
 | `POST /v1/chat/completions` | OpenAI-compatible, streaming (SSE) and not, with tool calls |
+| `GET /v1/tools` | tool schemas, the policy for each, and the agent system prompt |
+| `POST /v1/tools/exec` | run one tool: `{name, arguments, approved}` |
 | `GET /health` | device, context, VRAM, cache state |
 
 ```bash
@@ -120,6 +122,99 @@ curl localhost:8080/health
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}'
 ```
+
+### The agent harness: shell, files, tool calls
+
+The web UI is an agent, not just a chat window. It can read and search the workspace, edit
+files, and run commands — and everything it does goes through one registry in
+[`c/harness.h`](c/harness.h) with one gate in front of it.
+
+```bash
+make serve                                   # agent on, workspace-write, in the repo root
+make serve WORKSPACE=/home/me/myproject      # point it somewhere else
+make serve TOOLS=ro                          # read and search only; nothing that writes
+make serve TOOLS=off                         # a plain chat server, no tools offered at all
+make tools                                   # test the tool layer alone — no model needed
+```
+
+| tool | class | what it is for |
+|---|---|---|
+| `bash` | exec | build, test, git, anything the rest does not cover |
+| `read_file` | read | numbered lines, with `offset`/`limit` to page a long file |
+| `write_file` | write | a new file, or a full rewrite |
+| `edit_file` | write | exact-string replacement; **refuses** an ambiguous match |
+| `list_dir` | read | one directory |
+| `glob` | read | find files by name pattern, recursively |
+| `grep` | read | POSIX regex over file contents → `path:line:text` |
+
+#### The four modes
+
+| `--tools` | read | write | shell |
+|---|---|---|---|
+| `off` | — | — | — |
+| `ro` | yes | denied | denied |
+| `workspace` *(default)* | yes | yes, confined | **asks** |
+| `full` | yes | anywhere | yes, unasked |
+
+Three properties are worth knowing, because they are the reason the thing is safe enough to
+leave running:
+
+**Confinement is resolved, not textual.** Every path argument goes through `realpath()` before
+it is compared to the workspace root. `../../etc/passwd`, an absolute `/etc/shadow`, and a
+symlink pointing out of the tree all land outside and are refused — a `strncmp` on the argument
+as typed lets all three through. A refusal is reported as `"decision":"deny"`, distinct from a
+tool that merely failed.
+
+**An `ask` with nobody to ask is a refusal.** `POST /v1/tools/exec` returns
+`{"decision":"ask"}` and runs nothing; the caller has to come back with `"approved":true`. A
+script that ignores the question gets nothing done, which is the correct outcome — there is no
+timeout that eventually says yes.
+
+**It will not start in a configuration that hands the machine to the network.** Tools enabled
+on a non-loopback address with no `--api-key` is refused at startup, not warned about:
+
+```
+refusing to start: --tools workspace on 0.0.0.0 with no --api-key.
+Anything that can reach 0.0.0.0:8080 could run commands here. Pick one:
+  --api-key KEY   require a key, or
+  --tools off     serve chat only, or
+  --host 127.0.0.1
+```
+
+#### Output is a budget
+
+This engine prefills at about 10 tok/s, so a tool that returns 400 KiB of build log costs the
+next turn two minutes before the model says a word. Every result is capped at 16 KiB
+(`--tool-output`) — and for commands it is kept as **head plus a ring of the tail**, not as the
+first 16 KiB. That direction matters: a build prints warnings for a minute and its *errors* in
+the last twenty lines. Keeping the head only hands the model a log that ends before anything
+went wrong, and it then reports success.
+
+Commands are killed at `--tool-timeout` (120 s default) and killed as a process *group*, so a
+shell that backgrounded something does not leave it behind.
+
+#### What it costs per turn
+
+The schemas and the agent system prompt are prefilled on every turn: 3.6 KB of JSON plus 673
+characters, about 1.2k tokens. They are also the **first** bytes of the prompt and never
+change, so after the first turn the prefix cache serves all of them. That is why the UI never
+rewrites history — appending keeps the cache; editing an earlier message throws it away.
+
+```bash
+curl localhost:8080/v1/tools                    # the schemas, the policy, the system prompt
+curl localhost:8080/v1/tools/exec -H 'Content-Type: application/json' \
+  -d '{"name":"grep","arguments":{"pattern":"h_policy","glob":"*.h"}}'
+curl localhost:8080/v1/tools/exec -H 'Content-Type: application/json' \
+  -d '{"name":"bash","arguments":{"command":"git log --oneline -3"},"approved":true}'
+```
+
+The UI shows a card per call — the command or the exact two lines an edit swaps, an
+approve/deny row when one is needed, and the output collapsed underneath. The **⏱** button
+opens a trajectory panel with per-step prefill and decode time, tokens, and how many of them
+came from the cache.
+
+opencode does not use any of this: it brings its own tools and only needs
+`/v1/chat/completions`. The two can share one server.
 
 ### Terminal chat
 

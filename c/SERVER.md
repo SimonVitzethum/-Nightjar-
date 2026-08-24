@@ -85,6 +85,60 @@ zu starten.
 **Eine Anfrage zur Zeit.** Eine Engine, ein rekurrenter Zustand. Parallele Generierung bräuchte
 einen zweiten 146-MiB-Zustand und ein zweites KV-Fenster; dafür ist auf dieser Karte kein Platz.
 
+## Der Agent: Shell, Dateien, Werkzeuge
+
+Die Weboberfläche ist ein Agent, kein reines Chatfenster. Sie kann suchen, lesen, Dateien
+ändern und Befehle ausführen. Alles davon läuft über **eine** Registry in `harness.h` und
+**einen** Riegel davor — die Seite selbst kann kein Werkzeug erfinden und keins am Riegel
+vorbeiführen; sie schickt nur einen Namen und ein Argumentobjekt an `/v1/tools/exec`.
+
+```bash
+make serve                              # Agent an, workspace-write, im Repo-Wurzelverzeichnis
+make serve WORKSPACE=/home/ich/projekt  # anderer Arbeitsbereich
+make serve TOOLS=ro                     # nur lesen und suchen
+make serve TOOLS=off                    # reiner Chatserver
+make tools                              # nur die Werkzeugschicht testen, ohne Modell
+```
+
+| `--tools` | lesen | schreiben | Shell |
+|---|---|---|---|
+| `off` | — | — | — |
+| `ro` | ja | verweigert | verweigert |
+| `workspace` *(Default)* | ja | ja, eingegrenzt | **fragt** |
+| `full` | ja | überall | ja, ungefragt |
+
+Drei Eigenschaften, und alle drei sind Absichten, keine Nebenwirkungen:
+
+**Die Eingrenzung wird aufgelöst, nicht verglichen.** Jedes Pfadargument geht durch
+`realpath()`, bevor es gegen die Wurzel geprüft wird. `../../etc/passwd`, ein absolutes
+`/etc/shadow` und ein Symlink aus dem Baum heraus landen alle außerhalb und werden abgelehnt —
+ein `strncmp` auf das Argument, wie es getippt wurde, lässt alle drei durch.
+
+**Ein „fragen" ohne jemanden zum Fragen ist eine Ablehnung.** `/v1/tools/exec` antwortet
+`{"decision":"ask"}` und führt nichts aus. Wer die Frage ignoriert, kommt nicht weiter — es gibt
+keinen Timeout, der irgendwann ja sagt.
+
+**Der Server startet nicht in einer Konfiguration, die die Maschine ans Netz gibt.** Werkzeuge
+auf einer Nicht-Loopback-Adresse ohne `--api-key` werden beim Start abgelehnt, nicht bewarnt.
+
+**Ausgabe ist ein Budget.** 16 KiB pro Ergebnis (`--tool-output`), und bei Befehlen als *Kopf
+plus Ringpuffer des Endes* — nicht als die ersten 16 KiB. Die Richtung ist der Punkt: ein Build
+schreibt eine Minute Warnungen und seine **Fehler** in die letzten zwanzig Zeilen. Nur den Kopf
+zu behalten heißt, dem Modell ein Log zu geben, das endet, bevor etwas schiefging — und es
+meldet dann Erfolg. Befehle werden nach `--tool-timeout` (120 s) als Prozess**gruppe** getötet,
+damit eine Shell nichts Hinterlassenes zurücklässt.
+
+**Was es pro Zug kostet:** 3,6 KB Schemata plus 673 Zeichen Systemprompt, etwa 1,2k Token. Sie
+stehen ganz vorne im Prompt und ändern sich nie, also bedient der Präfix-Cache sie ab dem
+zweiten Zug vollständig. Genau darum schreibt die Oberfläche die Historie nie um: Anhängen
+behält den Cache, das Ändern einer früheren Nachricht wirft ihn weg.
+
+Oben rechts stehen dauerhaft **Cache-Trefferquote** und **Token/s**; das ⏱-Panel zeigt pro
+Schritt Prefill- und Decodezeit, Tokenzahlen und wie viele davon aus dem Cache kamen.
+
+opencode benutzt davon nichts — es bringt eigene Werkzeuge mit und braucht nur
+`/v1/chat/completions`. Beides kann an einem Server hängen.
+
 ## Stellschrauben
 
 | Variable | Default | Wirkung |
@@ -98,11 +152,17 @@ einen zweiten 146-MiB-Zustand und ein zweites KV-Fenster; dafür ist auf dieser 
 | `COLIBRI_KV_SPILL` | `../../kvspill` | Auslagerungspfad des kalten KV-Tiers. **Nicht auf tmpfs zeigen lassen** — das legt den „Disk"-Tier zurück in genau den RAM, den er freimachen soll. |
 | `COLIBRI_RESERVE_GB` | `4` | RAM, den die Engine nie anfasst. |
 | `COLIBRI_KERNEL_LOG` | aus | Meldet pro Komponente, auf welchem Gerät sie tatsächlich lief. |
+| `--tools MODE` | `workspace` | Was der Agent darf: `off`, `ro`, `workspace`, `full`. |
+| `--workspace DIR` | `.` | Wurzel, in der der Agent arbeitet. |
+| `--tool-output N` | `16384` | Bytes Werkzeugausgabe, die das Modell sieht. |
+| `--tool-timeout MS` | `120000` | Wann ein Befehl getötet wird. |
 
 ## Endpunkte
 
 | Methode | Pfad | |
 |---|---|---|
+| `GET` | `/v1/tools` | Schemata, Policy je Werkzeug, Systemprompt des Agenten |
+| `POST` | `/v1/tools/exec` | Ein Werkzeug ausführen: `{name, arguments, approved}` |
 | `GET` | `/` | die Chat-Oberfläche |
 | `GET` | `/v1/models` | Modellliste |
 | `POST` | `/v1/chat/completions` | streamend (SSE) und nicht-streamend |
