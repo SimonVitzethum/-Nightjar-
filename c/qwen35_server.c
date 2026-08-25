@@ -221,6 +221,37 @@ static int sock_write(int fd, const char *b, size_t n){
 }
 static int sock_str(int fd, const char *z){ return sock_write(fd, z, strlen(z)); }
 
+/* THE ENGINE THREAD MUST NEVER BLOCK ON A SOCKET.
+ *
+ * sock_write loops on send() until everything is out, and send() on a blocking socket waits
+ * when the peer's window is closed. That is fine on a connection thread and catastrophic on the
+ * engine thread: one browser that reads its SSE stream slower than the model writes it — a
+ * backgrounded tab is enough — fills the socket buffer, and the generation loop stops inside
+ * send() with 0% CPU, 0% GPU, no error and no log line. Every later request then queues behind
+ * it. That is the stall that was reported three times and misdiagnosed twice.
+ *
+ * So the streaming writes are non-blocking with a short bounded wait. If the client will not
+ * take the bytes in 250 ms it is not keeping up, and the right answer is to drop the frame and
+ * mark the stream dead — not to stop the engine. For a resumable turn the text is in the live
+ * buffer anyway and the page can fetch it whole; for everyone else a stalled reader was going
+ * to lose the stream regardless. */
+static int sock_write_nb(int fd, const char *b, size_t n){
+    const double t0 = now();
+    while(n){
+        const ssize_t w = send(fd, b, n, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if(w > 0){ b += w; n -= (size_t)w; continue; }
+        if(w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+            if((now() - t0) * 1000.0 > 250) return 0;      /* not keeping up */
+            struct pollfd p = { fd, POLLOUT, 0 };
+            poll(&p, 1, 20);
+            continue;
+        }
+        if(w < 0 && errno == EINTR) continue;
+        return 0;
+    }
+    return 1;
+}
+
 /* HAS THE CLIENT GONE AWAY?
  *
  * Nothing asked this before, and the consequence was the bug that produced this function. The
@@ -490,7 +521,7 @@ static void sse_delta(Gen *g, const char *field, const char *b, size_t n){
     s_fmt(&f, "\"%s\":", field);
     s_json(&f, b, n);
     s_cat(&f, "},\"finish_reason\":null}]}\n\n");
-    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
+    if(!sock_write_nb(g->fd, f.p, f.n)) g->dead = 1;
     s_free(&f);
 }
 
@@ -511,7 +542,7 @@ static void sse_prefill(int done, int total, int cached, double secs){
           g->id, g->created, g_model_name, done, total, cached,
           secs > 0 ? (done - cached) / secs : 0.0, secs,
           secs > 0 ? g_bytes_dram * ((done - cached) / secs) / (double)g_prefill_sb / 1e9 : 0.0);
-    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
+    if(!sock_write_nb(g->fd, f.p, f.n)) g->dead = 1;
     s_free(&f);
 }
 
@@ -526,7 +557,7 @@ static void sse_stats(Gen *g, int gen, double dec_s, int prompt, int cached, dou
               "\"phase\":\"decode\"}}\n\n",
           g->id, g->created, g_model_name, gen, dec_s, tps,
           g_bytes_dram * tps / 1e9, g_bytes_vram * tps / 1e9, prompt, cached, pre_s);
-    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
+    if(!sock_write_nb(g->fd, f.p, f.n)) g->dead = 1;
     s_free(&f);
 }
 
@@ -723,10 +754,10 @@ static void handle_chat(int fd, const char *body, size_t blen){
      * The cost of moving it: a 507 can no longer be a status code once the headers are out, so
      * a failure after this point is delivered as an SSE error frame. */
     if(stream){
-        sock_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                     "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n" CORS
-                     "Connection: close\r\n\r\n");
-        sock_str(fd, ": prefill\n\n");
+        { static const char H[] = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                                  "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n" CORS
+                                  "Connection: close\r\n\r\n: prefill\n\n";
+          sock_write_nb(fd, H, sizeof H - 1); }
     }
 
     double t_pre = 0; int reused = 0;
@@ -845,7 +876,7 @@ static void handle_chat(int fd, const char *body, size_t blen){
                     "data: [DONE]\n\n",
                     g.id, g.created, g_model_name, finish, np, ngen, np + ngen,
                     reused, t_pre, t_dec);
-        sock_write(fd, out.p, out.n);
+        sock_write_nb(fd, out.p, out.n);
     } else {
         s_fmt(&out, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\","
                     "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",
@@ -1541,6 +1572,9 @@ int main(int argc, char **argv){
         q35cu_report(&g_G, stderr);
         q35cu_state_reset(&g_G);
         if(q35cu_batch_init(&g_Z, &g_G, &g_R, 8) && q35_mtp_init(&g_P, &g_R)) g_spec = 1;
+        /* A switch to halve the problem with, and an escape hatch while a fault in the
+         * speculative path is being found: decoding without it is slower and correct. */
+        if(getenv("QWEN_NO_SPEC")){ g_spec = 0; fprintf(stderr, "  speculation OFF (QWEN_NO_SPEC)\n"); }
         PHASE("batch + mtp");
     }
 #endif
