@@ -82,6 +82,14 @@ Für interaktive Nutzung ist die Oberfläche deshalb angenehmer als ein Agent: k
 sofortige Antwort. Für opencode lohnt es sich, eine Sitzung offen zu lassen statt viele neue
 zu starten.
 
+**Slash-Befehle** im Eingabefeld: `/clear` verwirft den Verlauf, `/compact` fasst ihn zusammen
+und arbeitet damit weiter, `/help` listet sie.
+
+`/compact` ist dabei keine Bequemlichkeit, sondern die billigste Abkürzung, die es hier gibt: ein
+Zug mit 13k Token Vorgeschichte kostet über zwanzig Minuten Prefill, eine Zusammenfassung davon
+rund tausend Token. **Verkürzen schlägt Zwischenspeichern**, solange die Zusammenfassung reicht —
+denn selbst mit perfektem Cache bleibt jede neue Zeile Kontext teuer.
+
 **Live-Anzeige.** Oben rechts stehen während der Antwort Cache-Trefferquote, Decode-Tempo und
 Durchsatz — und zwar **zwei** Durchsatzzahlen, nie ihre Summe: `dram+pcie 56,4 / 64,8 GB/s`
 neben dem VRAM-Anteil im Tooltip. Die Summe wären ~84 GB/s, und kein Bus dieser Maschine macht

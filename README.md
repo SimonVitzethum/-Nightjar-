@@ -101,6 +101,14 @@ open:
 | `POST /v1/tools/exec` | run one tool: `{name, arguments, approved}` |
 | `GET /health` | device, context, VRAM, cache state |
 
+**Slash commands** in the composer: `/clear` drops the history, `/compact` summarises it and
+carries on from the summary, `/help` lists them.
+
+`/compact` is not a convenience here. A turn carrying 13k tokens of history costs over twenty
+minutes of prefill; a summary of it costs about a thousand tokens. **Shortening beats caching**
+as long as the summary suffices, because even a perfect cache still charges full price for every
+new line of context.
+
 **Live throughput.** While an answer streams, the header shows cache hit rate, decode tok/s and
 **two** throughput figures — never their sum: `dram+pcie 56.4 / 64.8 GB/s`, with the VRAM share
 in the tooltip. Summed they read ~84 GB/s and no bus in this machine does 84; the DRAM half has

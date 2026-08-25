@@ -497,6 +497,24 @@ static void sse_delta(Gen *g, const char *field, const char *b, size_t n){
 /* An extra key on an otherwise ordinary chunk. Clients that do not know it ignore it — which
  * is every client but this page — so the live readout costs no second request and no protocol
  * of its own. */
+/* The prefill has no tokens to report, so it reports its own progress on the same stream. Also
+ * the thing that keeps the response from being silent for minutes. */
+static Gen *g_pf_gen = NULL;
+static void sse_prefill(int done, int total, int cached, double secs){
+    Gen *g = g_pf_gen;
+    if(!g || !g->stream) return;
+    Str f = {0};
+    s_fmt(&f, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+              "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],"
+              "\"qwen\":{\"phase\":\"prefill\",\"pre_done\":%d,\"prompt\":%d,\"cached\":%d,"
+              "\"pre_tok_s\":%.2f,\"elapsed\":%.1f,\"gen\":0,\"tok_s\":0,\"gbps\":%.2f}}\n\n",
+          g->id, g->created, g_model_name, done, total, cached,
+          secs > 0 ? (done - cached) / secs : 0.0, secs,
+          secs > 0 ? g_bytes_dram * ((done - cached) / secs) / (double)g_prefill_sb / 1e9 : 0.0);
+    if(!sock_write(g->fd, f.p, f.n)) g->dead = 1;
+    s_free(&f);
+}
+
 static void sse_stats(Gen *g, int gen, double dec_s, int prompt, int cached, double pre_s){
     if(!g->stream || dec_s <= 0) return;
     const double tps = gen / dec_s;
@@ -571,8 +589,11 @@ static int prefill(int fd, int resumable, const int *req, int n, float *logits,
          * within a fraction of a second rather than at the end */
         for(; i + SB <= n - 1 && !g_abort; i += SB){
             if(PF_STOP()) break;
-            if(resumable && (i & 127) < SB)
-                live_prefill(i, n, (i - start) / (now() - t0 + 1e-9));
+            if((i & 127) < SB){
+                const double el = now() - t0;
+                if(resumable) live_prefill(i, n, (i - start) / (el + 1e-9));
+                sse_prefill(i, n, start, el);
+            }
             q35_forward_cu_batch_ex(&g_Z, (int*)req + i, SB, i, NULL, 0, xall);
             for(int s = 0; s < SB; s++){
                 q35_rmsnorm(hh, xall + (size_t)s*g_M.c.d_model, g_M.output_norm,
@@ -680,8 +701,38 @@ static void handle_chat(int fd, const char *body, size_t blen){
     char   piece[512];
     if(!logits || !lg2 || !cbuf){ http_err(fd, 500, "Internal Server Error", "out of memory"); goto done; }
 
+    Gen g; memset(&g, 0, sizeof g);
+    g.fd = fd; g.stream = stream; g.in_think = think; g.created = (long)time(NULL);
+    g.resumable = chat_id && *chat_id;
+    snprintf(g.id, sizeof g.id, "chatcmpl-%08lx%04x", (unsigned long)time(NULL), rand() & 0xffff);
+
+    /* THE HEADERS GO OUT BEFORE THE PREFILL, NOT AFTER.
+     *
+     * They used to be written here, after prefill returned — which for a 12k-token prompt is
+     * SEVEN MINUTES during which the client received nothing at all. Not a partial response:
+     * not even a status line. Every HTTP client eventually gives up on that, so the page said
+     * "abgebrochen" at a point that moved with the prompt length, which is what "it broke at
+     * almost the same place again" means. Measured in the log right before this fix:
+     *
+     *     11738 prompt (8192 cached) in 407.85s
+     *
+     * So: status line first, then a keep-alive comment and a progress frame every second while
+     * the prefill runs. The response is alive from the first millisecond and the page can show
+     * how far along it is instead of guessing.
+     *
+     * The cost of moving it: a 507 can no longer be a status code once the headers are out, so
+     * a failure after this point is delivered as an SSE error frame. */
+    if(stream){
+        sock_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n" CORS
+                     "Connection: close\r\n\r\n");
+        sock_str(fd, ": prefill\n\n");
+    }
+
     double t_pre = 0; int reused = 0;
+    g_pf_gen = &g;
     const int pf = prefill(fd, chat_id && *chat_id, req, np, logits, &t_pre, &reused);
+    g_pf_gen = NULL;
     if(pf < 0){
         if(g_verbose) fprintf(stderr, "  %d of %d prompt tokens in %.2fs, then it was dropped\n",
                               g_C.ctx_n, np, t_pre);
@@ -689,19 +740,11 @@ static void handle_chat(int fd, const char *body, size_t blen){
         goto done;
     }
     if(!pf){
-        http_err(fd, 507, "Insufficient Storage", "context does not fit in memory");
+        if(stream){
+            sock_str(fd, "data: {\"error\":{\"message\":\"context does not fit in memory\"}}\n\n"
+                         "data: [DONE]\n\n");
+        } else http_err(fd, 507, "Insufficient Storage", "context does not fit in memory");
         goto done;
-    }
-
-    Gen g; memset(&g, 0, sizeof g);
-    g.fd = fd; g.stream = stream; g.in_think = think; g.created = (long)time(NULL);
-    g.resumable = chat_id && *chat_id;
-    snprintf(g.id, sizeof g.id, "chatcmpl-%08lx%04x", (unsigned long)time(NULL), rand() & 0xffff);
-
-    if(stream){
-        sock_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                     "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n" CORS
-                     "Connection: close\r\n\r\n");
     }
 
     const double t_dec0 = now();
