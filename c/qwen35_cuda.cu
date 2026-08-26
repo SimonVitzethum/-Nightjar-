@@ -193,6 +193,8 @@ __device__ __forceinline__ double block_sum(double v, double *sh){
 #define SMAX 8
 #define RPW  4          /* rows per warp on the S==1 path */
 #define NARROW 2048     /* below this O, use one block per row */
+#define ROWMIN 1024     /* below this O, O/NWARP blocks cannot fill 36 SMs */
+#define ROWMAX 16384    /* above it, O/NWARP blocks stop paying and RPW=4 wins */
 
 /* WHY ROWS ARE BLOCKED AND x IS NOT STAGED IN SHARED
  *
@@ -529,6 +531,76 @@ extern "C" int q35cu_type_ok(int t){
     return t == CU_F32 || t == CU_F16 || t == CU_Q8_0 || t == CU_Q4_K || t == CU_Q6_K;
 }
 
+/* One warp per row, NWARP rows per block -- the bundled kernel's decomposition without the
+ * expert dimension. The narrow kernel puts a whole 256-thread block on ONE row, which is
+ * right while the row is long but collapses when it is not: a Q4_K row of I=512 is 288
+ * bytes, and 256 threads cannot keep the memory system busy on 288 bytes. Measured on the
+ * shared expert's down projection (I=512, O=2048): 10.4 us narrow vs 6.2 us here. */
+__global__ static void k_gemv_q4k_rows(float *y, const float *x,
+                                       const uint8_t *W, int I, int O){
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x*NWARP + wid;
+    if(row >= O) return;
+    const int nsb = I >> 8;
+    const uint8_t *w = W + (size_t)row*(size_t)nsb*144;
+    const float *xj = x;
+    /* One byte per lane means a 32-byte load per warp instruction, and the memory system
+     * wants far more in flight than that. A block's quants are exactly 128 bytes, so four
+     * bytes per lane covers the whole block in ONE instruction -- and because those four
+     * bytes then sit inside a single 64-value group, each lane needs its own scale pair
+     * rather than all four, which drops gsm4 from eight calls per block to two. */
+    const int g  = lane >> 3;             /* the 64-value group this lane serves */
+    const int l0 = (lane & 7) << 2;       /* its four consecutive quant bytes within it */
+    float acc = 0.f;
+    for(int sb = 0; sb < nsb; ++sb){
+        const b_q4_K *b = (const b_q4_K*)(w + (size_t)sb*144);
+        const float d = __half2float(b->d), mn = __half2float(b->dmin);
+        float s1,m1,s2,m2;
+        gsm4(b->scales, 2*g,   &s1,&m1);
+        gsm4(b->scales, 2*g+1, &s2,&m2);
+        const float d1=d*s1, mm1=mn*m1, d2=d*s2, mm2=mn*m2;
+        const uint32_t q = ((const uint32_t*)b->qs)[lane];
+        const float *xb = xj + sb*256 + g*64;
+        const float4 xl = *(const float4*)(xb + l0);
+        const float4 xh = *(const float4*)(xb + 32 + l0);
+        acc += (d1*(float)( q        & 0xF)-mm1)*xl.x + (d1*(float)((q >>  8) & 0xF)-mm1)*xl.y
+             + (d1*(float)((q >> 16) & 0xF)-mm1)*xl.z + (d1*(float)((q >> 24) & 0xF)-mm1)*xl.w;
+        acc += (d2*(float)((q >>  4) & 0xF)-mm2)*xh.x + (d2*(float)((q >> 12) & 0xF)-mm2)*xh.y
+             + (d2*(float)((q >> 20) & 0xF)-mm2)*xh.z + (d2*(float)((q >> 28) & 0xF)-mm2)*xh.w;
+    }
+    const float t = warp_sum(acc);
+    if(lane == 0) y[row] = t;
+}
+__global__ static void k_gemv_q6k_rows(float *y, const float *x,
+                                       const uint8_t *W, int I, int O){
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x*NWARP + wid;
+    if(row >= O) return;
+    const int nsb = I >> 8, is = lane >> 4;
+    const uint8_t *w = W + (size_t)row*(size_t)nsb*210;
+    const float *xj = x;
+    float acc = 0.f;
+    for(int sb = 0; sb < nsb; ++sb){
+        const b_q6_K *b = (const b_q6_K*)(w + (size_t)sb*210);
+        const float d = __half2float(b->d);
+        #pragma unroll
+        for(int nn = 0; nn < 2; ++nn){
+            const uint8_t *ql = b->ql + nn*64;
+            const uint8_t *qh = b->qh + nn*32;
+            const int8_t  *sc = b->scales + nn*8;
+            const uint8_t l0 = ql[lane], l1 = ql[lane+32], h = qh[lane];
+            const float q1=(float)((int)((l0 & 0xF)|(((h>>0)&3)<<4))-32);
+            const float q2=(float)((int)((l1 & 0xF)|(((h>>2)&3)<<4))-32);
+            const float q3=(float)((int)((l0 >>  4)|(((h>>4)&3)<<4))-32);
+            const float q4=(float)((int)((l1 >>  4)|(((h>>6)&3)<<4))-32);
+            const float a1=d*sc[is+0]*q1, a2=d*sc[is+2]*q2, a3=d*sc[is+4]*q3, a4=d*sc[is+6]*q4;
+            const float *xb = xj + sb*256 + nn*128;
+            acc += a1*xb[lane] + a2*xb[lane+32] + a3*xb[lane+64] + a4*xb[lane+96];
+        }
+    }
+    const float t = warp_sum(acc);
+    if(lane == 0) y[row] = t;
+}
 /* Staging x in shared cuts the L2 traffic of a gemv by the block count. It only pays for
  * S == 1 (a batch would need S*I floats and blow the 100 KB budget) and only when x fits. */
 extern "C" int q35cu_gemm(float *y, const float *x, const void *W, int gt, int I, int O, int S){
@@ -540,9 +612,14 @@ extern "C" int q35cu_gemm(float *y, const float *x, const void *W, int gt, int I
         if(S == 1){
             /* Below this the card is not busy: O rows spread over O/(8*RPW) blocks stops
              * filling 36 SMs long before it stops being memory-bound. */
-            if(O <= NARROW){
+            if(O < ROWMIN){
+                /* Too few rows to fill the grid one-warp-each: give each row a whole block. */
                 if(gt == CU_Q4_K) k_gemv_q4k_narrow<<<O, NTHR, 0, g_s>>>(y, x, (const uint8_t*)W, I, O);
                 else              k_gemv_q6k_narrow<<<O, NTHR, 0, g_s>>>(y, x, (const uint8_t*)W, I, O);
+            } else if(O <= ROWMAX){
+                const int gr = (O + NWARP - 1)/NWARP;
+                if(gt == CU_Q4_K) k_gemv_q4k_rows<<<gr, NTHR, 0, g_s>>>(y, x, (const uint8_t*)W, I, O);
+                else              k_gemv_q6k_rows<<<gr, NTHR, 0, g_s>>>(y, x, (const uint8_t*)W, I, O);
             } else {
                 const int gr = (O + NWARP*RPW - 1)/(NWARP*RPW);
                 if(gt == CU_Q4_K) k_gemv_q4k_r<<<gr, NTHR, 0, g_s>>>(y, x, (const uint8_t*)W, I, O);
@@ -580,21 +657,29 @@ __global__ static void k_gemv_q4k_grp(float *y, const float *x, int xstride,
     const int nsb = I >> 8;
     const uint8_t *w = Wp[j] + (size_t)row*(size_t)nsb*144;
     const float *xj = x + (size_t)j*(size_t)xstride;
+    /* One byte per lane means a 32-byte load per warp instruction, and the memory system
+     * wants far more in flight than that. A block's quants are exactly 128 bytes, so four
+     * bytes per lane covers the whole block in ONE instruction -- and because those four
+     * bytes then sit inside a single 64-value group, each lane needs its own scale pair
+     * rather than all four, which drops gsm4 from eight calls per block to two. */
+    const int g  = lane >> 3;             /* the 64-value group this lane serves */
+    const int l0 = (lane & 7) << 2;       /* its four consecutive quant bytes within it */
     float acc = 0.f;
     for(int sb = 0; sb < nsb; ++sb){
         const b_q4_K *b = (const b_q4_K*)(w + (size_t)sb*144);
         const float d = __half2float(b->d), mn = __half2float(b->dmin);
-        #pragma unroll
-        for(int g = 0; g < 4; ++g){
-            float s1,m1,s2,m2;
-            gsm4(b->scales, 2*g,   &s1,&m1);
-            gsm4(b->scales, 2*g+1, &s2,&m2);
-            const float d1=d*s1, mm1=mn*m1, d2=d*s2, mm2=mn*m2;
-            const uint8_t q = b->qs[g*32 + lane];
-            const float lo=(float)(q & 0xF), hi=(float)(q >> 4);
-            const float *xb = xj + sb*256 + g*64;
-            acc += (d1*lo-mm1)*xb[lane] + (d2*hi-mm2)*xb[32+lane];
-        }
+        float s1,m1,s2,m2;
+        gsm4(b->scales, 2*g,   &s1,&m1);
+        gsm4(b->scales, 2*g+1, &s2,&m2);
+        const float d1=d*s1, mm1=mn*m1, d2=d*s2, mm2=mn*m2;
+        const uint32_t q = ((const uint32_t*)b->qs)[lane];
+        const float *xb = xj + sb*256 + g*64;
+        const float4 xl = *(const float4*)(xb + l0);
+        const float4 xh = *(const float4*)(xb + 32 + l0);
+        acc += (d1*(float)( q        & 0xF)-mm1)*xl.x + (d1*(float)((q >>  8) & 0xF)-mm1)*xl.y
+             + (d1*(float)((q >> 16) & 0xF)-mm1)*xl.z + (d1*(float)((q >> 24) & 0xF)-mm1)*xl.w;
+        acc += (d2*(float)((q >>  4) & 0xF)-mm2)*xh.x + (d2*(float)((q >> 12) & 0xF)-mm2)*xh.y
+             + (d2*(float)((q >> 20) & 0xF)-mm2)*xh.z + (d2*(float)((q >> 28) & 0xF)-mm2)*xh.w;
     }
     const float t = warp_sum(acc);
     if(lane == 0) y[(size_t)j*O + row] = t;
