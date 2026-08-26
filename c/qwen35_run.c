@@ -396,6 +396,13 @@ int main(int argc, char **argv){
         printf("\n");
         fprintf(stderr, "  [prefill %d tok in %.2fs = %.1f tok/s | decode %d tok in %.2fs = %.2f tok/s | ctx %d]\n",
                 nt, tprefill, nt/tprefill, ngen, tdec, ngen > 0 ? ngen/tdec : 0.0, pos);
+        if(getenv("QWEN_PROFILE")){
+            const double tot = g_t_embd+g_t_attn+g_t_gdn+g_t_ffn+g_t_out;
+            fprintf(stderr, "  [profile per run: embd %.3f  attn %.3f  gdn %.3f  ffn %.3f  out %.3f  (sum %.3fs)]\n",
+                    g_t_embd, g_t_attn, g_t_gdn, g_t_ffn, g_t_out, tot);
+            if(tot>0) fprintf(stderr, "  [share: attn %.0f%%  gdn %.0f%%  ffn %.0f%%  out %.0f%%]\n",
+                    100*g_t_attn/tot, 100*g_t_gdn/tot, 100*g_t_ffn/tot, 100*g_t_out/tot);
+        }
         if(!raw) sadd(&hist, "<|im_end|>\n", 11);
         turn++;
         g_stop = 0;

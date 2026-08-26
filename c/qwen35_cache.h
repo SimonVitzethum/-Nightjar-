@@ -256,6 +256,230 @@ static void q35_cache_put_back(Q35Cache *C, Q35Ckpt *k){
     C->t_copy += q35_clk() - t0;
 }
 
+/* ---------------- the per-chat checkpoint, on disk ----------------
+ *
+ * WHY THIS IS A FILE AND NOT MORE RAM
+ *
+ * A checkpoint deep enough to be worth having is gigabytes: 34.0 KiB per token of trunk KV at
+ * q8_0, so 118k tokens is 4 GiB. Holding that per chat in RAM on a 31 GiB machine is the
+ * mistake this engine has already made twice — q35_cache_alloc carries the note about 2.95 GiB
+ * of pinned cache driving the box into swap and the process being OOM-killed with no error
+ * anywhere. On the drive the same budget costs nothing that matters: §23.3 measured 0.33 s to
+ * write 13k tokens and 0.13 s to read them back, against 1300 s of prefill.
+ *
+ * And it buys the other half for free. A file survives the process, so "continue where I left
+ * off" stops meaning "re-prefill twenty thousand tokens".
+ *
+ * WHAT IS IN IT, AND WHY IT IS SMALLER THAN IT LOOKS
+ *
+ * The device window holds positions [0, win) — the FIRST tokens, not the newest (see the
+ * `pos < G->win` branch in q35cu_attn_layer_x). So for any checkpoint past the window the
+ * VRAM half is one FIXED prefix of the conversation, and only [win, pos) is new. Both halves
+ * use the same per-token encoding — G->kv_half == kvt_half(&R->kv) — so this moves bytes and
+ * converts nothing.
+ *
+ *   header | tokens[pos] | S | conv | KV[0,min(pos,win)) from VRAM | KV[win,pos) from the tier
+ *
+ * Written to a temporary file, fsynced, renamed — the same rule as chatstore.h, for the same
+ * reason: rename() is atomic for visibility, not for durability. */
+
+#include <limits.h>
+#include <unistd.h>
+
+#define Q35_CK_MAGIC   0x314b4351u      /* "QCK1" */
+#define Q35_CK_VERSION 1
+
+typedef struct {
+    uint32_t magic, version;
+    /* the fingerprint. A checkpoint is raw model state; restoring one written by a different
+     * geometry does not fail, it answers from a history that never happened. Every field the
+     * layout depends on is checked, and a mismatch is a miss, not an error. */
+    int32_t  fmt, kv_layers, kv_win, kv_half, n_gdn, d_model, vocab;
+    int32_t  pos;
+    int64_t  s_bytes, c_bytes;
+} Q35CkHdr;
+
+static void q35_ck_head(const Q35Cache *C, Q35CkHdr *h, int pos){
+    const Q35Cfg *c = &C->R->M->c;
+    memset(h, 0, sizeof *h);
+    h->magic = Q35_CK_MAGIC; h->version = Q35_CK_VERSION;
+    h->fmt = C->R->kv.fmt;   h->kv_layers = C->kv_layers;
+    h->kv_win = C->kv_win;   h->kv_half = (int32_t)C->kv_stride;
+    h->n_gdn = C->R->n_gdn;  h->d_model = c->d_model; h->vocab = c->vocab;
+    h->pos = pos;
+    h->s_bytes = (int64_t)C->s_bytes; h->c_bytes = (int64_t)C->c_bytes;
+}
+
+/* QWEN_CHAT_CKPT_GB, per chat. 0 turns the whole thing off. */
+static int64_t q35_ck_budget(void){
+    double gb = 4.0;
+    const char *e = getenv("QWEN_CHAT_CKPT_GB");
+    if(e && *e) gb = atof(e);
+    return gb > 0 ? (int64_t)(gb*1073741824.0) : 0;
+}
+
+/* The deepest position that fits the budget. Reported rather than silently truncated: a
+ * checkpoint at a position other than the one asked for is a different conversation. */
+static int q35_ck_max_pos(const Q35Cache *C){
+    const int64_t budget = q35_ck_budget();
+    if(budget <= 0 || !C->kv_stride) return 0;
+    const int64_t per   = (int64_t)C->kv_layers*2*(int64_t)C->kv_stride + 4;   /* +token */
+    const int64_t fixed = (int64_t)sizeof(Q35CkHdr) + (int64_t)C->s_bytes + (int64_t)C->c_bytes
+                        + (int64_t)C->kv_layers*2*(int64_t)C->kv_win*(int64_t)C->kv_stride
+                        + 4*(int64_t)C->kv_win;
+    if(budget <= fixed) return 0;
+    const int64_t p = (int64_t)C->kv_win + (budget - fixed)/per;
+    return p > 2147483000 ? 2147483000 : (int)p;
+}
+
+/* What a checkpoint at `pos` occupies on disk — for the log line, so the budget is a number
+ * the user can see rather than one they discover when the drive fills. */
+static int64_t ck_bytes(const Q35Cache *C, int pos){
+    const int nw = pos < C->kv_win ? pos : C->kv_win;
+    return (int64_t)sizeof(Q35CkHdr) + 4*(int64_t)pos + (int64_t)C->s_bytes + (int64_t)C->c_bytes
+         + (int64_t)C->kv_layers*2*(int64_t)C->kv_stride*((int64_t)nw + (pos > C->kv_win ? pos - C->kv_win : 0));
+}
+
+static int q35_wr(FILE *f, const void *p, size_t n){ return n == 0 || fwrite(p, 1, n, f) == n; }
+static int q35_rd(FILE *f, void *p, size_t n){ return n == 0 || fread(p, 1, n, f) == n; }
+
+/* Save the CURRENT live state as this chat's checkpoint. Returns tokens written, or 0. */
+static int q35_ck_save(Q35Cache *C, const char *path, double *secs){
+    const int pos = C->ctx_n;
+    const int cap = q35_ck_max_pos(C);
+    if(pos <= 0 || cap <= 0 || pos > cap) return 0;
+    const double t0 = q35_clk();
+
+    char tmp[PATH_MAX];
+    if(snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return 0;
+    FILE *f = fopen(tmp, "wb");
+    if(!f) return 0;
+
+    Q35CkHdr h; q35_ck_head(C, &h, pos);
+    const size_t half = C->kv_stride;
+    const int    nw   = pos < C->kv_win ? pos : C->kv_win;
+    float   *sb  = (float*)malloc(C->s_bytes), *cb = (float*)malloc(C->c_bytes);
+    uint8_t *lane = (uint8_t*)malloc(half*(size_t)(nw ? nw : 1));
+    uint8_t *tk   = (uint8_t*)malloc(half), *tv = (uint8_t*)malloc(half);
+    int ok = sb && cb && lane && tk && tv;
+
+    if(ok){
+#ifndef QWEN_NO_CUDA
+        if(C->gpu){ q35cu_sync();
+                    q35cu_d2h(sb, C->G->S, C->s_bytes); q35cu_d2h(cb, C->G->conv, C->c_bytes); }
+        else
+#endif
+        { memcpy(sb, C->R->S, C->s_bytes); memcpy(cb, C->R->conv, C->c_bytes); }
+        ok = q35_wr(f, &h, sizeof h) && q35_wr(f, C->ctx, sizeof(int)*(size_t)pos)
+          && q35_wr(f, sb, C->s_bytes) && q35_wr(f, cb, C->c_bytes);
+    }
+    /* the VRAM half: one contiguous run per layer, K then V */
+    for(int l = 0; ok && nw > 0 && l < C->kv_layers; l++){
+#ifndef QWEN_NO_CUDA
+        if(C->gpu){
+            const size_t off = (size_t)l*(size_t)C->kv_win*half;
+            q35cu_d2h(lane, C->G->Kc + off, half*(size_t)nw); ok = q35_wr(f, lane, half*(size_t)nw);
+            if(ok){ q35cu_d2h(lane, C->G->Vc + off, half*(size_t)nw);
+                    ok = q35_wr(f, lane, half*(size_t)nw); }
+        } else
+#endif
+        /* CPU-only: there is no device window, the tier holds everything from 0 */
+        for(int p = 0; ok && p < nw; p++)
+            ok = kvt_get_raw(&C->R->kv, l, p, tk, tv) && q35_wr(f, tk, half) && q35_wr(f, tv, half);
+    }
+    /* the tier half. Layer-major and ascending, so each chunk is touched once. */
+    for(int l = 0; ok && l < C->kv_layers; l++)
+        for(int p = C->kv_win; ok && p < pos; p++)
+            ok = kvt_get_raw(&C->R->kv, l, p, tk, tv) && q35_wr(f, tk, half) && q35_wr(f, tv, half);
+
+    if(ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    fclose(f);
+    free(sb); free(cb); free(lane); free(tk); free(tv);
+    if(!ok || rename(tmp, path) != 0){ unlink(tmp); return 0; }
+    if(secs) *secs = q35_clk() - t0;
+    return pos;
+}
+
+/* How far this file would take us, without reading the body. */
+static int q35_ck_peek(const Q35Cache *C, const char *path){
+    FILE *f = fopen(path, "rb");
+    if(!f) return 0;
+    Q35CkHdr h, w;
+    const int got = q35_rd(f, &h, sizeof h);
+    fclose(f);
+    if(!got) return 0;
+    q35_ck_head(C, &w, h.pos);
+    return memcmp(&h, &w, sizeof h) == 0 ? h.pos : 0;
+}
+
+/* Restore, but ONLY if the file's token prefix is a prefix of this request. Returns the
+ * position the engine now stands at, or 0 having changed nothing. */
+static int q35_ck_load(Q35Cache *C, const char *path, const int *req, int n, double *secs){
+    const double t0 = q35_clk();
+    FILE *f = fopen(path, "rb");
+    if(!f) return 0;
+    Q35CkHdr h, w;
+    if(!q35_rd(f, &h, sizeof h)){ fclose(f); return 0; }
+    q35_ck_head(C, &w, h.pos);
+    if(memcmp(&h, &w, sizeof h) != 0 || h.pos <= 0 || h.pos > n){ fclose(f); return 0; }
+
+    const size_t half = C->kv_stride;
+    const int    nw   = h.pos < C->kv_win ? h.pos : C->kv_win;
+    int     *tok = (int*)malloc(sizeof(int)*(size_t)h.pos);
+    float   *sb  = (float*)malloc(C->s_bytes), *cb = (float*)malloc(C->c_bytes);
+    uint8_t *lane = (uint8_t*)malloc(half*(size_t)(nw ? nw : 1));
+    uint8_t *tk   = (uint8_t*)malloc(half), *tv = (uint8_t*)malloc(half);
+    int ok = tok && sb && cb && lane && tk && tv
+          && q35_rd(f, tok, sizeof(int)*(size_t)h.pos);
+    /* THE PREFIX TEST, BEFORE ANYTHING IS TOUCHED. Everything below overwrites live engine
+     * state, so the decision has to be final by this line. */
+    if(ok) ok = memcmp(tok, req, sizeof(int)*(size_t)h.pos) == 0;
+    if(ok) ok = q35_rd(f, sb, C->s_bytes) && q35_rd(f, cb, C->c_bytes);
+    if(!ok){ fclose(f); free(tok); free(sb); free(cb); free(lane); free(tk); free(tv); return 0; }
+
+#ifndef QWEN_NO_CUDA
+    if(C->gpu){ q35cu_h2d(C->G->S, sb, C->s_bytes); q35cu_h2d(C->G->conv, cb, C->c_bytes); }
+    else
+#endif
+    { memcpy(C->R->S, sb, C->s_bytes); memcpy(C->R->conv, cb, C->c_bytes); }
+
+    for(int l = 0; ok && nw > 0 && l < C->kv_layers; l++){
+#ifndef QWEN_NO_CUDA
+        if(C->gpu){
+            const size_t off = (size_t)l*(size_t)C->kv_win*half;
+            ok = q35_rd(f, lane, half*(size_t)nw);
+            if(ok){ q35cu_h2d(C->G->Kc + off, lane, half*(size_t)nw);
+                    ok = q35_rd(f, lane, half*(size_t)nw); }
+            if(ok) q35cu_h2d(C->G->Vc + off, lane, half*(size_t)nw);
+        } else
+#endif
+        for(int p = 0; ok && p < nw; p++)
+            ok = q35_rd(f, tk, half) && q35_rd(f, tv, half) && kvt_put_raw(&C->R->kv, l, p, tk, tv);
+    }
+    for(int l = 0; ok && l < C->kv_layers; l++)
+        for(int p = C->kv_win; ok && p < h.pos; p++)
+            ok = q35_rd(f, tk, half) && q35_rd(f, tv, half) && kvt_put_raw(&C->R->kv, l, p, tk, tv);
+#ifndef QWEN_NO_CUDA
+    if(C->gpu) q35cu_sync();
+#endif
+    fclose(f);
+    if(ok){
+        if(C->ctx_cap < h.pos){
+            C->ctx_cap = h.pos + 4096;
+            C->ctx = (int*)realloc(C->ctx, sizeof(int)*(size_t)C->ctx_cap);
+        }
+        memcpy(C->ctx, tok, sizeof(int)*(size_t)h.pos);
+        C->ctx_n = h.pos;
+        if(secs) *secs = q35_clk() - t0;
+    } else {
+        /* A partial restore is the one outcome that must not be survivable: half a KV image is
+         * a history that never happened and produces confident wrong answers. Reset instead. */
+        C->ctx_n = 0;
+    }
+    free(tok); free(sb); free(cb); free(lane); free(tk); free(tv);
+    return ok ? h.pos : 0;
+}
+
 static void q35_cache_reset_state(Q35Cache *C){
     q35_state_reset(C->R);
 #ifndef QWEN_NO_CUDA

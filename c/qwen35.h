@@ -94,6 +94,15 @@ typedef struct {
     /* sampling defaults shipped in the file */
     float top_p, temp; int top_k;
 
+    /* MoE (qwen35moe / Ornith). is_moe=0 => dense qwen35 and every field below is 0.
+     * The routed FFN replaces the dense one: n_expert experts of width d_ff_exp, n_expert_used
+     * of them per token, plus one always-on shared expert of width d_ff_shexp. */
+    int   is_moe;
+    int   n_expert;        /* 256 */
+    int   n_expert_used;   /* 8   */
+    int   d_ff_exp;        /* expert_feed_forward_length = 512 */
+    int   d_ff_shexp;      /* expert_shared_feed_forward_length = 512 */
+
     int   kind[Q35_MAX_LAYER];   /* Q35_LAYER_* per block index */
 } Q35Cfg;
 
@@ -101,7 +110,14 @@ typedef struct {
     /* shared by both layer kinds */
     const float *attn_norm;          /* [d_model] */
     const float *post_attn_norm;     /* [d_model] */
-    const gguf_tensor *ffn_gate, *ffn_up, *ffn_down;
+    const gguf_tensor *ffn_gate, *ffn_up, *ffn_down;   /* dense FFN (is_moe==0) */
+
+    /* MoE FFN (is_moe==1). The experts are stacked 3-D tensors [., ., n_expert]; a per-expert
+     * 2-D slice is contiguous, so kq_gemv_fast reads it straight out of the mapping. */
+    const gguf_tensor *ffn_gate_inp;                                  /* [d_model, n_expert] F32 router */
+    const gguf_tensor *ffn_gate_exps, *ffn_up_exps, *ffn_down_exps;   /* [d_model,d_ff_exp,E] / down [d_ff_exp,d_model,E] */
+    const gguf_tensor *ffn_gate_shexp, *ffn_up_shexp, *ffn_down_shexp;/* the shared expert, dense */
+    const float       *ffn_gate_inp_shexp;                            /* [d_model] F32 — sigmoid gate on the shared expert */
 
     /* full-attention layers */
     const gguf_tensor *wq, *wk, *wv, *wo;      /* wq is [d_model, n_head*d_head*2] */
@@ -178,40 +194,73 @@ static int q35_want(const gguf_tensor *t, const char *nm, int64_t ne0, int64_t n
     return 1;
 }
 
+/* Like q35_want, but for a stacked expert tensor: ne=[ne0, ne1, n_expert]. */
+static int q35_want3(const gguf_tensor *t, const char *nm, int64_t ne0, int64_t ne1, int64_t ne2){
+    if(!t){ fprintf(stderr, "qwen35: missing tensor %s\n", nm); return 0; }
+    if(t->n_dims != 3 || t->ne[0] != ne0 || t->ne[1] != ne1 || t->ne[2] != ne2){
+        fprintf(stderr, "qwen35: %s has ne=[%lld,%lld,%lld], expected [%lld,%lld,%lld]\n", nm,
+                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
+                (long long)ne0, (long long)ne1, (long long)ne2);
+        return 0;
+    }
+    return 1;
+}
+
 static int q35_cfg(Q35Model *M){
     const gguf_model *m = &M->m;
     Q35Cfg *c = &M->c;
     const char *arch = gguf_str(m, "general.architecture", "");
-    if(strcmp(arch, "qwen35") != 0){
-        fprintf(stderr, "qwen35: architecture is \"%s\", not qwen35\n", arch);
+    /* One engine, two Qwen3.5 architectures: the dense trunk ("qwen35") and the MoE
+     * ("qwen35moe", e.g. Ornith). They share every attention/GDN tensor and differ only in the
+     * FFN, so the whole config below is identical bar the metadata PREFIX and the four MoE keys.
+     * llama.cpp prefixes each key with the architecture name, so the prefix is the arch. */
+    c->is_moe = !strcmp(arch, "qwen35moe");
+    if(strcmp(arch, "qwen35") != 0 && !c->is_moe){
+        fprintf(stderr, "qwen35: architecture is \"%s\", not qwen35 or qwen35moe\n", arch);
         return 0;
     }
-    c->n_layer_all = (int)gguf_u64(m, "qwen35.block_count", 0);
-    c->n_layer_mtp = (int)gguf_u64(m, "qwen35.nextn_predict_layers", 0);
+    const char *P = c->is_moe ? "qwen35moe" : "qwen35";
+    char kb[96];
+    #define K(suf) (snprintf(kb, sizeof kb, "%s.%s", P, suf), kb)
+    c->n_layer_all = (int)gguf_u64(m, K("block_count"), 0);
+    c->n_layer_mtp = (int)gguf_u64(m, K("nextn_predict_layers"), 0);
     c->n_layer     = c->n_layer_all - c->n_layer_mtp;
-    c->d_model     = (int)gguf_u64(m, "qwen35.embedding_length", 0);
-    c->d_ff        = (int)gguf_u64(m, "qwen35.feed_forward_length", 0);
-    c->eps         = (float)gguf_f64(m, "qwen35.attention.layer_norm_rms_epsilon", 1e-6);
+    c->d_model     = (int)gguf_u64(m, K("embedding_length"), 0);
+    c->d_ff        = (int)gguf_u64(m, K("feed_forward_length"), 0);
+    c->eps         = (float)gguf_f64(m, K("attention.layer_norm_rms_epsilon"), 1e-6);
 
-    c->n_head      = (int)gguf_u64(m, "qwen35.attention.head_count", 0);
-    c->n_head_kv   = (int)gguf_u64(m, "qwen35.attention.head_count_kv", 0);
-    c->d_head      = (int)gguf_u64(m, "qwen35.attention.key_length", 0);
-    c->n_rot       = (int)gguf_u64(m, "qwen35.rope.dimension_count", 0);
-    c->rope_base   = (float)gguf_f64(m, "qwen35.rope.freq_base", 10000.0);
-    c->full_attn_iv= (int)gguf_u64(m, "qwen35.full_attention_interval", 4);
+    c->n_head      = (int)gguf_u64(m, K("attention.head_count"), 0);
+    c->n_head_kv   = (int)gguf_u64(m, K("attention.head_count_kv"), 0);
+    c->d_head      = (int)gguf_u64(m, K("attention.key_length"), 0);
+    c->n_rot       = (int)gguf_u64(m, K("rope.dimension_count"), 0);
+    c->rope_base   = (float)gguf_f64(m, K("rope.freq_base"), 10000.0);
+    c->full_attn_iv= (int)gguf_u64(m, K("full_attention_interval"), 4);
 
-    c->d_conv      = (int)gguf_u64(m, "qwen35.ssm.conv_kernel", 0);
-    c->d_inner     = (int)gguf_u64(m, "qwen35.ssm.inner_size", 0);
-    c->d_state     = (int)gguf_u64(m, "qwen35.ssm.state_size", 0);
-    c->n_k_heads   = (int)gguf_u64(m, "qwen35.ssm.group_count", 0);
-    c->n_v_heads   = (int)gguf_u64(m, "qwen35.ssm.time_step_rank", 0);
+    c->d_conv      = (int)gguf_u64(m, K("ssm.conv_kernel"), 0);
+    c->d_inner     = (int)gguf_u64(m, K("ssm.inner_size"), 0);
+    c->d_state     = (int)gguf_u64(m, K("ssm.state_size"), 0);
+    c->n_k_heads   = (int)gguf_u64(m, K("ssm.group_count"), 0);
+    c->n_v_heads   = (int)gguf_u64(m, K("ssm.time_step_rank"), 0);
+
+    if(c->is_moe){
+        c->n_expert      = (int)gguf_u64(m, K("expert_count"), 0);
+        c->n_expert_used = (int)gguf_u64(m, K("expert_used_count"), 0);
+        c->d_ff_exp      = (int)gguf_u64(m, K("expert_feed_forward_length"), 0);
+        c->d_ff_shexp    = (int)gguf_u64(m, K("expert_shared_feed_forward_length"), 0);
+        if(c->n_expert <= 0 || c->n_expert_used <= 0 || c->d_ff_exp <= 0){
+            fprintf(stderr, "qwen35moe: bad expert config E=%d used=%d ff=%d\n",
+                    c->n_expert, c->n_expert_used, c->d_ff_exp); return 0;
+        }
+    }
+    #undef K
 
     c->top_k = (int)gguf_u64(m, "general.sampling.top_k", 20);
     c->top_p = (float)gguf_f64(m, "general.sampling.top_p", 0.95);
     c->temp  = (float)gguf_f64(m, "general.sampling.temp", 1.0);
 
     const int32_t *sect = NULL;
-    uint64_t ns = gguf_i32s(m, "qwen35.rope.dimension_sections", &sect);
+    uint64_t ns = gguf_i32s(m, c->is_moe ? "qwen35moe.rope.dimension_sections"
+                                          : "qwen35.rope.dimension_sections", &sect);
     for(int i = 0; i < 4; i++) c->rope_sect[i] = (i < (int)ns && sect) ? sect[i] : 0;
 
     const gguf_tensor *te = gguf_find(m, "token_embd.weight");
@@ -269,12 +318,32 @@ static int q35_bind(Q35Model *M){
         if(!L->attn_norm || !L->post_attn_norm){
             fprintf(stderr, "qwen35: layer %d missing a norm\n", il); ok = 0;
         }
+        if(c->is_moe){
+            const int E = c->n_expert, F = c->d_ff_exp, Fs = c->d_ff_shexp;
+            L->ffn_gate_inp   = q35_t(m, "blk.%d.ffn_gate_inp.weight",   il);
+            L->ffn_gate_exps  = q35_t(m, "blk.%d.ffn_gate_exps.weight",  il);
+            L->ffn_up_exps    = q35_t(m, "blk.%d.ffn_up_exps.weight",    il);
+            L->ffn_down_exps  = q35_t(m, "blk.%d.ffn_down_exps.weight",  il);
+            L->ffn_gate_shexp = q35_t(m, "blk.%d.ffn_gate_shexp.weight", il);
+            L->ffn_up_shexp   = q35_t(m, "blk.%d.ffn_up_shexp.weight",   il);
+            L->ffn_down_shexp = q35_t(m, "blk.%d.ffn_down_shexp.weight", il);
+            L->ffn_gate_inp_shexp = q35_f32(m, "blk.%d.ffn_gate_inp_shexp.weight", il);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_gate_inp",  il); ok &= q35_want (L->ffn_gate_inp,  nm, c->d_model, E);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_gate_exps", il); ok &= q35_want3(L->ffn_gate_exps, nm, c->d_model, F, E);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_up_exps",   il); ok &= q35_want3(L->ffn_up_exps,   nm, c->d_model, F, E);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_down_exps", il); ok &= q35_want3(L->ffn_down_exps, nm, F, c->d_model, E);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_gate_shexp",il); ok &= q35_want (L->ffn_gate_shexp,nm, c->d_model, Fs);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_up_shexp",  il); ok &= q35_want (L->ffn_up_shexp,  nm, c->d_model, Fs);
+            snprintf(nm,sizeof nm,"blk.%d.ffn_down_shexp",il); ok &= q35_want (L->ffn_down_shexp,nm, Fs, c->d_model);
+            if(!L->ffn_gate_inp_shexp){ fprintf(stderr,"qwen35moe: layer %d missing ffn_gate_inp_shexp\n", il); ok = 0; }
+        } else {
         L->ffn_gate = q35_t(m, "blk.%d.ffn_gate.weight", il);
         L->ffn_up   = q35_t(m, "blk.%d.ffn_up.weight",   il);
         L->ffn_down = q35_t(m, "blk.%d.ffn_down.weight", il);
         snprintf(nm, sizeof nm, "blk.%d.ffn_gate", il); ok &= q35_want(L->ffn_gate, nm, c->d_model, c->d_ff);
         snprintf(nm, sizeof nm, "blk.%d.ffn_up",   il); ok &= q35_want(L->ffn_up,   nm, c->d_model, c->d_ff);
         snprintf(nm, sizeof nm, "blk.%d.ffn_down", il); ok &= q35_want(L->ffn_down, nm, c->d_ff, c->d_model);
+        }
 
         if(L->kind == Q35_LAYER_GDN){
             L->wqkv    = q35_t(m, "blk.%d.attn_qkv.weight",   il);
@@ -555,9 +624,18 @@ static int q35_reside_anon(Q35Model *M, Q35Resident *R, int what){
     int nw = 0;
     for(int il = 0; il < c->n_layer; il++){          /* trunk only: the MTP block is skipped */
         const Q35Layer *L = &M->L[il];
+        if(c->is_moe){
+            /* The MoE FFN is the experts: keeping them in RAM is the whole point of RES_FFN
+             * for Ornith. The router and shared expert are small but on the same hot path. */
+            const gguf_tensor *g[8] = { L->ffn_gate_inp, L->ffn_gate_exps, L->ffn_up_exps,
+                                        L->ffn_down_exps, L->ffn_gate_shexp, L->ffn_up_shexp,
+                                        L->ffn_down_shexp, NULL };
+            for(int k = 0; k < 8; k++) if(g[k] && !q35_is_elsewhere(M, g[k])) want[nw++] = g[k];
+        } else {
         if(L->ffn_gate && !q35_is_elsewhere(M, L->ffn_gate)) want[nw++] = L->ffn_gate;
         if(L->ffn_up   && !q35_is_elsewhere(M, L->ffn_up))   want[nw++] = L->ffn_up;
         if(L->ffn_down && !q35_is_elsewhere(M, L->ffn_down)) want[nw++] = L->ffn_down;
+        }
         if(what == Q35_RES_ALL){
             const gguf_tensor *g[9] = { L->wq, L->wk, L->wv, L->wo,
                                         L->wqkv, L->wgate, L->w_alpha, L->w_beta, L->w_out };

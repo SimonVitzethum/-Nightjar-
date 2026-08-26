@@ -178,7 +178,7 @@ int main(int argc, char **argv){
     t0 = now();
     for(int l = 0; l < n_at; l++){
         for(int ci = 0; ci < n_ch; ci++){
-            kvt_prefetch_window(&S, l, ci, depth);      /* ask for the next few FIRST */
+            kvt_prefetch_window(&S, l, ci, depth, n_ch); /* ask for the next few FIRST */
             const uint8_t *blk = kvt_chunk(&S, l, ci);
             if(!blk){ printf("  FAIL: layer %d chunk %d unavailable\n", l, ci); fails++; continue; }
             const int p0 = ci*S.chunk, p1 = (p0+S.chunk < n_ctx) ? p0+S.chunk : n_ctx;

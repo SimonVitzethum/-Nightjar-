@@ -114,7 +114,8 @@ typedef struct {
     int      n_kv;               /* values per K (and per V) = n_head_kv * d_head */
     int64_t  ent;                /* bytes of one token's K+V in one layer */
     int      chunk;              /* tokens per residency/IO unit */
-    int      n_chunk;
+    int      n_chunk;            /* CAPACITY of the index, not how much of it is written */
+    int      n_used;             /* highest position written + 1 — the live context */
     int64_t  chunk_bytes;        /* ent*chunk, padded to KVT_ALIGN (O_DIRECT needs it) */
 
     /* residency, indexed layer*n_chunk + c */
@@ -316,7 +317,15 @@ static int kvt_open_n(KvTier *S, const Q35Cfg *c, int n_layer, int n_ctx, int fm
     if(!S->where || !S->ram) return 0;
 
     S->ram_chunks = ram_budget > 0 ? (int)(ram_budget / S->chunk_bytes) : 0;
-    if(S->ram_chunks > n_slots) S->ram_chunks = n_slots;
+    /* NOT clamped to n_layer*n_chunk, and that clamp is why this is worth a paragraph.
+     *
+     * n_chunk here is the index size for the INITIAL n_ctx, and the index grows (kvt_grow)
+     * while the arena, by design, does not. Sizing the arena against the initial index
+     * therefore made the hot window a function of --ctx instead of of the RAM budget: at
+     * --ctx 8192 with 17 layers the index holds 34 chunks, so a 0.75 GiB budget bought 34
+     * chunks — 8192 tokens — while the startup line advertised 23091. Every token past
+     * --ctx was then served from the drive, at a context length where nothing was supposed
+     * to spill at all. The budget is the promise; this is where it has to be kept. */
     /* The hot window must at least be able to hold one open chunk per layer, or every layer
      * evicts the layer before it and nothing is ever resident when it is read back. */
     if(S->ram_chunks < S->n_layer){
@@ -428,6 +437,7 @@ static void kvt_close(KvTier *S){
 }
 
 static int kvt_grow(KvTier *S, int need_ctx);      /* defined below; used by kvt_put */
+static const uint8_t *kvt_chunk(KvTier *S, int layer, int c);  /* read path, below */
 
 /* ---------------- write path ---------------- */
 
@@ -457,9 +467,15 @@ static void kvt_flush_wait(KvTier *S, int slot){
     pthread_mutex_unlock(&S->mu);
 }
 
-/* Append one token's K and V for one attention-layer slot. */
-static void kvt_put(KvTier *S, int layer, int pos, const float *k, const float *v){
-    if(pos >= S->n_ctx && !kvt_grow(S, pos + 1)) return;   /* at the floor: stop growing */
+/* Make (layer, pos) resident and hand back its chunk base, or NULL at the memory floor.
+ *
+ * Split out of kvt_put because the checkpoint path needs the SAME residency, FIFO and
+ * write-behind behaviour while moving bytes that are already in the store's wire format.
+ * Duplicating the eviction dance for that would be two copies of the one piece of code here
+ * whose bugs are silent — a chunk placed in the wrong slot returns plausible KV for the wrong
+ * positions, and the model simply answers as if the history were different. */
+static uint8_t *kvt_slot(KvTier *S, int layer, int pos){
+    if(pos >= S->n_ctx && !kvt_grow(S, pos + 1)) return NULL;   /* at the floor: stop growing */
     const int c = pos / S->chunk;
     const int idx = layer*S->n_chunk + c;
 
@@ -489,18 +505,56 @@ static void kvt_put(KvTier *S, int layer, int pos, const float *k, const float *
         S->ram[idx]   = S->arena + (int64_t)slot*S->chunk_bytes;
         S->where[idx] = KVT_RAM;
     }
-    const int ti = pos % S->chunk;
-    uint8_t *base = S->ram[idx];
-    kvt_pack(S, base + kvt_koff(S, ti), k);
-    kvt_pack(S, base + kvt_voff(S, ti), v);
-    S->bytes_ram += S->ent;
+    if(pos + 1 > S->n_used) S->n_used = pos + 1;
+    if(pos + 1 > S->n_used) S->n_used = pos + 1;
+    return S->ram[idx];
+}
 
-    /* Chunk just filled: start its write NOW, while later chunks are still being computed.
-     * That is what keeps the drive's write queue non-empty instead of stop-and-go. */
+/* Chunk just filled: start its write NOW, while later chunks are still being computed. That is
+ * what keeps the drive's write queue non-empty instead of stop-and-go. */
+static void kvt_wrote(KvTier *S, int layer, int pos){
+    S->bytes_ram += S->ent;
     if(S->fd >= 0 && (pos % S->chunk) == S->chunk - 1){
+        const int idx = layer*S->n_chunk + (pos / S->chunk);
         for(int sl = 0; sl < S->ram_chunks; sl++)
             if(S->slot_owner[sl] == idx){ kvt_flush_begin(S, sl); break; }
     }
+}
+
+/* Append one token's K and V for one attention-layer slot. */
+static void kvt_put(KvTier *S, int layer, int pos, const float *k, const float *v){
+    uint8_t *base = kvt_slot(S, layer, pos);
+    if(!base) return;
+    const int ti = pos % S->chunk;
+    kvt_pack(S, base + kvt_koff(S, ti), k);
+    kvt_pack(S, base + kvt_voff(S, ti), v);
+    kvt_wrote(S, layer, pos);
+}
+
+/* ---- already-packed access, for the checkpoint path ----
+ * One token's K and V in one layer, in the store's own wire format. The device window uses
+ * the SAME per-token encoding (G->kv_half == ent/2), so a checkpoint moves these bytes
+ * between the two without converting anything. */
+static int64_t kvt_half(const KvTier *S){ return S->ent/2; }
+
+static int kvt_get_raw(KvTier *S, int layer, int pos, uint8_t *k, uint8_t *v){
+    if(pos < 0 || pos >= S->n_ctx) return 0;
+    const uint8_t *blk = kvt_chunk(S, layer, pos / S->chunk);
+    if(!blk) return 0;
+    const int ti = pos % S->chunk;
+    memcpy(k, blk + kvt_koff(S, ti), (size_t)kvt_half(S));
+    memcpy(v, blk + kvt_voff(S, ti), (size_t)kvt_half(S));
+    return 1;
+}
+
+static int kvt_put_raw(KvTier *S, int layer, int pos, const uint8_t *k, const uint8_t *v){
+    uint8_t *base = kvt_slot(S, layer, pos);
+    if(!base) return 0;
+    const int ti = pos % S->chunk;
+    memcpy(base + kvt_koff(S, ti), k, (size_t)kvt_half(S));
+    memcpy(base + kvt_voff(S, ti), v, (size_t)kvt_half(S));
+    kvt_wrote(S, layer, pos);
+    return 1;
 }
 
 /* ---------------- read path ----------------
@@ -513,8 +567,19 @@ static int kvt_find_read(KvTier *S, int layer, int c){
     return -1;
 }
 
+/* A PREFETCH THAT NOBODY WILL COME BACK FOR IS A LEAKED SLOT, NOT A WASTED READ.
+ *
+ * The read queue is claim-on-consume: kvt_chunk is what returns a job's slot to the free
+ * pool. So a job for a chunk that no scan will ever ask for holds its slot forever. That is
+ * not hypothetical — n_chunk is CAPACITY, and after a grow the index has chunks past the
+ * live context that nothing has been written to. kvt_prefetch_window issues six ahead, the
+ * scan stops at the last live chunk, and every attention layer leaked the one chunk past the
+ * end. Seventeen layers, sixteen slots: the queue was gone after a single forward pass, and
+ * the next genuine miss parked the ENGINE thread in cv_rdone with no timeout. 0% CPU, 0%
+ * GPU, one token of output, not one line in the log. */
 static void kvt_prefetch(KvTier *S, int layer, int c){
     if(c < 0 || c >= S->n_chunk || S->fd < 0) return;
+    if((int64_t)c*S->chunk >= S->n_used) return;          /* past what has been written */
     if(S->ram[layer*S->n_chunk + c]) return;
     pthread_mutex_lock(&S->mu);
     if(kvt_find_read(S, layer, c) < 0){
@@ -540,19 +605,45 @@ static const uint8_t *kvt_chunk(KvTier *S, int layer, int c){
     int j = kvt_find_read(S, layer, c);
     if(j < 0){
         for(int i = 0; i < KVT_MAXQ; i++) if(!S->rq[i].state){ j = i; break; }
+        /* A slot in state 3 holds a FINISHED read nobody claimed. There is exactly one
+         * consumer of this queue and it is this call, and kvt_find_read has just ruled out
+         * that any done slot holds the chunk we want — so a done slot is unclaimed by
+         * construction and recycling it is safe. Without this, one leaked prefetch is
+         * permanent; with it, a leak costs a re-read instead of the process. */
+        if(j < 0)
+            for(int i = 0; i < KVT_MAXQ; i++) if(S->rq[i].state == 3){ S->rq[i].state = 0; j = i; break; }
         if(j < 0){
-            /* every slot in flight: wait for one to retire rather than fail the read */
+            /* Every slot genuinely in flight. Wait for one to retire — but BOUNDED, because
+             * this runs on the thread that owns the only model state in the process and that
+             * thread must not wait without end on anything, the drive included. */
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 30;
             while(j < 0 && !S->stop){
-                pthread_cond_wait(&S->cv_rdone, &S->mu);
+                if(pthread_cond_timedwait(&S->cv_rdone, &S->mu, &ts) == ETIMEDOUT) break;
                 for(int i = 0; i < KVT_MAXQ; i++) if(!S->rq[i].state){ j = i; break; }
             }
-            if(j < 0){ pthread_mutex_unlock(&S->mu); return NULL; }
+            if(j < 0){
+                pthread_mutex_unlock(&S->mu);
+                fprintf(stderr, "kv_tier: no read slot for chunk (%d,%d) after 30 s — that "
+                                "chunk is being dropped from the scan\n", layer, c);
+                return NULL;
+            }
         }
         S->rq[j].layer = layer; S->rq[j].c = c; S->rq[j].slot = j;
         S->rq[j].state = 1;
         pthread_cond_signal(&S->cv_rjob);
     }
-    while(S->rq[j].state != 3 && !S->stop) pthread_cond_wait(&S->cv_rdone, &S->mu);
+    /* Waiting for our own job. Abandoning it is not an option — a reader still owns that
+     * staging slot and would land in a buffer we had handed on — so this one stays until it
+     * completes. What it must not do is stay SILENT: a stall here used to be indistinguishable
+     * from a hung process, so it says so once and keeps waiting. */
+    for(int said = 0; S->rq[j].state != 3 && !S->stop; ){
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 30;
+        if(pthread_cond_timedwait(&S->cv_rdone, &S->mu, &ts) == ETIMEDOUT && !said){
+            said = 1;
+            fprintf(stderr, "kv_tier: chunk (%d,%d) has not come back from the drive in 30 s "
+                            "— still waiting\n", layer, c);
+        }
+    }
     const int slot = S->rq[j].slot;
     S->rq[j].state = 0;
     pthread_cond_broadcast(&S->cv_rdone);          /* a slot just freed up */
@@ -560,10 +651,20 @@ static const uint8_t *kvt_chunk(KvTier *S, int layer, int c){
     return S->stage + (int64_t)slot*S->chunk_bytes;
 }
 
-/* Issue the next `depth` chunks at once. One-ahead is queue depth 1, and this drive was
- * measured at 2.36 GB/s at QD1 against 5.39 at QD8 — 2.3x for nothing but asking earlier. */
-static void kvt_prefetch_window(KvTier *S, int layer, int c, int depth){
-    for(int i = 1; i <= depth; i++) kvt_prefetch(S, layer, c+i);
+/* Issue the next `depth` chunks at once, and NOT ONE PAST c_end — which is the caller's own
+ * loop bound, passed in rather than guessed.
+ *
+ * Only the scan retires a read slot, so "prefetched" and "will be consumed" have to be the
+ * same set or the queue bleeds. c_end is what makes them the same set. The n_used guard in
+ * kvt_prefetch is a floor under this, not a substitute for it: n_used is a high-water mark
+ * over the whole process, so after one long conversation it would happily read ahead over a
+ * short one's entire history — chunks that are real, that load fine, and that this scan is
+ * never going to ask for.
+ *
+ * One-ahead is queue depth 1, and this drive was measured at 2.36 GB/s at QD1 against 5.39
+ * at QD8 — 2.3x for nothing but asking earlier. */
+static void kvt_prefetch_window(KvTier *S, int layer, int c, int depth, int c_end){
+    for(int i = 1; i <= depth && c + i < c_end; i++) kvt_prefetch(S, layer, c+i);
 }
 
 /* ---------------- growth ----------------

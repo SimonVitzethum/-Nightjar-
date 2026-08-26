@@ -144,6 +144,7 @@ typedef struct {
 
     /* scratch, one token wide */
     float *x, *xn, *tmp, *qg, *k, *v, *att, *o, *ffn_g, *ffn_u, *qkv, *z, *ab;
+    float *moe_rlog, *moe_od;   /* MoE only: router logits [n_expert], one experts down output [d_model] */
     int    pos;
 } Q35State;
 
@@ -185,8 +186,20 @@ static int q35_state_init_ex(Q35State *R, const Q35Model *M, int n_ctx,
     R->v     = (float*)q35_calloc(sizeof(float)*kvd);
     R->att   = (float*)q35_calloc(sizeof(float)*(size_t)n_ctx*c->n_head);
     R->o     = (float*)q35_calloc(sizeof(float)*(c->n_head*c->d_head > c->d_inner ? c->n_head*c->d_head : c->d_inner));
-    R->ffn_g = (float*)q35_calloc(sizeof(float)*c->d_ff);
-    R->ffn_u = (float*)q35_calloc(sizeof(float)*c->d_ff);
+    /* The FFN scratch must hold the widest hidden vector the model uses. Dense: d_ff. MoE:
+     * the routed expert (d_ff_exp) and the shared expert (d_ff_shexp), whichever is wider —
+     * d_ff itself is 0 for a MoE file. */
+    int ffn_scratch = c->d_ff;
+    if(c->is_moe){
+        if(c->d_ff_exp   > ffn_scratch) ffn_scratch = c->d_ff_exp;
+        if(c->d_ff_shexp > ffn_scratch) ffn_scratch = c->d_ff_shexp;
+    }
+    R->ffn_g = (float*)q35_calloc(sizeof(float)*ffn_scratch);
+    R->ffn_u = (float*)q35_calloc(sizeof(float)*ffn_scratch);
+    if(c->is_moe){
+        R->moe_rlog = (float*)q35_calloc(sizeof(float)*c->n_expert);
+        R->moe_od   = (float*)q35_calloc(sizeof(float)*c->d_model);
+    }
     R->qkv   = (float*)q35_calloc(sizeof(float)*c->conv_dim);
     R->z     = (float*)q35_calloc(sizeof(float)*c->d_inner);
     R->ab    = (float*)q35_calloc(sizeof(float)*2*c->n_v_heads);
@@ -204,6 +217,7 @@ static void q35_state_free(Q35State *R){
     free(R->attn_slot); free(R->gdn_slot); free(R->S); free(R->conv);
     free(R->x); free(R->xn); free(R->tmp); free(R->qg); free(R->k); free(R->v);
     free(R->att); free(R->o); free(R->ffn_g); free(R->ffn_u); free(R->qkv); free(R->z); free(R->ab);
+    free(R->moe_rlog); free(R->moe_od);
 }
 
 /* reset the sequence: recurrent state to zero, KV logically empty */
@@ -231,13 +245,101 @@ static void q35_mv2(float *y, const float *x, const Q35Model *M, const gguf_tens
 
 /* ---------------- FFN: swiglu, gate/up parallel ---------------- */
 
-static void q35_ffn(Q35State *R, const Q35Layer *L, const float *xn, float *out){
+static void q35_ffn_dense(Q35State *R, const Q35Layer *L, const float *xn, float *out){
     const Q35Cfg *c = &R->M->c;
     const Q35Model *M = R->M;
     q35_mv2(R->ffn_g, xn, M, L->ffn_gate);
     q35_mv2(R->ffn_u, xn, M, L->ffn_up);
     for(int i = 0; i < c->d_ff; i++) R->ffn_g[i] = q35_silu(R->ffn_g[i]) * R->ffn_u[i];
     q35_mv2(out, R->ffn_g, M, L->ffn_down);
+}
+
+/* One dense SwiGLU FFN of hidden width F, straight out of quantized weights: same shape as the
+ * dense path but with the width and pointers passed in, so both the routed experts and the
+ * shared expert share it. acc is written (not accumulated). */
+/* One dense SwiGLU FFN of hidden width F straight out of quantized weights, state-free: the
+ * caller passes the two hidden scratch buffers (gbuf,ubuf, each >= F) and the accumulator.
+ * Shared by the routed experts and the shared expert, decode and prefill alike. */
+static void q35_swiglu_row(const Q35Model *M, const float *xn, int D, int F,
+                           const gguf_tensor *Tg, const gguf_tensor *Tu, const gguf_tensor *Td,
+                           size_t goff, size_t uoff, size_t doff,
+                           float *gbuf, float *ubuf, float *acc){
+    const uint8_t *bg = (const uint8_t*)q35_wdata(M, Tg) + goff;
+    const uint8_t *bu = (const uint8_t*)q35_wdata(M, Tu) + uoff;
+    const uint8_t *bd = (const uint8_t*)q35_wdata(M, Td) + doff;
+    kq_gemv_fast(gbuf, xn, bg, Tg->type, D, F);
+    kq_gemv_fast(ubuf, xn, bu, Tu->type, D, F);
+    for(int i = 0; i < F; i++) gbuf[i] = q35_silu(gbuf[i]) * ubuf[i];
+    kq_gemv_fast(acc, gbuf, bd, Td->type, F, D);
+}
+
+/* ---------------- FFN: routed MoE (qwen35moe / Ornith), ONE token ----------------
+ *
+ * router -> softmax over all E experts -> top-K -> renormalize the K weights to sum 1
+ * (norm_topk_prob) -> out = sum_k w_k * expert_k(x) + sigmoid(w_shexp . x) * shared_expert(x).
+ *
+ * State-free: every scratch buffer is the caller's, so the decode state (Q35State) and the
+ * prefill batch both reach the same routing. rlog >= n_expert, gbuf/ubuf >= max(d_ff_exp,
+ * d_ff_shexp), od >= d_model. The router weight is F32 and tiny, so its gemv is a plain dot
+ * loop; each expert is a contiguous 2-D slice of a stacked [.,.,E] tensor read in place. */
+static void q35_moe_row(const Q35Model *M, const Q35Layer *L, const float *xn, float *out,
+                        float *rlog, float *gbuf, float *ubuf, float *od){
+    const Q35Cfg *c = &M->c;
+    const int D = c->d_model, F = c->d_ff_exp, E = c->n_expert, K = c->n_expert_used;
+
+    const float *Wr = (const float*)q35_wdata(M, L->ffn_gate_inp);
+    float mx = -1e30f;
+    for(int e = 0; e < E; e++){
+        const float *w = Wr + (size_t)e*D;
+        float acc = 0.f; for(int i = 0; i < D; i++) acc += w[i]*xn[i];
+        rlog[e] = acc; if(acc > mx) mx = acc;
+    }
+    float sum = 0.f;
+    for(int e = 0; e < E; e++){ rlog[e] = expf(rlog[e]-mx); sum += rlog[e]; }
+    const float inv = sum > 0.f ? 1.f/sum : 0.f;
+    for(int e = 0; e < E; e++) rlog[e] *= inv;
+
+    int   idx[64]; float wt[64];
+    if(K > 64) return;
+    float wsum = 0.f;
+    for(int j = 0; j < K; j++){
+        int best = -1; float bv = -1.f;
+        for(int e = 0; e < E; e++){
+            if(rlog[e] > bv){ int taken = 0;
+                for(int t = 0; t < j; t++) if(idx[t] == e){ taken = 1; break; }
+                if(!taken){ bv = rlog[e]; best = e; } }
+        }
+        idx[j] = best; wt[j] = bv; wsum += bv;
+    }
+    const float rnorm = wsum > 0.f ? 1.f/wsum : 0.f;   /* norm_topk_prob */
+
+    for(int i = 0; i < D; i++) out[i] = 0.f;
+
+    const int64_t sg = (int64_t)F * kq_row_bytes(L->ffn_gate_exps->type, D);
+    const int64_t su = (int64_t)F * kq_row_bytes(L->ffn_up_exps->type,   D);
+    const int64_t sd = (int64_t)D * kq_row_bytes(L->ffn_down_exps->type, F);
+    for(int j = 0; j < K; j++){
+        const int e = idx[j]; const float w = wt[j]*rnorm;
+        q35_swiglu_row(M, xn, D, F, L->ffn_gate_exps, L->ffn_up_exps, L->ffn_down_exps,
+                       (size_t)e*sg, (size_t)e*su, (size_t)e*sd, gbuf, ubuf, od);
+        for(int i = 0; i < D; i++) out[i] += w * od[i];
+    }
+
+    const float *ws = L->ffn_gate_inp_shexp;
+    float g = 0.f; for(int i = 0; i < D; i++) g += ws[i]*xn[i];
+    g = 1.f/(1.f+expf(-g));
+    q35_swiglu_row(M, xn, D, c->d_ff_shexp, L->ffn_gate_shexp, L->ffn_up_shexp, L->ffn_down_shexp,
+                   0, 0, 0, gbuf, ubuf, od);
+    for(int i = 0; i < D; i++) out[i] += g * od[i];
+}
+
+static void q35_ffn_moe(Q35State *R, const Q35Layer *L, const float *xn, float *out){
+    q35_moe_row(R->M, L, xn, out, R->moe_rlog, R->ffn_g, R->ffn_u, R->moe_od);
+}
+
+static void q35_ffn(Q35State *R, const Q35Layer *L, const float *xn, float *out){
+    if(R->M->c.is_moe) q35_ffn_moe(R, L, xn, out);
+    else               q35_ffn_dense(R, L, xn, out);
 }
 
 /* ---------------- full attention (one token, decode) ---------------- */
@@ -281,7 +383,7 @@ static void q35_attn(Q35State *R, const Q35Layer *L, int il, const float *xn, in
      * and rescale would work too, but two passes over kilobytes is not the cost that
      * matters when the other side of the loop is moving gigabytes. */
     for(int ci = 0; ci < n_ch; ci++){
-        kvt_prefetch(KV, slot, ci+1);
+        kvt_prefetch_window(KV, slot, ci, 1, n_ch);
         const uint8_t *blk = kvt_chunk(KV, slot, ci);
         if(!blk) continue;
         const int t0 = ci*KV->chunk;
@@ -304,7 +406,7 @@ static void q35_attn(Q35State *R, const Q35Layer *L, int il, const float *xn, in
     for(int h = 0; h < nh; h++) q35_softmax(R->att + (size_t)h*R->n_ctx, T);
 
     for(int ci = 0; ci < n_ch; ci++){
-        kvt_prefetch(KV, slot, ci+1);
+        kvt_prefetch_window(KV, slot, ci, 1, n_ch);
         const uint8_t *blk = kvt_chunk(KV, slot, ci);
         if(!blk) continue;
         const int t0 = ci*KV->chunk;

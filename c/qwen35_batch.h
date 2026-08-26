@@ -112,6 +112,26 @@ static void q35_batch_timers_reset(void){ g_b_ffn = g_b_attn = g_b_gdn = g_b_out
 
 static void q35_ffn_b(Q35Batch *B, const Q35Layer *L, const float *xn, float *out, int S){
     const Q35Cfg *c = &B->M->c;
+    if(c->is_moe){
+        /* Prefill for a MoE model: each token routes to its own experts, so this is a
+         * per-token loop over the same q35_moe_row the decode path uses. Batching the experts
+         * across tokens buys little when every token picks a different eight, and correctness
+         * comes first — the tokens are independent, so OpenMP splits them cleanly. */
+        const int D = c->d_model, E = c->n_expert;
+        const int Fw = c->d_ff_exp > c->d_ff_shexp ? c->d_ff_exp : c->d_ff_shexp;
+        #pragma omp parallel
+        {
+            float *rlog = (float*)malloc(sizeof(float)*E);
+            float *gbuf = (float*)malloc(sizeof(float)*Fw);
+            float *ubuf = (float*)malloc(sizeof(float)*Fw);
+            float *od   = (float*)malloc(sizeof(float)*D);
+            #pragma omp for schedule(static)
+            for(int s = 0; s < S; s++)
+                q35_moe_row(B->M, L, xn + (size_t)s*D, out + (size_t)s*D, rlog, gbuf, ubuf, od);
+            free(rlog); free(gbuf); free(ubuf); free(od);
+        }
+        return;
+    }
     q35_mm(B->ffn_g, xn, B->M, L->ffn_gate, S);
     q35_mm(B->ffn_u, xn, B->M, L->ffn_up,   S);
     const int64_t n = (int64_t)S*c->d_ff;
@@ -166,7 +186,7 @@ static void q35_attn_b(Q35Batch *B, const Q35Layer *L, int il, const float *xn,
         float *os = B->o + (size_t)s*nh*dh;
 
         for(int ci = 0; ci < n_ch; ci++){
-            kvt_prefetch_window(KV, slot, ci, 6);
+            kvt_prefetch_window(KV, slot, ci, 6, n_ch);
             const uint8_t *blk = kvt_chunk(KV, slot, ci);
             if(!blk) continue;
             const int t0 = ci*KV->chunk;
@@ -184,7 +204,7 @@ static void q35_attn_b(Q35Batch *B, const Q35Layer *L, int il, const float *xn,
         for(int h = 0; h < nh; h++) q35_softmax(R->att + (size_t)h*R->n_ctx, T);
 
         for(int ci = 0; ci < n_ch; ci++){
-            kvt_prefetch_window(KV, slot, ci, 6);
+            kvt_prefetch_window(KV, slot, ci, 6, n_ch);
             const uint8_t *blk = kvt_chunk(KV, slot, ci);
             if(!blk) continue;
             const int t0 = ci*KV->chunk;

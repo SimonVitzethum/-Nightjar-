@@ -362,7 +362,7 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
           G->stream_f_b = pe ? atof(pe) : 0.85;
           if(G->stream_f_b > 0.92) G->stream_f_b = 0.92;
           if(G->stream_f_b < G->stream_f) G->stream_f_b = G->stream_f; }
-        if(G->stream_f > 0){
+        if(!c->is_moe && G->stream_f > 0){   /* MoE has no dense FFN to stream; experts stay in RAM */
             q35cu_mem(&vfree, &vtot);
             int64_t cap = (int64_t)vfree - (160<<20);
             int64_t need = 0;
@@ -405,7 +405,7 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
     const char *fe = getenv("QWEN_CUDA_FFN_GB");
     if(fe){ const double gb = atof(fe); const int64_t cap = (int64_t)(gb*1073741824.0);
             if(cap < spare) spare = cap; }
-    if(spare > 0){
+    if(!c->is_moe && spare > 0){   /* dense FFN layers into VRAM; a MoE model keeps every expert on the CPU (B1) */
         int64_t need_ffn = 0;
         G->ffn_g = q35cu_work(G, c->d_ff);
         G->ffn_u = q35cu_work(G, c->d_ff);
@@ -558,7 +558,7 @@ static void q35_attn_host_partial(Q35State *R, const float *qg, int slot,
     if(t_hi <= t_lo) return;
 
     for(int ci = c0; ci < c1; ci++){
-        kvt_prefetch(KV, slot, ci+1);
+        kvt_prefetch_window(KV, slot, ci, 1, c1);
         const uint8_t *blk = kvt_chunk(KV, slot, ci);
         if(!blk) continue;
         int a = ci*KV->chunk, b = a + KV->chunk;
@@ -584,7 +584,7 @@ static void q35_attn_host_partial(Q35State *R, const float *qg, int slot,
         lse[h] = m;
     }
     for(int ci = c0; ci < c1; ci++){
-        kvt_prefetch(KV, slot, ci+1);
+        kvt_prefetch_window(KV, slot, ci, 1, c1);
         const uint8_t *blk = kvt_chunk(KV, slot, ci);
         if(!blk) continue;
         int a = ci*KV->chunk, b = a + KV->chunk;

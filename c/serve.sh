@@ -5,6 +5,10 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${MODEL:-/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf}"
+# The switchable registry: Ornith (default) and the dense Qwen, selectable from the web UI's
+# model dropdown. MODEL stays the Qwen path for back-compat; override ORNITH/DEFMODEL to taste.
+ORNITH="${ORNITH:-/home/simon/Models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-A3B-Abliterated-Q4_K_M.gguf}"
+DEFMODEL="${DEFMODEL:-ornith}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-8192}"      # the context still grows past this; see qwen35_server.c
 ENGINE_HOME="${ENGINE_HOME:-$HOME/QwenEngine}"
@@ -70,8 +74,22 @@ fi
 
 mkdir -p "$KV_SPILL" "$(dirname "$LOG")"
 : > "$LOG"
-setsid env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-4}" \
-    "$HERE/qwen35_server" "$MODEL" --port "$PORT" --ctx "$CTX" "$@" \
+# MEMMAX puts the engine in its own memory cgroup. Without one, the engine is simply the
+# biggest anonymous allocation on the box, so when memory runs out the kernel's OOM killer
+# picks it — or, just as often, something else entirely that had nothing to do with it. With
+# one, the limit is enforced against THIS process and the kill lands where it belongs.
+# MemorySwapMax=0 because the weights are pinned anyway: swapping the rest buys nothing and
+# turns a fast failure into ten minutes of thrashing first.
+#   MEMMAX=20G make serve
+LAUNCH=""
+if [ -n "${MEMMAX:-}" ] && command -v systemd-run >/dev/null 2>&1; then
+    LAUNCH="systemd-run --user --scope --quiet --collect \
+            -p MemoryMax=$MEMMAX -p MemorySwapMax=0 --"
+    echo "  memory-capped at $MEMMAX (own cgroup; an overrun kills the engine, nothing else)"
+fi
+setsid $LAUNCH env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-4}" \
+    "$HERE/qwen35_server" --model "ornith:$ORNITH" --model "qwen3.5-27b:$MODEL" \
+    --default "$DEFMODEL" --port "$PORT" --ctx "$CTX" "$@" \
     >> "$LOG" 2>&1 < /dev/null &
 
 echo -n "loading"
@@ -89,6 +107,9 @@ for i in $(seq 1 400); do   # a cold page cache makes residency take minutes, no
         exit 0
     fi
     grep -q "bind .* failed" "$LOG" && { echo; tail -3 "$LOG"; exit 1; }
+    # A refusal is a decision, not a slow start: say so now instead of polling health for
+    # thirteen minutes against a process that already exited on purpose.
+    grep -q "REFUSING TO START" "$LOG" && { echo; sed -n "/REFUSING TO START/,\$p" "$LOG"; exit 1; }
     echo -n "."
 done
 echo " timed out"; tail -8 "$LOG"; exit 1

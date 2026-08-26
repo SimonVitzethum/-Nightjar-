@@ -205,9 +205,12 @@ aside#fs.on{width:17rem}
 .chats .c.sel{background:var(--accent-soft);color:var(--accent)}
 .chats .c .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chats .c .n{font-size:10.5px;color:var(--fg-faint);font-variant-numeric:tabular-nums}
-.chats .c .x{opacity:0;color:var(--fg-faint);font-size:12px;padding:0 2px}
-.chats .c:hover .x{opacity:1}
-.chats .c .x:hover{color:var(--bad)}
+/* Visible without hovering. It used to be opacity:0 until the row was hovered, which on a
+   sidebar of short rows means "there is no way to delete a chat" for anyone who does not
+   happen to sweep the mouse across one. */
+.chats .c .x{opacity:.45;color:var(--fg-faint);font-size:13px;padding:0 4px;border-radius:4px}
+.chats .c:hover .x{opacity:.8}
+.chats .c .x:hover{opacity:1;color:var(--bad);background:var(--bg)}
 .chats .empty2{padding:8px 12px;color:var(--fg-faint);font-size:12px}
 .tree{flex:1;overflow:auto;padding:6px 0 20px;font-size:13px;width:17rem}
 .tree .row{display:flex;align-items:center;gap:5px;padding:2.5px 10px;cursor:pointer;
@@ -339,6 +342,7 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
 <body>
 <header>
   <div class="brand"><span class="dot"></span>QwenEngine <small id="mname">…</small></div>
+  <select id="model" title="Modell wechseln"></select>
   <div class="seg" id="mode">
     <button data-m="chat">Chat</button><button data-m="agent" class="on">Agent</button>
   </div>
@@ -495,7 +499,8 @@ async function chatsLoad(){
   host.innerHTML = chats.map(c =>
     '<div class="c' + (c.id === chatId ? ' sel' : '') + '" data-id="' + esc(c.id) + '">'
     + '<span class="t">' + esc(c.title || 'Ohne Titel') + '</span>'
-    + '<span class="n">' + c.n + '</span><span class="x" data-del="' + esc(c.id) + '">✕</span></div>'
+    + '<span class="n">' + c.n + '</span>'
+    + '<span class="x" data-del="' + esc(c.id) + '" title="Chat l\u00f6schen">\u2715</span></div>'
   ).join('');
   for (const el of host.querySelectorAll('.c')){
     el.onclick = e => {
@@ -518,7 +523,16 @@ function chatSave(){
   }, 700);
 }
 
+/* Asks first, and says what actually goes. Deleting used to be one stray click on a glyph the
+   user could not see, and what it destroys is no longer just a transcript: the chat's
+   checkpoint is gigabytes and rebuilding it is a full prefill — twenty minutes and up. */
 async function chatDelete(id){
+  const c = chats.find(x => x.id === id);
+  const n = (c && c.title) || id;
+  if (!confirm('Chat \u201e' + n + '\u201c l\u00f6schen?\n\n'
+             + 'Verlauf und gespeicherter Zustand auf der Platte werden entfernt. '
+             + 'Ein sp\u00e4teres Weiterarbeiten kostet dann wieder einen vollen Prefill.\n\n'
+             + 'Das l\u00e4sst sich nicht r\u00fcckg\u00e4ngig machen.')) return;
   await fetch('/v1/chat/delete', { method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ project, id }) }).catch(()=>{});
   if (id === chatId){ chatId = ''; newChat(); }
@@ -1640,9 +1654,47 @@ $('#pnew').onclick = async () => {
   await loadProjects(); await loadTools(); applyMode(); newChat();
 };
 
+/* The model registry lives on the server; the dropdown lists it and a change re-execs the
+   engine into the chosen model. The switch drops the socket for as long as the load takes
+   (~10-40 s), so the page shows an overlay and polls /health until the new model answers. */
+async function loadModels(){
+  const sel = $('#model'); if (!sel) return;
+  const list = await fetch('/v1/models').then(r=>r.json()).catch(()=>null);
+  if (!list || !list.data){ sel.style.display = 'none'; return; }
+  sel.innerHTML = '';
+  for (const m of list.data){
+    const o = document.createElement('option');
+    o.value = m.id; o.textContent = m.id; if (m.current) o.selected = true;
+    sel.appendChild(o);
+  }
+  if (list.data.length < 2){ sel.style.display = 'none'; return; }  /* nothing to switch to */
+  sel.onchange = () => {
+    const target = sel.value;
+    if (!confirm('Modell zu „' + target + '" wechseln?\nDer Server lädt neu (~10–40 s).')){ loadModels(); return; }
+    switchModel(target);
+  };
+}
+async function switchModel(target){
+  const ov = document.createElement('div');
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);color:#fff;display:flex;'
+    + 'align-items:center;justify-content:center;font-size:16px;z-index:99999;text-align:center;padding:24px';
+  ov.textContent = 'Modell „' + target + '" wird geladen …';
+  document.body.appendChild(ov);
+  try { await fetch('/v1/model/select', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ model: target }) }); } catch(e){}
+  for (let i = 0; i < 150; i++){
+    await new Promise(z => setTimeout(z, 1000));
+    const hh = await fetch('/health').then(r=>r.json()).catch(()=>null);
+    if (hh && hh.model === target){ location.reload(); return; }
+    ov.textContent = 'Modell „' + target + '" wird geladen … (' + (i+1) + ' s)';
+  }
+  ov.textContent = 'Zeitüberschreitung — bitte die Seite neu laden.';
+}
+
 (async () => {
   const h = await fetch('/health').then(r=>r.json()).catch(()=>null);
   if (h) $('#mname').textContent = h.model + ' · ' + (h.speculative ? 'GPU + spekulativ' : h.gpu ? 'GPU' : 'CPU');
+  await loadModels();
   await loadProjects();
   await loadTools();
   $('#fstitle').textContent = project || 'Dateien';

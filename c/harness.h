@@ -47,6 +47,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <pty.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -120,6 +121,47 @@ static const char *h_root(void){ return t_root[0] ? t_root : g_root; }
  * (~90 tokens at 5.4 tok/s = 17 s) rather than twenty times it. Raise it with --tool-output on
  * a machine that prefills faster; the arithmetic above is the whole argument. */
 static size_t   g_tmax  = 4096;      /* bytes of tool output the model is allowed to see */
+
+/* ---- WHAT A TOOL IS ALLOWED TO ALLOCATE ----
+ *
+ * A tool is an arbitrary command the model chose, and it runs beside 10.7 GiB of pinned
+ * weights on a machine that is already oversubscribed. One `cat` of the wrong file, one build
+ * with -j32, one scanner, and the kernel runs the global OOM killer — which does not kill the
+ * command that caused it. It kills whatever it likes best, and this engine is marked
+ * oom_score_adj 200, so that is the engine: after the prefill, with no error anywhere.
+ * dmesg has three of those.
+ *
+ * So the child gets a ceiling of its own, computed FRESH at spawn time from MemAvailable minus
+ * a headroom the engine keeps for itself. A runaway tool then dies with an allocation failure
+ * it can report — which is a debuggable outcome — instead of taking the engine with it.
+ *
+ * RLIMIT_AS and RLIMIT_DATA together: AS is what every allocator honours, DATA is the one that
+ * counts only anonymous memory and so does not punish a large read-only mmap. At ten-plus GiB
+ * neither bothers an ordinary build.
+ *
+ * QWEN_TOOL_MEM_HEADROOM_GB tunes the headroom; 0 turns the ceiling off entirely. */
+static double h_tool_headroom_gb(void){
+    const char *e = getenv("QWEN_TOOL_MEM_HEADROOM_GB");
+    return (e && *e) ? atof(e) : 3.0;
+}
+static int64_t h_mem_avail(void){
+    FILE *f = fopen("/proc/meminfo", "r");
+    if(!f) return 0;
+    char k[64]; long long v; int64_t out = 0;
+    while(fscanf(f, "%63s %lld kB", k, &v) == 2)
+        if(!strcmp(k, "MemAvailable:")){ out = (int64_t)v*1024; break; }
+    fclose(f);
+    return out;
+}
+/* >0 the ceiling, 0 = disabled, <0 = there is not even the headroom left */
+static int64_t h_tool_mem_limit(void){
+    const double hg = h_tool_headroom_gb();
+    if(hg <= 0) return 0;
+    const int64_t avail = h_mem_avail();
+    if(avail <= 0) return 0;                       /* no /proc/meminfo: do not invent a limit */
+    const int64_t lim = avail - (int64_t)(hg*1073741824.0);
+    return lim > 0 ? lim : -1;
+}
 static int      g_ttmo  = 120000;    /* default command timeout, ms */
 
 static const char *h_mode_name(void){
@@ -613,12 +655,29 @@ static void h_close_inherited(void){
 }
 
 static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
+    /* Refuse rather than run unbounded. Below the headroom there is no ceiling that leaves the
+     * engine alive, and starting the command anyway is the exact sequence that has already
+     * cost three engines. */
+    const int64_t memlim = h_tool_mem_limit();
+    if(memlim < 0){
+        s_fmt(out, "refused: only %.2f GiB of memory available, which is under the %.2f GiB the "
+                   "engine keeps in reserve. Free memory and retry, or lower "
+                   "QWEN_TOOL_MEM_HEADROOM_GB.\n",
+              h_mem_avail()/1073741824.0, h_tool_headroom_gb());
+        if(code) *code = 1;
+        return 1;
+    }
     int master = -1;
     struct winsize ws = { 40, 120, 0, 0 };       /* something sane for programs that ask */
     const pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if(pid < 0) return 0;
     if(pid == 0){
         h_close_inherited();          /* forkpty already put the slave on 0,1,2 */
+        if(memlim > 0){
+            struct rlimit rl = { (rlim_t)memlim, (rlim_t)memlim };
+            setrlimit(RLIMIT_AS, &rl);
+            setrlimit(RLIMIT_DATA, &rl);
+        }
         if(chdir(h_root()) != 0) _exit(126);
         setenv("TERM", "dumb", 1);               /* no colour escapes in the model's context */
         setenv("PAGER", "cat", 1);
@@ -633,7 +692,10 @@ static int h_run(const char *cmd, Str *out, int timeout_ms, int *code){
     g_term.has_code = 0;
     snprintf(g_term.cmd, sizeof g_term.cmd, "%s", cmd);
     pthread_mutex_unlock(&g_term.mu);
-    { Str hdr = {0}; s_fmt(&hdr, "\n$ %s\n", cmd); h_term_add(hdr.p, hdr.n); s_free(&hdr); }
+    { Str hdr = {0};
+      if(memlim > 0) s_fmt(&hdr, "\n$ %s\n[memory ceiling %.1f GiB]\n", cmd, memlim/1073741824.0);
+      else           s_fmt(&hdr, "\n$ %s\n", cmd);
+      h_term_add(hdr.p, hdr.n); s_free(&hdr); }
 
     const size_t hcap = g_tmax * 3 / 4;
     const size_t tcap = g_tmax / 4 > 300 ? g_tmax / 4 - 200 : 256;
