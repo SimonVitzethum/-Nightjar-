@@ -564,6 +564,92 @@ extern "C" int q35cu_gemm(float *y, const float *x, const void *W, int gt, int I
     return 1;
 }
 
+/* ---- GROUPED expert gemv: one launch computes n experts instead of n launches ----
+ * y[j*O + o] = Wp[j][o,:] . (x + j*xstride), for expert j in [0,n). blockIdx.y selects the
+ * expert. This is the decode MoE win: the eight routed experts + the shared one become ONE
+ * kernel per stage (gate, up, down) instead of ~27 tiny launches, and the GPU runs them
+ * concurrently instead of one starved warp-block at a time. xstride=0 => all experts read the
+ * same input (gate/up over xn); xstride=I => each expert reads its own row (down over the
+ * per-expert hidden vector). */
+__global__ static void k_gemv_q4k_grp(float *y, const float *x, int xstride,
+                                      const uint8_t * const *Wp, int I, int O, int n){
+    const int j = blockIdx.y; if(j >= n) return;
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x*NWARP + wid;
+    if(row >= O) return;
+    const int nsb = I >> 8;
+    const uint8_t *w = Wp[j] + (size_t)row*(size_t)nsb*144;
+    const float *xj = x + (size_t)j*(size_t)xstride;
+    float acc = 0.f;
+    for(int sb = 0; sb < nsb; ++sb){
+        const b_q4_K *b = (const b_q4_K*)(w + (size_t)sb*144);
+        const float d = __half2float(b->d), mn = __half2float(b->dmin);
+        #pragma unroll
+        for(int g = 0; g < 4; ++g){
+            float s1,m1,s2,m2;
+            gsm4(b->scales, 2*g,   &s1,&m1);
+            gsm4(b->scales, 2*g+1, &s2,&m2);
+            const float d1=d*s1, mm1=mn*m1, d2=d*s2, mm2=mn*m2;
+            const uint8_t q = b->qs[g*32 + lane];
+            const float lo=(float)(q & 0xF), hi=(float)(q >> 4);
+            const float *xb = xj + sb*256 + g*64;
+            acc += (d1*lo-mm1)*xb[lane] + (d2*hi-mm2)*xb[32+lane];
+        }
+    }
+    const float t = warp_sum(acc);
+    if(lane == 0) y[(size_t)j*O + row] = t;
+}
+__global__ static void k_gemv_q6k_grp(float *y, const float *x, int xstride,
+                                      const uint8_t * const *Wp, int I, int O, int n){
+    const int j = blockIdx.y; if(j >= n) return;
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x*NWARP + wid;
+    if(row >= O) return;
+    const int nsb = I >> 8, is = lane >> 4;
+    const uint8_t *w = Wp[j] + (size_t)row*(size_t)nsb*210;
+    const float *xj = x + (size_t)j*(size_t)xstride;
+    float acc = 0.f;
+    for(int sb = 0; sb < nsb; ++sb){
+        const b_q6_K *b = (const b_q6_K*)(w + (size_t)sb*210);
+        const float d = __half2float(b->d);
+        #pragma unroll
+        for(int nn = 0; nn < 2; ++nn){
+            const uint8_t *ql = b->ql + nn*64;
+            const uint8_t *qh = b->qh + nn*32;
+            const int8_t  *sc = b->scales + nn*8;
+            const uint8_t l0 = ql[lane], l1 = ql[lane+32], h = qh[lane];
+            const float q1=(float)((int)((l0 & 0xF)|(((h>>0)&3)<<4))-32);
+            const float q2=(float)((int)((l1 & 0xF)|(((h>>2)&3)<<4))-32);
+            const float q3=(float)((int)((l0 >>  4)|(((h>>4)&3)<<4))-32);
+            const float q4=(float)((int)((l1 >>  4)|(((h>>6)&3)<<4))-32);
+            const float a1=d*sc[is+0]*q1, a2=d*sc[is+2]*q2, a3=d*sc[is+4]*q3, a4=d*sc[is+6]*q4;
+            const float *xb = xj + sb*256 + nn*128;
+            acc += a1*xb[lane] + a2*xb[lane+32] + a3*xb[lane+64] + a4*xb[lane+96];
+        }
+    }
+    const float t = warp_sum(acc);
+    if(lane == 0) y[(size_t)j*O + row] = t;
+}
+/* out[o] = sum_j w[j] * od[j*D + o]  — the weighted expert sum, one thread per output element. */
+__global__ static void k_moe_reduce(float *out, const float *od, const float *w, int D, int n){
+    const int o = blockIdx.x*blockDim.x + threadIdx.x; if(o >= D) return;
+    float acc = 0.f;
+    for(int j = 0; j < n; ++j) acc += w[j] * od[(size_t)j*D + o];
+    out[o] = acc;
+}
+extern "C" int q35cu_gemv_grp(float *y, const float *x, int xstride,
+                              const void * const *Wp, int gt, int I, int O, int n){
+    if(n <= 0) return 1;
+    dim3 grid((unsigned)((O + NWARP - 1)/NWARP), (unsigned)n);
+    if(gt == CU_Q4_K)      k_gemv_q4k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n);
+    else if(gt == CU_Q6_K) k_gemv_q6k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n);
+    else return 0;
+    return 1;
+}
+extern "C" void q35cu_moe_reduce(float *out, const float *od, const float *w, int D, int n){
+    k_moe_reduce<<<(D+255)/256, 256, 0, g_s>>>(out, od, w, D, n);
+}
+
 extern "C" int q35cu_gemv(float *y, const float *x, const void *W, int gt, int I, int O){
     return q35cu_gemm(y, x, W, gt, I, O, 1);
 }
