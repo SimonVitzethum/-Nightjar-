@@ -43,7 +43,8 @@ typedef struct {
     /* device */
     float *xB, *xnB, *tB, *gB, *uB, *logitsB;
     float *snapS, *snapConv;
-    int64_t snapS_bytes, snapConv_bytes;
+    int64_t snapS_bytes, snapConv_bytes;      /* per position */
+    int64_t snapS_stride, snapConv_stride;    /* in floats */
 
     /* pinned host staging for the FFN hand-off */
     float *hxnB, *htB;
@@ -52,7 +53,8 @@ typedef struct {
 
     /* the CPU's batched FFN scratch (kq_gemm_batched lives behind it) */
     Q35Batch B;
-    int      snap_after;          /* -1 = off */
+    int      snap_after;          /* -1 = off; >=0 snapshots after that position only */
+    int      snap_all;            /* snapshot after EVERY position, for W-token drafts */
     int64_t  vram;
 
     /* batched MoE: S*K (expert, token) pairs per layer, ordered by expert */
@@ -85,9 +87,11 @@ static int q35cu_batch_init(Q35CuBatch *Z, Q35Cu *G, Q35State *R, int S_max){
     }
     Z->snapS_bytes    = (int64_t)R->n_gdn*c->n_v_heads*c->d_state*c->d_head_v*4;
     Z->snapConv_bytes = (int64_t)R->n_gdn*(c->d_conv-1)*c->conv_dim*4;
-    Z->snapS    = (float*)q35cu_alloc((size_t)Z->snapS_bytes);
-    Z->snapConv = (float*)q35cu_alloc((size_t)Z->snapConv_bytes);
-    Z->vram += Z->snapS_bytes + Z->snapConv_bytes;
+    Z->snapS_stride    = Z->snapS_bytes/4;
+    Z->snapConv_stride = Z->snapConv_bytes/4;
+    Z->snapS    = (float*)q35cu_alloc((size_t)Z->snapS_bytes*S_max);
+    Z->snapConv = (float*)q35cu_alloc((size_t)Z->snapConv_bytes*S_max);
+    Z->vram += (Z->snapS_bytes + Z->snapConv_bytes)*S_max;
 
     Z->hxnB = (float*)q35cu_host_alloc(D*4);
     Z->htB  = (float*)q35cu_host_alloc(D*4);
@@ -395,12 +399,23 @@ static void q35_forward_cu_batch_ex(Q35CuBatch *Z, const int *toks, int S, int p
             float *out = Z->tB + (size_t)s*Dm;
             if(is_attn) q35cu_attn_layer_x(G, R, il, slot, pos_base + s, xn, out);
             else        q35cu_gdn_layer_x (G, il, slot, xn, out);
-            /* freeze this layer's slot the moment it has finished token `snap_after` */
-            if(!is_attn && Z->snap_after == s){
+            /* Freeze this layer's slot the moment it has finished token s.
+             *
+             * A one-token draft only ever needs the state as of position 0, because the only
+             * question is accept-or-not. A W-token draft can stop anywhere: if a of the W are
+             * accepted, the correct state is the one after position a, and a is not known
+             * until the whole batch has run. So every position gets its own copy, and the
+             * loop restores the one it turns out to need. The recurrence is why this is
+             * necessary at all -- attention can simply have its KV truncated, but the GDN
+             * state is a summary that cannot be un-applied. */
+            if(!is_attn && (Z->snap_all || Z->snap_after == s)){
                 const size_t sn = (size_t)c->n_v_heads*c->d_state*c->d_head_v;
                 const size_t cn = (size_t)(c->d_conv-1)*c->conv_dim;
-                q35cu_d2d(Z->snapS + (size_t)slot*sn, G->S + (size_t)slot*sn, sn*4);
-                q35cu_d2d(Z->snapConv + (size_t)slot*cn, G->conv + (size_t)slot*cn, cn*4);
+                const int k = Z->snap_all ? s : 0;
+                q35cu_d2d(Z->snapS    + (size_t)k*Z->snapS_stride    + (size_t)slot*sn,
+                          G->S    + (size_t)slot*sn, sn*4);
+                q35cu_d2d(Z->snapConv + (size_t)k*Z->snapConv_stride + (size_t)slot*cn,
+                          G->conv + (size_t)slot*cn, cn*4);
             }
         }
         q35cu_add(Z->xB, Z->tB, S*Dm);
@@ -430,10 +445,127 @@ static void q35_forward_cu_batch(Q35CuBatch *Z, const int *toks, int S, int pos_
     q35_forward_cu_batch_ex(Z, toks, S, pos_base, logits, all_logits, NULL);
 }
 
-static void q35cu_spec_restore(Q35CuBatch *Z){
-    q35cu_d2d(Z->G->S,    Z->snapS,    (size_t)Z->snapS_bytes);
-    q35cu_d2d(Z->G->conv, Z->snapConv, (size_t)Z->snapConv_bytes);
+/* Roll the recurrent state back to just after position `a` of the last verified batch. */
+static void q35cu_spec_restore_at(Q35CuBatch *Z, int a){
+    if(a < 0) a = 0;
+    q35cu_d2d(Z->G->S,    Z->snapS    + (size_t)a*Z->snapS_stride,    (size_t)Z->snapS_bytes);
+    q35cu_d2d(Z->G->conv, Z->snapConv + (size_t)a*Z->snapConv_stride, (size_t)Z->snapConv_bytes);
     q35cu_sync();
+}
+static void q35cu_spec_restore(Q35CuBatch *Z){ q35cu_spec_restore_at(Z, 0); }
+
+/* ---------------- n-gram speculation ----------------
+ *
+ * The drafter is a longest-suffix lookup over everything generated so far: if the last few
+ * tokens occurred earlier in the context, propose whatever followed them. It costs nothing
+ * and needs no training, which matters here because Ornith ships no usable MTP head.
+ *
+ * Measured post-hoc on real output, expected accepted tokens per step: 0.26 on prose, 0.56
+ * writing code, 1.01 refactoring. It is a repetition detector, so it pays on exactly the
+ * workload an agent generates and barely at all on free text -- hence the adaptive give-up
+ * below rather than a fixed on.
+ *
+ * WHY THIS CANNOT CHANGE THE OUTPUT. The draft only ever proposes. Every emitted token is
+ * drawn from the TARGET's own logits, and a proposal is accepted only when it equals what the
+ * target itself produced at that position. A drafter that is wrong, biased, or trained on a
+ * different model costs acceptance rate and nothing else. That is what makes it safe to graft
+ * a head trained on a different checkpoint onto this one.
+ */
+#define Q35_SPEC_W 4      /* draft length; S_max = W+1 positions per verify */
+#define Q35_NGRAM_MAXL 8
+#define Q35_NGRAM_MINL 3
+
+/* Longest suffix of hist[0..n) that occurred earlier; writes up to W following tokens. */
+static int q35_ngram_draft(const int *hist, int n, int *out, int W){
+    for(int L = Q35_NGRAM_MAXL; L >= Q35_NGRAM_MINL; L--){
+        if(n < L + 1) continue;
+        for(int p = n - 2; p >= L - 1; p--){          /* most recent match first */
+            int ok = 1;
+            for(int k = 0; k < L; k++) if(hist[p-k] != hist[n-1-k]){ ok = 0; break; }
+            if(!ok) continue;
+            int m = 0;
+            for(; m < W && p + 1 + m < n; m++) out[m] = hist[p+1+m];
+            if(m > 0) return m;
+        }
+    }
+    return 0;
+}
+
+/* `tok` at `pos` is already real. `hist` holds every token so far INCLUDING tok, and is
+ * extended as tokens are committed. Returns tokens written to out. */
+static int q35_spec_generate_ngram_cu(Q35CuBatch *Z, int tok, int pos,
+                                      int *hist, int nhist, int hist_cap,
+                                      int *out, int n_out, int eos, Q35SpecStats *st,
+                                      float temp, float top_p, int top_k,
+                                      int (*pick)(float*, int, float, float, int, void*),
+                                      void *pctx, int W){
+    Q35Cu *G = Z->G; Q35State *R = Z->R;
+    const Q35Cfg *c = &G->M->c;
+    const int V = c->vocab;
+    if(W > Z->S_max - 1) W = Z->S_max - 1;
+    if(W < 1) return 0;
+
+    int  *draft = (int*)malloc(sizeof(int)*(size_t)(W+1));
+    int  *batch = (int*)malloc(sizeof(int)*(size_t)(W+1));
+    float *lg   = (float*)malloc(sizeof(float)*(size_t)(W+1)*V);
+    if(!draft || !batch || !lg){ free(draft); free(batch); free(lg); return 0; }
+    int n = 0;
+
+    while(n < n_out){
+        /* `tok` is committed but not yet emitted. It has to enter the history BEFORE the
+         * lookup, or the suffix being matched ends one token short and the drafter predicts
+         * the token we already have instead of the one after it. */
+        if(nhist < hist_cap) hist[nhist++] = tok;
+        out[n++] = tok;
+        if(tok == eos || n >= n_out) break;
+
+        const int nd = q35_ngram_draft(hist, nhist, draft, W);
+        if(nd == 0){                              /* nothing to propose: ordinary step */
+            q35_forward_cu(G, R, tok, pos++, lg);
+            tok = pick ? pick(lg, V, temp, top_p, top_k, pctx) : q35_argmax(lg, V);
+            continue;
+        }
+
+        batch[0] = tok;
+        for(int i = 0; i < nd; i++) batch[i+1] = draft[i];
+        const double t0 = q35_clk();
+        Z->snap_all = 1;
+        q35_forward_cu_batch(Z, batch, nd + 1, pos, lg, 1);
+        Z->snap_all = 0;
+        st->t_verify += q35_clk() - t0;
+        st->rounds++;
+
+        /* accept the longest prefix the target agrees with */
+        int a = 0;
+        while(a < nd){
+            const int truth = pick ? pick(lg + (size_t)a*V, V, temp, top_p, top_k, pctx)
+                                   : q35_argmax(lg + (size_t)a*V, V);
+            if(truth != draft[a]) break;
+            a++;
+        }
+        st->accepts += a;
+        if(a < nd){
+            const double tr = q35_clk();
+            q35cu_spec_restore_at(Z, a);          /* the recurrence has to be un-applied */
+            st->t_rollback += q35_clk() - tr;
+        }
+        const int truth = pick ? pick(lg + (size_t)a*V, V, temp, top_p, top_k, pctx)
+                               : q35_argmax(lg + (size_t)a*V, V);
+
+        int stop = 0;
+        for(int i = 0; i < a && n < n_out; i++){
+            if(nhist < hist_cap) hist[nhist++] = draft[i];
+            out[n++] = draft[i];
+            if(draft[i] == eos){ stop = 1; break; }
+        }
+        if(stop || n >= n_out) break;
+        pos += a + 1;
+        tok  = truth;
+        R->pos = pos;
+    }
+    st->tokens += n;
+    free(draft); free(batch); free(lg);
+    return n;
 }
 
 /* ---------------- the loop ----------------

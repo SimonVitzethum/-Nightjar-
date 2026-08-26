@@ -410,6 +410,8 @@ textarea{flex:1;border:0;outline:0;resize:none;background:none;color:var(--fg);f
       <label>Max <input type="number" id="maxt" value="1536" min="16" step="128"></label>
       <label title="Wie viele Werkzeugschritte höchstens">Schritte <input type="number" id="steps" value="24" min="1" max="200"></label>
       <label><input type="checkbox" id="think" checked> Denken</label>
+      <label title="Spekulatives Decoding: ein Entwurf schlägt mehrere Tokens vor, das Modell prüft sie in einem Durchgang. Die Ausgabe bleibt identisch — nur die Geschwindigkeit ändert sich, und ob sie steigt, hängt vom Text ab (Code und Wiederholungen ja, freier Fließtext kaum).">
+        <input type="checkbox" id="spec"> Spekulativ</label>
       <label title="Fragen: jeder Shell-Befehl muss bestätigt werden">Freigabe
         <select id="appr"><option value="ask">fragen</option><option value="auto">alles erlauben</option></select>
       </label>
@@ -1167,7 +1169,8 @@ async function streamOnce(v, step, sink){
     model:'qwen', messages, stream:true, chat: chatId,
     temperature: parseFloat($('#temp').value),
     max_tokens: parseInt($('#maxt').value, 10),
-    enable_thinking: $('#think').checked
+    enable_thinking: $('#think').checked,
+    speculative: $('#spec').checked
   };
   if (mode === 'agent' && tools.length) body.tools = tools;
 

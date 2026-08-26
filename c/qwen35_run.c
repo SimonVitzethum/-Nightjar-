@@ -235,10 +235,18 @@ int main(int argc, char **argv){
 
     q35_state_reset(&R);
 #ifndef QWEN_NO_CUDA
-    Q35CuBatch Z; Q35Mtp P; int use_spec = 0;
+    Q35CuBatch Z; Q35Mtp P; int use_spec = 0, spec_ngram = 0;
     if(use_gpu){
         q35cu_state_reset(&G);
-        if(spec && q35cu_batch_init(&Z, &G, &R, 4) && q35_mtp_init(&P, &R)){
+        /* Two drafters behind one verify path. The MTP head is the better source where one
+         * exists; this model ships none that is trained, so n-gram is the fallback that needs
+         * nothing at all. Either way the TARGET does the sampling, so neither can change what
+         * comes out -- only how fast it arrives. */
+        if(spec && q35cu_batch_init(&Z, &G, &R, Q35_SPEC_W + 1) && !q35_mtp_init(&P, &R)){
+            use_spec = spec_ngram = 1;
+            fprintf(stderr, "  speculative decode: n-gram drafter W=%d, +%.0f MiB VRAM"
+                    " (no trained MTP head in this model)\n", Q35_SPEC_W, Z.vram/1048576.0);
+        } else if(spec && use_gpu && Z.xB && q35_mtp_init(&P, &R)){
             use_spec = 1;
             fprintf(stderr, "  speculative decode: MTP draft head, +%.0f MiB VRAM\n",
                     Z.vram/1048576.0);
@@ -306,7 +314,7 @@ int main(int argc, char **argv){
          * them, and on the streamed layers the PCIe traffic is shared too. This is what makes
          * a long prompt affordable at all — it is the difference between hours and minutes at
          * 100k tokens. */
-        if(use_spec){
+        if(use_spec && !spec_ngram){
             const int SB = Z.S_max;
             float *xall = (float*)malloc(sizeof(float)*(size_t)SB*c->d_model);
             float *hh   = (float*)malloc(sizeof(float)*c->d_model);
@@ -336,7 +344,7 @@ int main(int argc, char **argv){
 #endif
                         q35_forward(&R, toks[i], pos, last ? logits : NULL);
 #ifndef QWEN_NO_CUDA
-            if(use_spec){
+            if(use_spec && !spec_ngram){
                 float hbuf[8192];
                 q35_hidden(&R, hbuf);
                 q35_mtp_prefill_kv(&P, hbuf, toks[i], pos);
@@ -359,7 +367,32 @@ int main(int argc, char **argv){
         q35cupti_reset();          /* window the timeline to decode: prefill is a different regime */
         int ngen = 0;
 #ifndef QWEN_NO_CUDA
-        if(use_spec){
+        if(use_spec && spec_ngram){
+            Q35SpecStats st; memset(&st, 0, sizeof st);
+            const int cap = nt + n_pred + 8;
+            int *thist = (int*)malloc(sizeof(int)*(size_t)cap);
+            int *buf   = (int*)malloc(sizeof(int)*(size_t)(n_pred+8));
+            for(int i = 0; i < nt; i++) thist[i] = toks[i];
+            const int cur = sample(logits, c->vocab, temp, top_p, top_k, cbuf);
+            const int k = q35_spec_generate_ngram_cu(&Z, cur, pos, thist, nt, cap,
+                                                     buf, n_pred, eos, &st, temp, top_p, top_k,
+                                                     (int(*)(float*,int,float,float,int,void*))sample,
+                                                     cbuf, Q35_SPEC_W);
+            for(int i = 0; i < k && ngen < n_pred; i++){
+                if(buf[i] == eos || buf[i] == ids.eos) break;
+                const int np2 = tok_decode(&T, &buf[i], 1, piece, sizeof piece);
+                if(np2 > 0){ fwrite(piece, 1, (size_t)np2, stdout); sadd(&hist, piece, (size_t)np2); }
+                ngen++;
+            }
+            fflush(stdout);
+            pos = R.pos;
+            if(stats || getenv("QWEN_SPEC_STAT"))
+                fprintf(stderr, "\n  [spec ngram: %lld rounds, %lld accepted (%.2f/round),"
+                        " verify %.2fs, rollback %.3fs]\n", (long long)st.rounds,
+                        (long long)st.accepts, st.rounds ? (double)st.accepts/st.rounds : 0.0,
+                        st.t_verify, st.t_rollback);
+            free(thist); free(buf);
+        } else if(use_spec){
             /* One round drafts a token with the MTP head and verifies BOTH positions in a
              * single batched pass. The true token is always sampled from the trunk's own
              * logits, so accepting only on an exact match leaves the output distribution
@@ -455,7 +488,8 @@ int main(int argc, char **argv){
     if(use_gpu && G.moe){ const uint64_t h=G.moe_hit,m=G.moe_miss,cp=G.moe_cpu,tot=h+m+cp;
         if(tot) fprintf(stderr,"  moe experts: %.1f%% VRAM-hit, %.1f%% streamed, %.1f%% CPU  (%llu reads)\n",
             100.0*h/tot,100.0*m/tot,100.0*cp/tot,(unsigned long long)tot); }
-    if(use_spec){ q35_mtp_free(&P); q35cu_batch_free(&Z); }
+    if(use_spec && !spec_ngram) q35_mtp_free(&P);
+    if(use_spec) q35cu_batch_free(&Z);
     if(use_gpu) q35cu_model_free(&G);
 #endif
     q35_state_free(&R);

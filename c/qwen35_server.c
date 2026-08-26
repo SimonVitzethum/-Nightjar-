@@ -186,6 +186,7 @@ static const char  *g_default_model = NULL;
 static char       **g_argv = NULL;
 static int          g_srv_fd = -1;
 static const char *g_api_key = NULL;
+static int g_want_spec = 0;   /* per-request speculative decoding; see the chat endpoint */
 static int       g_n_ctx = 8192;
 static int       g_verbose = 1;
 static volatile sig_atomic_t g_abort = 0;
@@ -755,6 +756,12 @@ static void handle_chat(int fd, const char *body, size_t blen){
     int think = 1;
     if((jt = json_get(root, "reasoning")) && jt->t == J_BOOL) think = jt->boolean;
     if((jt = json_get(root, "enable_thinking")) && jt->t == J_BOOL) think = jt->boolean;
+    /* Speculative decoding is per-request because whether it pays is a property of the
+     * TEXT, not of the model: a draft only helps where the continuation is predictable.
+     * It cannot change what is produced -- every token is still drawn from the target's
+     * own logits and a proposal is kept only when it matches -- so this is purely a
+     * speed switch, and safe to leave in the user's hands. */
+    if((jt = json_get(root, "speculative")) && jt->t == J_BOOL) g_want_spec = jt->boolean;
     if(max_tokens <= 0 || max_tokens > 32768) max_tokens = 2048;
     jval *tools = json_get(root, "tools");
 
