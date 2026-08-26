@@ -169,6 +169,30 @@ int main(void){
     printf("\n");
     bench("lm head O=248320",          KQ_Q6_K, 2048, 248320, 0, 1);
 
+    /* rmsnorm: 81 calls per token, and CUPTI clocks it at 9.3 us for 8 KiB of data. */
+    {
+        const int n = 2048, R = 2000;
+        float *x = (float*)malloc(sizeof(float)*n), *w = (float*)malloc(sizeof(float)*n);
+        float *o = (float*)malloc(sizeof(float)*n), *oc = (float*)malloc(sizeof(float)*n);
+        for(int i = 0; i < n; i++){ x[i] = frnd(); w[i] = frnd(); }
+        void *dx = q35cu_alloc(sizeof(float)*n), *dw = q35cu_alloc(sizeof(float)*n);
+        void *dо = q35cu_alloc(sizeof(float)*n);
+        q35cu_h2d(dx, x, sizeof(float)*n); q35cu_h2d(dw, w, sizeof(float)*n);
+        double ss = 0; for(int i = 0; i < n; i++) ss += (double)x[i]*x[i];
+        const float r = 1.0f/sqrtf((float)(ss/n) + 1e-6f);
+        for(int i = 0; i < n; i++) oc[i] = x[i]*r*w[i];
+        q35cu_rmsnorm((float*)dо, (const float*)dx, (const float*)dw, n, 1e-6f);
+        q35cu_sync(); q35cu_d2h(o, dо, sizeof(float)*n);
+        for(int i = 0; i < 20; i++) q35cu_rmsnorm((float*)dо, (const float*)dx, (const float*)dw, n, 1e-6f);
+        q35cu_sync();
+        const double t0 = now();
+        for(int i = 0; i < R; i++) q35cu_rmsnorm((float*)dо, (const float*)dx, (const float*)dw, n, 1e-6f);
+        q35cu_sync();
+        printf("\n== elementwise ==\n  %-26s %8.2f us/call   rel %.1e\n",
+               "rmsnorm n=2048", (now()-t0)/R*1e6, relerr(oc, o, n));
+        q35cu_free(dx); q35cu_free(dw); q35cu_free(dо); free(x); free(w); free(o); free(oc);
+    }
+
     printf("\n%s\n", g_fail ? "FAIL" : "all shapes match the CPU dequant");
     q35cu_shutdown();
     return g_fail ? 1 : 0;

@@ -383,6 +383,9 @@ int main(int argc, char **argv){
 
     free(logits); free(cbuf); free(toks); free(hist.buf);
 #ifndef QWEN_NO_CUDA
+    if(use_gpu && G.moe && G.moe_pre_tot)
+        fprintf(stderr, "  moe pre-route: %.1f%% of the guess is truly routed (%llu probes)\n",
+                100.0*G.moe_pre_hit/G.moe_pre_tot, (unsigned long long)G.moe_pre_tot);
     if(use_gpu && G.moe){ const uint64_t h=G.moe_hit,m=G.moe_miss,cp=G.moe_cpu,tot=h+m+cp;
         if(tot) fprintf(stderr,"  moe experts: %.1f%% VRAM-hit, %.1f%% streamed, %.1f%% CPU  (%llu reads)\n",
             100.0*h/tot,100.0*m/tot,100.0*cp/tot,(unsigned long long)tot); }

@@ -35,6 +35,7 @@
 
 #define QK_K 256
 #define NWARP 8
+#define RMS_THR 256          /* rmsnorm block: shallower reduction beats more threads */
 #define NTHR  (NWARP*32)
 #define FULL  0xffffffffu
 
@@ -173,6 +174,25 @@ __device__ __forceinline__ float warp_max(float v){
 
 /* block reduction in double — matches the CPU reference's accumulator, so a norm mismatch
  * means a real bug and not the summation order. */
+__device__ __forceinline__ float warp_sum_f(float v){
+    #pragma unroll
+    for(int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(FULL, v, o);
+    return v;
+}
+__device__ __forceinline__ float block_sum_f(float v, float *sh){
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    v = warp_sum_f(v);
+    if(lane == 0) sh[wid] = v;
+    __syncthreads();
+    const int nw = (blockDim.x + 31) >> 5;
+    if(wid == 0){
+        float t = (lane < nw) ? sh[lane] : 0.f;
+        t = warp_sum_f(t);
+        if(lane == 0) sh[0] = t;
+    }
+    __syncthreads();
+    return sh[0];
+}
 __device__ __forceinline__ double block_sum(double v, double *sh){
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     v = warp_sum(v);
@@ -741,12 +761,26 @@ extern "C" int q35cu_gemv(float *y, const float *x, const void *W, int gt, int I
 
 /* ---------------- elementwise ---------------- */
 
+/* Called 81 times per token on 2048 floats -- 8 KiB of traffic that should cost well under a
+ * microsecond, and did not. Two reasons, both in the reduction rather than the data:
+ *
+ *   - it accumulated in double. FP64 runs at 1/64 of FP32 on this class of card, and the
+ *     cross-warp reduction is a chain of FP64 shuffles. The sum is over 2048 squares, where
+ *     float32 carries a relative error around 1e-6 -- three orders below the 5e-4 the engine
+ *     already tolerates against the CPU path.
+ *   - it launched 1024 threads for 2048 elements, so the block spanned 32 warps and the
+ *     reduction tree was five levels deep to sum two values per thread. Fewer, busier
+ *     threads make the tree shallower than the extra loop iterations cost.
+ *
+ * x is read twice rather than cached in registers: the loop's trip count is dynamic, so a
+ * per-thread array would be indexed dynamically and spill to local memory, which costs more
+ * than the second read of 8 KiB that L1 serves anyway. */
 __global__ static void k_rmsnorm(float *out, const float *x, const float *w, int n, float eps){
-    __shared__ double sh[32];
-    double s = 0;
-    for(int i = threadIdx.x; i < n; i += blockDim.x){ const double v = x[i]; s += v*v; }
-    s = block_sum(s, sh);
-    const float r = 1.0f/sqrtf((float)(s/n) + eps);
+    __shared__ float sh[32];
+    float s = 0.f;
+    for(int i = threadIdx.x; i < n; i += blockDim.x){ const float t = x[i]; s += t*t; }
+    s = block_sum_f(s, sh);
+    const float r = rsqrtf(s/(float)n + eps);
     for(int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i]*r*w[i];
 }
 
@@ -764,7 +798,7 @@ __global__ static void k_swiglu(float *g, const float *u, int n){
 }
 
 extern "C" void q35cu_rmsnorm(float *o, const float *x, const float *w, int n, float eps){
-    const int thr = n >= 1024 ? 1024 : ((n + 31)/32)*32;
+    const int thr = n >= RMS_THR ? RMS_THR : ((n + 31)/32)*32;
     k_rmsnorm<<<1, thr, 0, g_s>>>(o, x, w, n, eps);
 }
 extern "C" void q35cu_add(float *x, const float *t, int n){

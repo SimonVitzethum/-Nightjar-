@@ -53,6 +53,7 @@ typedef struct {
  * actually needs, and each one is ~15 us of the CPU spinning instead of running the FFN. It
  * is how you find out where the time goes, so it stays -- behind a switch. */
 static int g_q35_stage_timing = 0;
+static int g_q35_preroute = 0;   /* QWEN_MOE_PREROUTE=1: score routing on the pre-attention state */
 #define MOE_MAXG 16   /* n_expert_used + shared, with headroom */
 #define Q35_MOE_EV 2  /* copy/compute event slot; 0 and 1 belong to the dense split */
 
@@ -124,7 +125,18 @@ typedef struct {
     int64_t  moe_gb, moe_ub, moe_db;       /* bytes of one expert's gate/up/down slice */
     uint8_t *moe_gpool, *moe_upool, *moe_dpool;   /* device: nslot * gb/ub/db */
     int     *moe_slot_gid;                 /* [nslot] global expert id in each slot, -1 empty */
-    uint32_t*moe_slot_clk;                 /* [nslot] last-use tick (LRU) */
+    uint32_t*moe_slot_clk;                 /* [nslot] last-use tick, the LFU tie-break */
+    uint32_t*moe_freq;                     /* [n_layer*n_expert] aged use count */
+    int      moe_fill;                     /* next never-used slot while the cache warms */
+    uint32_t moe_rng;                      /* eviction sampling state (seeded, deterministic) */
+    uint32_t moe_admit;                    /* admissions since the last aging pass */
+    int      moe_lfu, moe_sample;          /* eviction policy knobs, see q35cu_moe_evict */
+    void    *moe_pblk;                     /* one device block holding pg|pu|pd|wt */
+    uint8_t *moe_hpblk;                    /* its pinned host twin */
+    size_t   moe_ptr_bytes;
+    float   *moe_xnpre;                    /* pre-attention normed state, for the prefetch probe */
+    float   *moe_prelog;                   /* host copy of its router logits */
+    uint64_t moe_pre_hit, moe_pre_tot;     /* how often the guess names a truly-routed expert */
     int     *moe_map;                      /* [n_layer*n_expert] -> slot, or -1 */
     uint32_t moe_clk;                      /* global LRU tick */
     int      moe_budget;                   /* max experts streamed to the GPU per layer */
@@ -889,17 +901,26 @@ static int q35cu_moe_setup(Q35Cu *G){
     G->moe_gg   = q35cu_work(G, MOE_MAXG*F);
     G->moe_uu   = q35cu_work(G, MOE_MAXG*F);
     G->moe_odg  = q35cu_work(G, MOE_MAXG*D);
-    G->moe_wdev = q35cu_work(G, MOE_MAXG);
-    G->moe_pg = q35cu_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_pu = q35cu_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_pd = q35cu_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_hpg = (void**)q35cu_host_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_hpu = (void**)q35cu_host_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_hpd = (void**)q35cu_host_alloc(MOE_MAXG*sizeof(void*));
-    G->moe_hwt = (float*)q35cu_host_alloc(MOE_MAXG*sizeof(float));
+    /* The three pointer arrays and the weight vector go up together, every layer, as four
+     * separate sub-kilobyte copies -- 160 per token, each carrying full copy-issue latency
+     * for ~100 bytes of payload. CUPTI charged them 0.86 ms/token in transfer plus the
+     * bubble in front. One contiguous block at fixed MOE_MAXG stride makes it one copy per
+     * layer; the stride has to stay fixed because the bundled kernel indexes by blockIdx.y,
+     * and the hit/miss split offsets into the same arrays. */
+    G->moe_ptr_bytes = 3*MOE_MAXG*sizeof(void*) + MOE_MAXG*sizeof(float);
+    G->moe_pblk  = q35cu_alloc(G->moe_ptr_bytes);
+    G->moe_hpblk = (uint8_t*)q35cu_host_alloc(G->moe_ptr_bytes);
+    G->moe_pg = G->moe_pblk;
+    G->moe_pu = (void*)((uint8_t*)G->moe_pblk + MOE_MAXG*sizeof(void*));
+    G->moe_pd = (void*)((uint8_t*)G->moe_pblk + 2*MOE_MAXG*sizeof(void*));
+    G->moe_wdev = (float*)((uint8_t*)G->moe_pblk + 3*MOE_MAXG*sizeof(void*));
+    G->moe_hpg = (void**)G->moe_hpblk;
+    G->moe_hpu = (void**)(G->moe_hpblk + MOE_MAXG*sizeof(void*));
+    G->moe_hpd = (void**)(G->moe_hpblk + 2*MOE_MAXG*sizeof(void*));
+    G->moe_hwt = (float*)(G->moe_hpblk + 3*MOE_MAXG*sizeof(void*));
     if(!G->moe_wg || !G->moe_wu || !G->moe_wd || !G->moe_acc_dev ||
        !G->moe_gg || !G->moe_uu || !G->moe_odg || !G->moe_wdev ||
-       !G->moe_pg || !G->moe_pu || !G->moe_pd || !G->moe_hpg || !G->moe_hpu || !G->moe_hpd || !G->moe_hwt){
+       !G->moe_pblk || !G->moe_hpblk){
         G->ok = 0; return 0; }
 
     /* shared experts, one per layer, always resident */
@@ -986,6 +1007,16 @@ static int q35cu_moe_setup(Q35Cu *G){
     for(int i = 0; i < nslot; i++){ G->moe_slot_gid[i] = -1; G->moe_slot_clk[i] = 0; }
     G->moe_map = (int*)malloc(sizeof(int)*(size_t)total);
     for(int i = 0; i < total; i++) G->moe_map[i] = -1;
+    G->moe_freq = (uint32_t*)calloc((size_t)total, sizeof(uint32_t));
+    G->moe_fill = 0; G->moe_rng = 0x9E3779B9u; G->moe_admit = 0;
+    { const char *e = getenv("QWEN_MOE_EVICT"); G->moe_lfu = (e && !strcmp(e, "lfu")); }
+    { const char *e = getenv("QWEN_MOE_PREROUTE"); g_q35_preroute = e && atoi(e); }
+    if(g_q35_preroute){
+        G->moe_xnpre = (float*)q35cu_alloc(sizeof(float)*(size_t)c->d_model);
+        G->moe_prelog = (float*)malloc(sizeof(float)*(size_t)(c->n_expert+1));
+        G->moe_pre_hit = G->moe_pre_tot = 0;
+    }
+    { const char *e = getenv("QWEN_MOE_SAMPLE"); G->moe_sample = e ? atoi(e) : 0; }
     G->moe_clk = 1;
     { const char *be = getenv("QWEN_MOE_STREAM"); G->moe_budget = be ? atoi(be) : c->n_expert_used; }
     fprintf(stderr, "  moe cache: %d slots x %.2f MiB = %.2f GiB (%.0f%% of %d experts), stream<=%d/layer\n",
@@ -1011,13 +1042,46 @@ static void q35cu_moe_shared_gpu(Q35Cu *G, const float *xn, int D, int F,
 
 /* Pick a cache slot for a miss: an empty one, else the least-recently-used. O(nslot), which is
  * dwarfed by the gemvs it precedes. */
+/* Sampled LFU, replacing a full LRU scan.
+ *
+ * Two things were wrong with scanning every slot for the oldest tick. It ran ~64 times per
+ * token, on the host, in the window between deciding a miss and issuing its DMA -- 2888
+ * slots x 64 is ~185k comparisons per token sitting directly on the critical path. And
+ * recency is the wrong signal here: expert demand is strongly skewed and stable across
+ * prompts, so LRU keeps spending lines on experts that are touched once and never again,
+ * while an expert that is hot every token is evicted the moment it goes briefly cold.
+ *
+ * Sampling a dozen slots and taking the least-used of them is the standard answer (Redis
+ * evicts this way) and fixes both: O(1) instead of O(nslot), and frequency instead of
+ * recency, which converges on pinning the hot set without any offline profiling pass.
+ * Counts are halved periodically so a workload change is not outvoted by history. */
+#define MOE_AGE_EVERY 65536u
+/* Defaults are exact-scan LRU, and that is a measured choice; see the table below. */
 static int q35cu_moe_evict(Q35Cu *G){
-    int best = 0; uint32_t oldest = 0xffffffffu;
-    for(int i = 0; i < G->moe_nslot; i++){
-        if(G->moe_slot_gid[i] < 0) return i;
-        if(G->moe_slot_clk[i] < oldest){ oldest = G->moe_slot_clk[i]; best = i; }
+    if(G->moe_fill < G->moe_nslot) return G->moe_fill++;   /* still warming: take a fresh one */
+    const int lfu = G->moe_lfu, ns = G->moe_nslot;
+    int nsample = G->moe_sample;
+    int best = -1; uint32_t bestf = 0xffffffffu, bestc = 0xffffffffu;
+    if(nsample <= 0 || nsample >= ns){
+        for(int i = 0; i < ns; i++){
+            const int gid = G->moe_slot_gid[i];
+            const uint32_t f = lfu ? (gid >= 0 ? G->moe_freq[gid] : 0u) : 0u;
+            if(f < bestf || (f == bestf && G->moe_slot_clk[i] < bestc)){
+                bestf = f; bestc = G->moe_slot_clk[i]; best = i;
+            }
+        }
+        return best < 0 ? 0 : best;
     }
-    return best;
+    for(int t = 0; t < nsample; t++){
+        G->moe_rng ^= G->moe_rng << 13; G->moe_rng ^= G->moe_rng >> 17; G->moe_rng ^= G->moe_rng << 5;
+        const int i = (int)(G->moe_rng % (uint32_t)ns);
+        const int gid = G->moe_slot_gid[i];
+        const uint32_t f = lfu ? (gid >= 0 ? G->moe_freq[gid] : 0u) : 0u;
+        if(f < bestf || (f == bestf && G->moe_slot_clk[i] < bestc)){
+            bestf = f; bestc = G->moe_slot_clk[i]; best = i;
+        }
+    }
+    return best < 0 ? 0 : best;
 }
 
 /* ---- hetero MoE decode: route on the host, then ONE grouped kernel per stage ----
@@ -1044,6 +1108,24 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
     int idx[64]; float wt[64];
     const float sh_gate = 1.f/(1.f+expf(-G->moe_logits_host[E]));
     q35_moe_topk(G->moe_logits_host, E, K, idx, wt);
+
+    /* Would routing on the PRE-attention state have named the same experts? If it largely
+     * does, a miss's DMA can be started before this layer's attention runs instead of after
+     * its router, which is the only way to widen the transfer window past the ~2 ms of
+     * in-layer work that does not depend on it. A wrong guess costs bandwidth, never
+     * correctness -- but only if the guess is mostly right, hence measuring first. */
+    if(g_q35_preroute && G->moe_xnpre){
+        q35cu_gemv(G->moe_logits_dev, G->moe_xnpre, G->moe_router_dev[il],
+                   L->ffn_gate_inp->type, D, E+1);
+        q35cu_d2h_compute(G->moe_prelog, G->moe_logits_dev, sizeof(float)*(E+1));
+        q35cu_sync();
+        int pidx[64]; float pwt[64];
+        q35_moe_topk(G->moe_prelog, E, K, pidx, pwt);
+        for(int a = 0; a < K; a++){
+            for(int b = 0; b < K; b++) if(pidx[a] == idx[b]){ G->moe_pre_hit++; break; }
+            G->moe_pre_tot++;
+        }
+    }
 
     const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
     const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
@@ -1075,6 +1157,7 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
 
     for(int j = 0; j < K; j++){
         const int e = idx[j], gid = il*E + e;
+        if(G->moe_freq) G->moe_freq[gid]++;
         if(resident){
             hg[nhit] = (const uint8_t*)G->moe_rexp_g[il] + (size_t)e*lgb;
             hu[nhit] = (const uint8_t*)G->moe_rexp_u[il] + (size_t)e*lub;
@@ -1105,6 +1188,11 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
         } else { cpu_e[ncpu] = e; cpu_w[ncpu] = wt[j]; ncpu++; }
     }
     if(nmiss) q35cu_copy_mark(Q35_MOE_EV);   /* compute may read these once the DMA lands */
+    if(G->moe_freq && (G->moe_admit += (uint32_t)nmiss) >= MOE_AGE_EVERY){
+        G->moe_admit = 0;
+        const int tot = c->n_layer * E;
+        for(int i = 0; i < tot; i++) G->moe_freq[i] >>= 1;   /* age, so history cannot outvote now */
+    }
 
     const int ng = nhit + nmiss;
     for(int i = 0; i < nhit; i++){
@@ -1116,12 +1204,7 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
         G->moe_hpd[nhit+i] = (void*)md[i]; G->moe_hwt[nhit+i] = mw[i];
     }
 
-    if(ng > 0){
-        q35cu_h2d_compute(G->moe_pg,   G->moe_hpg, (size_t)ng*sizeof(void*));
-        q35cu_h2d_compute(G->moe_pu,   G->moe_hpu, (size_t)ng*sizeof(void*));
-        q35cu_h2d_compute(G->moe_pd,   G->moe_hpd, (size_t)ng*sizeof(void*));
-        q35cu_h2d_compute(G->moe_wdev, G->moe_hwt, (size_t)ng*sizeof(float));
-    }
+    if(ng > 0) q35cu_h2d_compute(G->moe_pblk, G->moe_hpblk, G->moe_ptr_bytes);
 
     /* --- the transfer window: everything here reads only weights already in VRAM --- */
     if(nhit > 0){
@@ -1225,6 +1308,7 @@ static void q35_forward_cu(Q35Cu *G, Q35State *R, int tok, int pos, float *logit
             if(nl >= 0) q35cu_stream_issue(G, nl, 1 - G->stage_half);
         }
         q35cu_rmsnorm(G->xn, G->x, D->attn_norm, c->d_model, c->eps);
+        if(g_q35_preroute && G->moe_xnpre) q35cu_d2d(G->moe_xnpre, G->xn, sizeof(float)*c->d_model);
         { const double t0 = g_q35_stage_timing ? q35_clk() : 0;
           if(c->kind[il] == Q35_LAYER_ATTN) q35cu_attn_layer(G, R, il, R->attn_slot[il], pos);
           else                              q35cu_gdn_layer(G, il, R->gdn_slot[il]);
