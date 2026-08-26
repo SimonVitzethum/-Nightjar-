@@ -29,7 +29,7 @@
 #define BUF_SIZE  (1024*1024)
 #define BUF_ALIGN 8
 #define MAXNAME   192
-#define MAXKIND   128
+#define MAXKIND   256
 #define MAXIVAL   (1u<<22)          /* 4M ops; ~64 MiB. A 100-token run makes ~120k. */
 
 typedef struct { uint64_t s, e; int b; } Ival;
@@ -95,7 +95,9 @@ static void handle(CUpti_Activity *rec){
         CUpti_ActivityKernel12 *k = (CUpti_ActivityKernel12*)rec;
         if(k->start < g_t_reset) return;
         char nm[MAXNAME]; demangle(k->name ? k->name : "?", nm, sizeof nm);
-        Bucket *b = bucket(nm, k->streamId, 0);
+        char key[MAXNAME];
+        snprintf(key, sizeof key, "%s g=%d", nm, k->gridX * (k->gridY > 1 ? k->gridY : 1));
+        Bucket *b = bucket(key, k->streamId, 0);
         b->n++; b->dur += k->end - k->start;
         if(k->queued && k->submitted >= k->queued)   b->queue_lat  += k->submitted - k->queued;
         if(k->submitted && k->start >= k->submitted) b->submit_lat += k->start - k->submitted;
@@ -103,7 +105,11 @@ static void handle(CUpti_Activity *rec){
     } else if(rec->kind == CUPTI_ACTIVITY_KIND_MEMCPY){
         CUpti_ActivityMemcpy6 *m = (CUpti_ActivityMemcpy6*)rec;
         if(m->start < g_t_reset) return;
-        Bucket *b = bucket(copyname(m->copyKind), m->streamId, 1);
+        char key[MAXNAME];
+        const unsigned long long kb = (unsigned long long)m->bytes >> 10;
+        snprintf(key, sizeof key, "%s %s", copyname(m->copyKind),
+                 kb == 0 ? "<1KiB" : kb < 16 ? "1-16KiB" : kb < 256 ? "16-256KiB" : ">=256KiB");
+        Bucket *b = bucket(key, m->streamId, 1);
         b->n++; b->dur += m->end - m->start; b->bytes += m->bytes;
         add_ival(m->start, m->end, (int)(b - g_b));
     }

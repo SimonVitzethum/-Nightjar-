@@ -54,6 +54,7 @@ typedef struct {
  * is how you find out where the time goes, so it stays -- behind a switch. */
 static int g_q35_stage_timing = 0;
 #define MOE_MAXG 16   /* n_expert_used + shared, with headroom */
+#define Q35_MOE_EV 2  /* copy/compute event slot; 0 and 1 belong to the dense split */
 
 typedef struct {
     const Q35Model *M;
@@ -996,14 +997,16 @@ static int q35cu_moe_setup(Q35Cu *G){
 /* Compute one expert on the GPU from device weight pointers and accumulate w*expert(x) into
  * out (device). The three gemvs and the swiglu ride the compute stream, so successive calls
  * queue without a host sync — and the host is free to run CPU experts meanwhile. */
-static void q35cu_moe_expert_gpu(Q35Cu *G, const float *xn, int D, int F,
+/* The shared expert, left in G->moe_wd rather than accumulated. It reads only resident
+ * weights, so it belongs in the window where the streamed experts are still in flight --
+ * but the reduce that follows OVERWRITES out, so the accumulate has to happen after it. */
+static void q35cu_moe_shared_gpu(Q35Cu *G, const float *xn, int D, int F,
                                  const void *g, int tg, const void *u, int tu,
-                                 const void *d, int td, float w, float *out){
+                                 const void *d, int td){
     q35cu_gemv(G->moe_wg, xn, g, tg, D, F);
     q35cu_gemv(G->moe_wu, xn, u, tu, D, F);
     q35cu_swiglu(G->moe_wg, G->moe_wu, F);
     q35cu_gemv(G->moe_wd, G->moe_wg, d, td, F, D);
-    q35cu_scale_add(out, G->moe_wd, w, D);
 }
 
 /* Pick a cache slot for a miss: an empty one, else the least-recently-used. O(nslot), which is
@@ -1051,34 +1054,66 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
     const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
     const int resident = G->moe_rexp_g[il] != NULL;
 
-    int ng = 0, ncpu = 0, streamed = 0;
+    /* Hits and misses are split, and hits are ordered FIRST, because that ordering is the
+     * whole optimization: a miss's weights are still crossing PCIe when this loop ends, so
+     * everything that does not depend on them — the resident experts and the shared expert —
+     * has to be issued BEFORE the compute stream waits on the copy. The two groups must be
+     * contiguous because the bundled kernel indexes experts by blockIdx.y.
+     *
+     * Reordering changes which order the 8 expert outputs are summed in, so the layer output
+     * moves in the last bits or two. That is inherent to overlapping at all. */
+    int nhit = 0, nmiss = 0, ncpu = 0, streamed = 0;
     int cpu_e[64]; float cpu_w[64];
+    const uint8_t *hg[64], *hu[64], *hd[64], *mg[64], *mu[64], *md[64];
+    float hw[64], mw[64];
+
+    /* Do not let the copy stream overwrite a cache slot whose gemv is still running. Today
+     * the sync above already guarantees that; this makes the dependency explicit so it
+     * survives the sync's removal, which is the next step. The same hazard, unguarded, is
+     * what made a 145 MiB slice disagree with a 104 MiB one. */
+    q35cu_copy_join(Q35_MOE_EV);
+
     for(int j = 0; j < K; j++){
         const int e = idx[j], gid = il*E + e;
-        const uint8_t *pg, *pu, *pd;
         if(resident){
-            pg = (const uint8_t*)G->moe_rexp_g[il] + (size_t)e*lgb;
-            pu = (const uint8_t*)G->moe_rexp_u[il] + (size_t)e*lub;
-            pd = (const uint8_t*)G->moe_rexp_d[il] + (size_t)e*ldb;
-            G->moe_res++;
-        } else {
-            int slot = G->moe_nslot ? G->moe_map[gid] : -1;
-            if(slot >= 0){ G->moe_hit++; G->moe_slot_clk[slot] = ++G->moe_clk; }
-            else if(G->moe_nslot && streamed < G->moe_budget){
-                G->moe_miss++; streamed++;
-                slot = q35cu_moe_evict(G);
-                if(G->moe_slot_gid[slot] >= 0) G->moe_map[G->moe_slot_gid[slot]] = -1;
-                G->moe_slot_gid[slot] = gid; G->moe_map[gid] = slot; G->moe_slot_clk[slot] = ++G->moe_clk;
-                q35cu_h2d_compute(G->moe_gpool + (size_t)slot*G->moe_gb, bgate + (size_t)e*lgb, (size_t)lgb);
-                q35cu_h2d_compute(G->moe_upool + (size_t)slot*G->moe_ub, bup   + (size_t)e*lub, (size_t)lub);
-                q35cu_h2d_compute(G->moe_dpool + (size_t)slot*G->moe_db, bdown + (size_t)e*ldb, (size_t)ldb);
-            } else { cpu_e[ncpu] = e; cpu_w[ncpu] = wt[j]; ncpu++; continue; }
-            pg = G->moe_gpool + (size_t)slot*G->moe_gb;
-            pu = G->moe_upool + (size_t)slot*G->moe_ub;
-            pd = G->moe_dpool + (size_t)slot*G->moe_db;
+            hg[nhit] = (const uint8_t*)G->moe_rexp_g[il] + (size_t)e*lgb;
+            hu[nhit] = (const uint8_t*)G->moe_rexp_u[il] + (size_t)e*lub;
+            hd[nhit] = (const uint8_t*)G->moe_rexp_d[il] + (size_t)e*ldb;
+            hw[nhit] = wt[j]; nhit++; G->moe_res++;
+            continue;
         }
-        G->moe_hpg[ng] = (void*)pg; G->moe_hpu[ng] = (void*)pu; G->moe_hpd[ng] = (void*)pd;
-        G->moe_hwt[ng] = wt[j]; ng++;
+        int slot = G->moe_nslot ? G->moe_map[gid] : -1;
+        if(slot >= 0){
+            G->moe_hit++; G->moe_slot_clk[slot] = ++G->moe_clk;
+            hg[nhit] = G->moe_gpool + (size_t)slot*G->moe_gb;
+            hu[nhit] = G->moe_upool + (size_t)slot*G->moe_ub;
+            hd[nhit] = G->moe_dpool + (size_t)slot*G->moe_db;
+            hw[nhit] = wt[j]; nhit++;
+        } else if(G->moe_nslot && streamed < G->moe_budget){
+            G->moe_miss++; streamed++;
+            slot = q35cu_moe_evict(G);
+            if(G->moe_slot_gid[slot] >= 0) G->moe_map[G->moe_slot_gid[slot]] = -1;
+            G->moe_slot_gid[slot] = gid; G->moe_map[gid] = slot; G->moe_slot_clk[slot] = ++G->moe_clk;
+            /* on the COPY stream: this is the transfer that used to block every kernel behind it */
+            q35cu_h2d_async(G->moe_gpool + (size_t)slot*G->moe_gb, bgate + (size_t)e*lgb, (size_t)lgb);
+            q35cu_h2d_async(G->moe_upool + (size_t)slot*G->moe_ub, bup   + (size_t)e*lub, (size_t)lub);
+            q35cu_h2d_async(G->moe_dpool + (size_t)slot*G->moe_db, bdown + (size_t)e*ldb, (size_t)ldb);
+            mg[nmiss] = G->moe_gpool + (size_t)slot*G->moe_gb;
+            mu[nmiss] = G->moe_upool + (size_t)slot*G->moe_ub;
+            md[nmiss] = G->moe_dpool + (size_t)slot*G->moe_db;
+            mw[nmiss] = wt[j]; nmiss++;
+        } else { cpu_e[ncpu] = e; cpu_w[ncpu] = wt[j]; ncpu++; }
+    }
+    if(nmiss) q35cu_copy_mark(Q35_MOE_EV);   /* compute may read these once the DMA lands */
+
+    const int ng = nhit + nmiss;
+    for(int i = 0; i < nhit; i++){
+        G->moe_hpg[i] = (void*)hg[i]; G->moe_hpu[i] = (void*)hu[i];
+        G->moe_hpd[i] = (void*)hd[i]; G->moe_hwt[i] = hw[i];
+    }
+    for(int i = 0; i < nmiss; i++){
+        G->moe_hpg[nhit+i] = (void*)mg[i]; G->moe_hpu[nhit+i] = (void*)mu[i];
+        G->moe_hpd[nhit+i] = (void*)md[i]; G->moe_hwt[nhit+i] = mw[i];
     }
 
     if(ng > 0){
@@ -1086,20 +1121,37 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
         q35cu_h2d_compute(G->moe_pu,   G->moe_hpu, (size_t)ng*sizeof(void*));
         q35cu_h2d_compute(G->moe_pd,   G->moe_hpd, (size_t)ng*sizeof(void*));
         q35cu_h2d_compute(G->moe_wdev, G->moe_hwt, (size_t)ng*sizeof(float));
-        q35cu_gemv_grp(G->moe_gg, xn, 0, (const void* const*)G->moe_pg, tg, D, F, ng);
-        q35cu_gemv_grp(G->moe_uu, xn, 0, (const void* const*)G->moe_pu, tu, D, F, ng);
-        q35cu_swiglu(G->moe_gg, G->moe_uu, ng*F);
-        q35cu_gemv_grp(G->moe_odg, G->moe_gg, F, (const void* const*)G->moe_pd, td, F, D, ng);
-        q35cu_moe_reduce(out, G->moe_odg, G->moe_wdev, D, ng);   /* out = sum_j w_j * expert_j */
-    } else {
-        q35cu_zero(out, sizeof(float)*D);
     }
 
-    /* shared expert, its own per-layer type */
-    q35cu_moe_expert_gpu(G, xn, D, F,
+    /* --- the transfer window: everything here reads only weights already in VRAM --- */
+    if(nhit > 0){
+        q35cu_gemv_grp(G->moe_gg, xn, 0, (const void* const*)G->moe_pg, tg, D, F, nhit);
+        q35cu_gemv_grp(G->moe_uu, xn, 0, (const void* const*)G->moe_pu, tu, D, F, nhit);
+        q35cu_swiglu(G->moe_gg, G->moe_uu, nhit*F);
+        q35cu_gemv_grp(G->moe_odg, G->moe_gg, F, (const void* const*)G->moe_pd, td, F, D, nhit);
+    }
+    /* the shared expert is resident too, so its three gemvs widen the window at no cost.
+     * Only the accumulate has to wait, because the reduce below overwrites `out`. */
+    q35cu_moe_shared_gpu(G, xn, D, F,
                          G->moe_shg[il], L->ffn_gate_shexp->type,
                          G->moe_shu[il], L->ffn_up_shexp->type,
-                         G->moe_shd[il], L->ffn_down_shexp->type, sh_gate, out);
+                         G->moe_shd[il], L->ffn_down_shexp->type);
+    /* --- window closed --- */
+
+    if(nmiss > 0){
+        q35cu_stream_join(Q35_MOE_EV);       /* GPU-side wait; the host does not block */
+        float *gg = G->moe_gg + (size_t)nhit*F, *uu = G->moe_uu + (size_t)nhit*F;
+        q35cu_gemv_grp(gg, xn, 0, (const void* const*)G->moe_pg + nhit, tg, D, F, nmiss);
+        q35cu_gemv_grp(uu, xn, 0, (const void* const*)G->moe_pu + nhit, tu, D, F, nmiss);
+        q35cu_swiglu(gg, uu, nmiss*F);
+        q35cu_gemv_grp(G->moe_odg + (size_t)nhit*D, gg, F,
+                       (const void* const*)G->moe_pd + nhit, td, F, D, nmiss);
+    }
+
+    if(ng > 0) q35cu_moe_reduce(out, G->moe_odg, G->moe_wdev, D, ng);  /* out = sum_j w_j * expert_j */
+    else       q35cu_zero(out, sizeof(float)*D);
+    q35cu_scale_add(out, G->moe_wd, sh_gate, D);       /* the shared expert computed above */
+    if(nmiss) q35cu_compute_mark(Q35_MOE_EV);          /* these slots are free to overwrite */
 
     /* CPU tier (PCIe budget spent), concurrent with the GPU queue above */
     if(ncpu){
