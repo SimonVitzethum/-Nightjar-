@@ -61,6 +61,7 @@ static double g_hp_fwd = 0, g_hp_sync = 0, g_hp_route = 0, g_hp_issue = 0;
 static uint64_t g_hp_n = 0;
 #define MOE_MAXG 16   /* n_expert_used + shared, with headroom */
 #define Q35_MOE_EV 2  /* copy/compute event slot; 0 and 1 belong to the dense split */
+#define SPEC_W 8      /* longest draft window the expert-overlap probe reports */
 
 typedef struct {
     const Q35Model *M;
@@ -139,6 +140,9 @@ typedef struct {
     void    *moe_pblk;                     /* one device block holding pg|pu|pd|wt */
     uint8_t *moe_hpblk;                    /* its pinned host twin */
     size_t   moe_ptr_bytes;
+    uint64_t*moe_hist;                     /* [n_layer][SPEC_W][4] expert bitmaps, last W tokens */
+    uint64_t moe_uni[8], moe_uni_n;        /* union popcount over a window of W tokens */
+    int      moe_hpos, moe_overlap;
     float   *moe_xnpre;                    /* pre-attention normed state, for the prefetch probe */
     float   *moe_prelog;                   /* host copy of its router logits */
     uint64_t moe_pre_hit, moe_pre_tot;     /* how often the guess names a truly-routed expert */
@@ -1016,6 +1020,16 @@ static int q35cu_moe_setup(Q35Cu *G){
     G->moe_fill = 0; G->moe_rng = 0x9E3779B9u; G->moe_admit = 0;
     { const char *e = getenv("QWEN_MOE_EVICT"); G->moe_lfu = (e && !strcmp(e, "lfu")); }
     { const char *e = getenv("QWEN_MOE_PREROUTE"); g_q35_preroute = e && atoi(e); }
+    /* QWEN_MOE_OVERLAP=1: how many DISTINCT experts a window of W consecutive tokens touches
+     * per layer. This is the number that decides whether speculative decoding is affordable
+     * on a MoE: a draft of W tokens pays for the UNION of their expert sets, not W times one
+     * set, and the gap between those two is the whole question. */
+    { const char *e = getenv("QWEN_MOE_OVERLAP"); G->moe_overlap = e && atoi(e); }
+    if(G->moe_overlap){
+        G->moe_hist = (uint64_t*)calloc((size_t)c->n_layer*SPEC_W*4, sizeof(uint64_t));
+        for(int i = 0; i < 8; i++) G->moe_uni[i] = 0;
+        G->moe_uni_n = 0; G->moe_hpos = 0;
+    }
     if(g_q35_preroute){
         G->moe_xnpre = (float*)q35cu_alloc(sizeof(float)*(size_t)c->d_model);
         G->moe_prelog = (float*)malloc(sizeof(float)*(size_t)(c->n_expert+1));
@@ -1147,6 +1161,23 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
             for(int b = 0; b < K; b++) if(pidx[a] == idx[b]){ G->moe_pre_hit++; break; }
             G->moe_pre_tot++;
         }
+    }
+
+    if(G->moe_overlap){
+        if(il == 0) G->moe_hpos = (G->moe_hpos + 1) % SPEC_W;
+        uint64_t *slot = G->moe_hist + ((size_t)il*SPEC_W + G->moe_hpos)*4;
+        slot[0] = slot[1] = slot[2] = slot[3] = 0;
+        for(int a = 0; a < K; a++) slot[idx[a] >> 6] |= 1ull << (idx[a] & 63);
+        for(int w = 1; w <= SPEC_W; w++){
+            uint64_t u[4] = {0,0,0,0};
+            for(int b = 0; b < w; b++){
+                const uint64_t *h = G->moe_hist + ((size_t)il*SPEC_W + (G->moe_hpos + SPEC_W - b) % SPEC_W)*4;
+                for(int q = 0; q < 4; q++) u[q] |= h[q];
+            }
+            int pc = 0; for(int q = 0; q < 4; q++) pc += __builtin_popcountll(u[q]);
+            if(w <= 8) G->moe_uni[w-1] += (uint64_t)pc;
+        }
+        if(il == 0) G->moe_uni_n++;
     }
 
     if(g_q35_hostprof) g_hp_route += q35_clk()-t_route;

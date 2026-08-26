@@ -50,11 +50,21 @@ static float q35_logit_max(const float *logits, int V){
 }
 
 /* s = Σ exp((l-mx)/temp) over the whole vocabulary. */
+/* The thread cap is not cosmetic. This region is ~250k expf calls -- a few hundred
+ * microseconds -- and spreading it over every core costs more in spawn and barrier than the
+ * arithmetic it saves. Measured on a 16-core Ryzen 9950X, per sampled token:
+ *
+ *     1 thread   0.70 ms      4 threads  0.29 ms      16 threads  6.02 ms
+ *
+ * Twenty times worse at full width than at four. On the 8-core machine this was written on
+ * the effect is invisible; it only appears once there are enough cores to hurt. */
+#define Q35_SAMPLE_THREADS 4
 static double q35_softmax_denom(const float *logits, int V, float mx, float temp){
     const float inv = 1.0f/temp, lim = mx - Q35_SAMPLE_FLOOR*temp;
     double s = 0;
 #if defined(_OPENMP)
-    #pragma omp parallel for reduction(+:s) schedule(static) if(V > 65536)
+    #pragma omp parallel for reduction(+:s) schedule(static) \
+            num_threads(Q35_SAMPLE_THREADS) if(V > 65536)
 #endif
     for(int i = 0; i < V; i++)
         if(logits[i] > lim) s += (double)expf((logits[i]-mx)*inv);

@@ -82,6 +82,49 @@ static int sample(float *logits, int V, float temp, float top_p, int top_k, Cand
     return q35_sample(logits, V, temp, top_p, top_k, buf, urand);
 }
 
+/* Would an N-gram drafter have predicted what the model actually produced?
+ *
+ * This needs no verify path and no engine change: acceptance is a property of the token
+ * sequence, so it can be scored after the fact. Longest-suffix match against everything seen
+ * so far (prompt included), propose the continuation, and score it the way a real drafter is
+ * scored -- a chain stops at its first wrong token, so position w only counts if 0..w-1 were
+ * all right. What comes out is the expected number of accepted tokens per attempt, which is
+ * the number that decides whether the verify path is worth building at all. */
+static void ngram_report(const int *seq, int n, int nprompt){
+    enum { W = 8, MAXL = 8, MINL = 3 };
+    long long steps = 0, drafted = 0, hit[W]; double eacc = 0;
+    for(int w = 0; w < W; w++) hit[w] = 0;
+    for(int t = nprompt; t < n-1; t++){
+        steps++;
+        int best = -1;
+        for(int L = MAXL; L >= MINL && best < 0; L--){
+            if(t+1 < L) continue;
+            for(int p = t-1; p >= L-1; p--){          /* most recent match wins */
+                int ok = 1;
+                for(int k = 0; k < L; k++) if(seq[p-k] != seq[t-k]){ ok = 0; break; }
+                if(ok){ best = p+1; break; }
+            }
+        }
+        if(best < 0) continue;
+        drafted++;
+        for(int w = 0; w < W; w++){
+            if(best+w >= n || t+1+w >= n) break;
+            if(seq[best+w] != seq[t+1+w]) break;
+            hit[w]++;
+        }
+    }
+    if(!steps) return;
+    fprintf(stderr, "  ngram drafter (post-hoc, %lld decode steps):\n", steps);
+    fprintf(stderr, "    a draft was available at %.1f%% of steps\n", 100.0*drafted/steps);
+    for(int w = 0; w < W; w++){
+        eacc += (double)hit[w]/steps;
+        fprintf(stderr, "    depth %d: %5.1f%% of all steps accept this far%s\n",
+                w+1, 100.0*hit[w]/steps, w == 3 ? "   <- W=4" : "");
+    }
+    fprintf(stderr, "    expected accepted tokens per step: %.2f  (a step advances %.2f)\n",
+            eacc, 1.0+eacc);
+}
+
 /* ---------------- chat template ----------------
  * <|im_start|>role\n content <|im_end|>\n , then an open assistant turn. The role markers are
  * CONTROL tokens: tok_encode matches them literally and never merges them. */
@@ -306,6 +349,12 @@ int main(int argc, char **argv){
         const double tprefill = now()-tp0;
         if(nt > 8) fprintf(stderr, "\r%*s\r", 48, "");
 
+        int *nseq = NULL, nseqn = 0, nseqp = 0;
+        if(getenv("QWEN_NGRAM_STAT")){
+            nseq = (int*)malloc(sizeof(int)*(size_t)(nt + n_pred + 8));
+            for(int i = 0; i < nt; i++) nseq[i] = toks[i];
+            nseqn = nseqp = nt;
+        }
         const double td0 = now();
         q35cupti_reset();          /* window the timeline to decode: prefill is a different regime */
         int ngen = 0;
@@ -349,6 +398,7 @@ int main(int argc, char **argv){
 #endif
         for(; ngen < n_pred && !g_stop; ngen++){
             const int id = sample(logits, c->vocab, temp, top_p, top_k, cbuf);
+            if(nseq) nseq[nseqn++] = id;
             if(id == eos || id == ids.eos) break;
             const int np = tok_decode(&T, &id, 1, piece, sizeof piece);
             if(np > 0){ fwrite(piece, 1, (size_t)np, stdout); fflush(stdout); }
@@ -365,6 +415,7 @@ int main(int argc, char **argv){
             pos++;
         }
         const double tdec = now()-td0;
+        if(nseq){ ngram_report(nseq, nseqn, nseqp); free(nseq); }
         q35cupti_report(ngen);
         printf("\n");
         fprintf(stderr, "  [prefill %d tok in %.2fs = %.1f tok/s | decode %d tok in %.2fs = %.2f tok/s | ctx %d]\n",
@@ -388,6 +439,16 @@ int main(int argc, char **argv){
         fprintf(stderr, "  [host per token: forward %.2f ms | of which sync %.2f, topk %.2f,"
                 " issue %.2f]\n", 1e3*g_hp_fwd/g_hp_n, 1e3*g_hp_sync/g_hp_n,
                 1e3*g_hp_route/g_hp_n, 1e3*g_hp_issue/g_hp_n);
+    if(use_gpu && G.moe && G.moe_overlap && G.moe_uni_n){
+        const double L = (double)c->n_layer, T = (double)G.moe_uni_n;
+        fprintf(stderr, "  moe expert union per layer, draft window W (K=%d/token):\n", c->n_expert_used);
+        for(int w = 1; w <= 8; w++){
+            const double u = G.moe_uni[w-1]/(L*T);
+            fprintf(stderr, "    W=%d  %5.2f distinct  = %.2fx the weights of one token,"
+                    " %.2fx per drafted token\n", w, u, u/c->n_expert_used,
+                    u/(c->n_expert_used*(double)w));
+        }
+    }
     if(use_gpu && G.moe && G.moe_pre_tot)
         fprintf(stderr, "  moe pre-route: %.1f%% of the guess is truly routed (%llu probes)\n",
                 100.0*G.moe_pre_hit/G.moe_pre_tot, (unsigned long long)G.moe_pre_tot);
