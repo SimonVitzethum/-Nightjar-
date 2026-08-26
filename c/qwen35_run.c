@@ -29,6 +29,7 @@
 #include <sys/prctl.h>
 
 #include "qwen35_cpu.h"
+#include "qwen35_sample.h"
 #ifndef QWEN_NO_CUDA
 #include "qwen35_cu_spec.h"
 #endif
@@ -70,49 +71,15 @@ static void on_int(int s){ (void)s; g_stop = 1; }
 
 /* ---------------- sampling ---------------- */
 
-typedef struct { float p; int id; } Cand;
-static int cmp_desc(const void *a, const void *b){
-    const float x = ((const Cand*)a)->p, y = ((const Cand*)b)->p;
-    return x < y ? 1 : (x > y ? -1 : 0);
-}
-
 static uint64_t g_rng = 0x243F6A8885A308D3ull;
 static double urand(void){
     g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
-    return (double)(g_rng >> 11) / 9007199254740992.0;
+    return (double)(g_rng >> 11)/9007199254740992.0;
 }
-
-/* temperature, then top-k, then top-p — the order llama.cpp uses, and the order the model's
- * own shipped defaults were tuned against. */
+/* Cand, and the selection sampler behind it, live in qwen35_sample.h — sorting a
+ * 248320-entry vocabulary once per token cost more than the entire forward pass. */
 static int sample(float *logits, int V, float temp, float top_p, int top_k, Cand *buf){
-    if(temp <= 0.0f){
-        int best = 0;
-        for(int i = 1; i < V; i++) if(logits[i] > logits[best]) best = i;
-        return best;
-    }
-    float mx = -INFINITY;
-    for(int i = 0; i < V; i++) if(logits[i] > mx) mx = logits[i];
-    double s = 0;
-    for(int i = 0; i < V; i++){
-        const double e = exp((double)(logits[i]-mx)/temp);
-        buf[i].p = (float)e; buf[i].id = i; s += e;
-    }
-    const float inv = (float)(1.0/s);
-    for(int i = 0; i < V; i++) buf[i].p *= inv;
-    qsort(buf, V, sizeof(Cand), cmp_desc);
-
-    int n = V;
-    if(top_k > 0 && top_k < n) n = top_k;
-    if(top_p > 0 && top_p < 1.0f){
-        double acc = 0; int m = 0;
-        for(; m < n; m++){ acc += buf[m].p; if(acc >= top_p){ m++; break; } }
-        n = m ? m : 1;
-    }
-    double tot = 0;
-    for(int i = 0; i < n; i++) tot += buf[i].p;
-    double r = urand()*tot, c = 0;
-    for(int i = 0; i < n; i++){ c += buf[i].p; if(r <= c) return buf[i].id; }
-    return buf[0].id;
+    return q35_sample(logits, V, temp, top_p, top_k, buf, urand);
 }
 
 /* ---------------- chat template ----------------
