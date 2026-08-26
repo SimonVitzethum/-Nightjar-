@@ -1,0 +1,1 @@
+Large MoE models on hardware that cannot hold them. Pure C and CUDA, no framework: hot experts cached in VRAM, misses streamed over PCIe while resident ones compute, CPU takes the overflow. 35B-A3B at 55 tok/s on an 8 GB laptop GPU. One UI over many models.

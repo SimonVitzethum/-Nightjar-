@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
+
+# One model root for every engine in the runtime: $NIGHTJAR_MODELS, else /models, else
+# $HOME/Models. Overriding MODELS_DIR moves all of them at once.
+MODELS_DIR="${NIGHTJAR_MODELS:-$([ -d /models ] && echo /models || echo "$HOME/Models")}"
 # Start (or restart) the engine server, waiting for the previous instance to actually let go.
 # A CUDA context takes seconds to tear down and keeps both the port and the VRAM until it
 # does, so a fixed sleep races it — poll instead.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MODEL="${MODEL:-/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf}"
+MODEL="${MODEL:-"$MODELS_DIR"/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf}"
 # The switchable registry: Ornith (default) and the dense Qwen, selectable from the web UI's
 # model dropdown. MODEL stays the Qwen path for back-compat; override ORNITH/DEFMODEL to taste.
-ORNITH="${ORNITH:-/home/simon/Models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-A3B-Abliterated-Q4_K_M.gguf}"
+ORNITH="${ORNITH:-"$MODELS_DIR"/Ornith-1.5-35B-A3B/Ornith-1.5-35B-A3B-Abliterated-Q4_K_M.gguf}"
 DEFMODEL="${DEFMODEL:-ornith}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-8192}"      # the context still grows past this; see qwen35_server.c
-ENGINE_HOME="${ENGINE_HOME:-$HOME/QwenEngine}"
+ENGINE_HOME="${ENGINE_HOME:-$HOME/.nightjar}"
 LOG="${LOG:-$ENGINE_HOME/logs/server.log}"
 KV_SPILL="${KV_SPILL:-$ENGINE_HOME/kvspill}"
 

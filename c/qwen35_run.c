@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <sys/prctl.h>
 
+#include "models.h"
 #include "qwen35_cpu.h"
 #include "qwen35_sample.h"
 #ifndef QWEN_NO_CUDA
@@ -145,7 +146,17 @@ int main(int argc, char **argv){
     if(getenv("QWEN_HOSTPROF")) g_q35_hostprof = 1;
     const char *path = NULL, *prompt = NULL, *sysmsg = NULL;
     int n_pred = 256, top_k = -1, n_ctx = 0, raw = 0, cpu_only = 0, stats = 0, no_think = 0;
-    int spec = 1;
+    /* Speculative decoding defaults to the MTP head where one is installed, and to nothing
+     * where one is not.
+     *
+     * The n-gram fallback exists and works -- 2.96 of 4 drafted tokens accepted on a
+     * refactoring prompt -- but it measured 50.1 tok/s against 50.6 plain, so it is not a
+     * default, it is a switch. The limit is not draft quality: 2.96/4 is 74% acceptance,
+     * ABOVE the 69% the published MTP head reports. It is that a verify over S positions
+     * costs S sequential gated-delta-net updates, because the recurrence does not batch.
+     * On an attention-only model (GLM, Kimi) the same machinery should pay, and there the
+     * head is the right default. */
+    int spec = 1, spec_allow_ngram = 0;
     float temp = -1, top_p = -1;
     for(int i = 1; i < argc; i++){
         const char *a = argv[i];
@@ -162,6 +173,7 @@ int main(int argc, char **argv){
         else if(!strcmp(a,"--no-think")) no_think = 1;
         else if(!strcmp(a,"--cpu")) cpu_only = 1;
         else if(!strcmp(a,"--no-spec")) spec = 0;
+        else if(!strcmp(a,"--spec-ngram")) spec_allow_ngram = 1;
         else if(!strcmp(a,"--stats")) stats = 1;
         else if(!strcmp(a,"-h") || !strcmp(a,"--help")){
             fprintf(stderr, "usage: %s <model.gguf> [-p prompt] [-s system] [-n 256]"
@@ -238,18 +250,31 @@ int main(int argc, char **argv){
     Q35CuBatch Z; Q35Mtp P; int use_spec = 0, spec_ngram = 0;
     if(use_gpu){
         q35cu_state_reset(&G);
-        /* Two drafters behind one verify path. The MTP head is the better source where one
-         * exists; this model ships none that is trained, so n-gram is the fallback that needs
-         * nothing at all. Either way the TARGET does the sampling, so neither can change what
-         * comes out -- only how fast it arrives. */
-        if(spec && q35cu_batch_init(&Z, &G, &R, Q35_SPEC_W + 1) && !q35_mtp_init(&P, &R)){
-            use_spec = spec_ngram = 1;
-            fprintf(stderr, "  speculative decode: n-gram drafter W=%d, +%.0f MiB VRAM"
-                    " (no trained MTP head in this model)\n", Q35_SPEC_W, Z.vram/1048576.0);
-        } else if(spec && use_gpu && Z.xB && q35_mtp_init(&P, &R)){
-            use_spec = 1;
-            fprintf(stderr, "  speculative decode: MTP draft head, +%.0f MiB VRAM\n",
-                    Z.vram/1048576.0);
+        /* Two drafters behind one verify path, and the target does the sampling either way,
+         * so neither can change what comes out -- only how fast it arrives.
+         *
+         * The MTP head is the default where one is installed. The n-gram fallback works
+         * (2.96 of 4 drafted tokens accepted on a refactoring prompt) but is opt-in, because
+         * on this architecture it measured 50.1 tok/s against 50.6 plain. Draft quality is
+         * not the limit: 74% acceptance is ABOVE the 69% the published MTP head reports. A
+         * verify over S positions costs S sequential gated-delta-net updates, because the
+         * recurrence does not batch. On an attention-only model the same machinery pays. */
+        const char *mtp = nj_mtp_path(path);
+        if(spec && q35cu_batch_init(&Z, &G, &R, Q35_SPEC_W + 1)){
+            if(q35_mtp_init(&P, &R)){
+                use_spec = 1;
+                fprintf(stderr, "  speculative decode: MTP draft head, +%.0f MiB VRAM\n",
+                        Z.vram/1048576.0);
+            } else if(spec_allow_ngram || getenv("QWEN_SPEC_NGRAM")){
+                use_spec = spec_ngram = 1;
+                fprintf(stderr, "  speculative decode: n-gram drafter W=%d, +%.0f MiB VRAM\n",
+                        Q35_SPEC_W, Z.vram/1048576.0);
+            } else {
+                q35cu_batch_free(&Z);
+                if(mtp) fprintf(stderr, "  mtp head at %s is not loadable yet — plain decode\n", mtp);
+                else    fprintf(stderr, "  no trained MTP head; plain decode"
+                                        " (--spec-ngram for the n-gram drafter)\n");
+            }
         } else if(spec){
             fprintf(stderr, "  speculative decode unavailable — plain decode\n");
         }

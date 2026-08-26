@@ -22,6 +22,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "../models.h"
 #include "../qwen35_cpu.h"
 
 static int cmp_desc(const void *a, const void *b){
@@ -31,7 +32,7 @@ static int cmp_desc(const void *a, const void *b){
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     Q35Model M;
     if(!q35_open(&M, path)){ printf("open failed\n"); return 1; }
     Q35Resident RES;

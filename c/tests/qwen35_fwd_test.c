@@ -17,6 +17,7 @@
 #include <math.h>
 #include <time.h>
 
+#include "../models.h"
 #include "../qwen35_cpu.h"
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
@@ -30,7 +31,7 @@ static int cmp_cand(const void *a, const void *b){
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     const char *idlist = argc > 2 ? argv[2] : "9707";     /* "Hello" */
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--tile")) q35_set_gdn_head_map(1);

@@ -20,6 +20,7 @@
 #include <math.h>
 #include <time.h>
 
+#include "../models.h"
 #include "../qwen35_cpu.h"
 #include "../qwen35_cuda.h"
 
@@ -58,7 +59,7 @@ static void *up(const Q35Model *M, const gguf_tensor *T){
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
 
     if(!q35cu_init(0)){ printf("cuda unavailable: %s\n", q35cu_error()); return 77; }
     printf("device: %s\n", q35cu_name());

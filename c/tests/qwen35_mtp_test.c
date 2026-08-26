@@ -17,6 +17,7 @@
 #include <math.h>
 #include <time.h>
 
+#include "../models.h"
 #include "../qwen35_mtp.h"
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
@@ -24,7 +25,7 @@ static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     const int n_gen = argc > 2 ? atoi(argv[2]) : 24;
 
     Q35Model M;

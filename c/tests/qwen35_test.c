@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../models.h"
 #include "../qwen35_plan.h"
 
 static int fails = 0;
@@ -24,7 +25,7 @@ static void ck(int cond, const char *what, long long got, long long want){
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     int n_ctx = argc > 2 ? atoi(argv[2]) : 250000;
 
     Q35Model M;

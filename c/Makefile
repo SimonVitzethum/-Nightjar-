@@ -52,7 +52,10 @@ CUPTI_CF   := -DHAVE_CUPTI
 CUPTI_LIBS := -L$(CUPTI_DIR)/lib -lcupti
 endif
 
-MODEL ?= /home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf
+# Models live under one root, not in anyone\'s home: $NIGHTJAR_MODELS, else /models,
+# else $HOME/Models. See models.h -- the C side resolves the same order.
+MODELS_DIR ?= $(shell test -d /models && echo /models || echo $(HOME)/Models)
+MODEL      ?= $(MODELS_DIR)/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf
 # Everything the engine owns at runtime lives under one directory in $HOME, not inside this
 # checkout: projects the agent works in, the KV spill tier, logs. A coding agent whose
 # workspace is the directory holding its own source is a footgun waiting for the first
@@ -60,7 +63,7 @@ MODEL ?= /home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M
 #
 # The KV spill tier MUST NOT point at tmpfs — that would put the "disk" tier back in the RAM it
 # exists to free. $HOME is on disk; kv_tier.h warns if it ever is not.
-ENGINE_HOME ?= $(HOME)/QwenEngine
+ENGINE_HOME ?= $(HOME)/.nightjar
 KV_SPILL    ?= $(ENGINE_HOME)/kvspill
 
 HDRS = qwen35.h qwen35_plan.h qwen35_cpu.h qwen35_batch.h qwen35_mtp.h kv_tier.h kv_tier_simd.h \

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "../models.h"
 #include "../qwen35_hetero.h"
 
 static int g_fail = 0;
@@ -39,7 +40,7 @@ static void frand(float *v, int n, unsigned seed){
 
 int main(int argc, char **argv){
     const char *path = argc > 1 ? argv[1]
-        : "/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+        : nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     const int n_ctx = argc > 2 ? atoi(argv[2]) : 512;
     int kv_fmt = Q35_KV_Q8_0;
     for(int i = 1; i < argc; i++) if(!strcmp(argv[i], "--kv-f16")) kv_fmt = Q35_KV_F16;

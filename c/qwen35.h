@@ -57,6 +57,7 @@
 #include <unistd.h>
 
 #include "gguf.h"
+#include "nj_arch.h"
 #include "kquant.h"
 
 #define Q35_MAX_LAYER 128
@@ -216,7 +217,13 @@ static int q35_cfg(Q35Model *M){
      * llama.cpp prefixes each key with the architecture name, so the prefix is the arch. */
     c->is_moe = !strcmp(arch, "qwen35moe");
     if(strcmp(arch, "qwen35") != 0 && !c->is_moe){
-        fprintf(stderr, "qwen35: architecture is \"%s\", not qwen35 or qwen35moe\n", arch);
+        /* Name the architecture and which engine owns it. "failed to load" sends someone
+         * hunting a corrupt file; "glm5 needs the colibri engine" is actionable. */
+        fprintf(stderr, "qwen35: architecture is \"%s\", which this engine does not run.\n"
+                        "  %s\n", arch,
+                nj_arch_from_name(arch) != NJ_ARCH_UNKNOWN
+                  ? "It belongs to another engine in this runtime -- see docs/ARCHITECTURE.md."
+                  : "No engine in this runtime claims it.");
         return 0;
     }
     const char *P = c->is_moe ? "qwen35moe" : "qwen35";

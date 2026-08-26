@@ -19,13 +19,14 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include "../models.h"
 #include "../qwen35_cu_spec.h"
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 static double score(const float*a,const float*b,int n){ double d=0,r=0;
     for(int i=0;i<n;i++){ double e=(double)a[i]-b[i]; d+=e*e; r+=(double)b[i]*b[i]; }
     return r==0?(d==0?0:INFINITY):sqrt(d/r); }
 int main(int argc,char**argv){
-    const char *path = argc>1?argv[1]:"/home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf";
+    const char *path = argc>1?argv[1]:nj_model_path("Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf");
     Q35Model M; if(!q35_open(&M,path)) return 1;
     Q35State R; const int n_ctx=4096;
     q35_state_init_ex(&R,&M,n_ctx,Q35_KV_Q8_0,q35_kv_bytes_per_token(&M.c,Q35_KV_Q8_0)*n_ctx+(32<<20),getenv("QWEN_KV_SPILL"),4096);
