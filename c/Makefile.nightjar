@@ -133,7 +133,7 @@ qwen35_server: qwen35_server.c $(HDRS)
 endif
 
 # Fast checks. kquant_simd needs no model; the others read geometry only.
-nightjar-test: all
+nightjar-test: nightjar-all
 	@echo "=== geometry + placement plan ===" && ./tests/qwen35_test "$(MODEL)"
 	@echo "=== k-quant SIMD kernels ==="      && ./tests/kquant_simd_test
 	@echo "=== agent tools: gate, confinement, budget ===" && ./tests/harness_test | tail -3
@@ -148,7 +148,7 @@ nightjar-test: all
 #     not just the one speculation happens to use
 #  5. greedy speculation must reproduce greedy decode TOKEN FOR TOKEN — otherwise the
 #     rollback is wrong
-nightjar-gates: all
+nightjar-gates: nightjar-all
 	@mkdir -p "$(KV_SPILL)"
 	@echo "=== 1. device kernels ==="   && ./tests/qwen35_cuda_test "$(MODEL)"
 	@echo "=== 2. layers ==="           && ./tests/qwen35_hetero_test "$(MODEL)"
