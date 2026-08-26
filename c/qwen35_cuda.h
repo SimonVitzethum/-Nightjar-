@@ -77,6 +77,8 @@ int q35cu_zero(void *p, size_t n);
 
 int q35cu_gemv(float *y, const float *x, const void *W, int gtype, int I, int O);
 int q35cu_gemv_grp(float *y, const float *x, int xstride, const void * const *Wp, int gt, int I, int O, int n);
+int q35cu_gemv_grp_x(float *y, const float *x, int xstride, const void * const *Wp, int gt, int I, int O, int n, const int *xidx);
+void q35cu_moe_reduce_b(float *out, const float *od, const float *w, const int *ti, int D, int np, int S);
 void q35cu_moe_reduce(float *out, const float *od, const float *w, int D, int n);
 int q35cu_gemm(float *y, const float *x, const void *W, int gtype, int I, int O, int S);
 int q35cu_type_ok(int gtype);

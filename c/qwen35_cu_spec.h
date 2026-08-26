@@ -54,7 +54,17 @@ typedef struct {
     Q35Batch B;
     int      snap_after;          /* -1 = off */
     int64_t  vram;
+
+    /* batched MoE: S*K (expert, token) pairs per layer, ordered by expert */
+    float *moe_logB, *moe_gg, *moe_uu, *moe_odg, *moe_shB, *moe_wdev;
+    float *moe_loghB, *moe_hwt;
+    void  *moe_pg, *moe_pu, *moe_pd;
+    int   *moe_tidev, *moe_hti;
+    void **moe_hpg, **moe_hpu, **moe_hpd;
 } Q35CuBatch;
+
+#define Q35_SPEC_SMAX 8                    /* longest draft this path will verify */
+#define MOE_MAXG_B (Q35_SPEC_SMAX*16)      /* S_max * n_expert_used, with headroom */
 
 static int q35cu_batch_init(Q35CuBatch *Z, Q35Cu *G, Q35State *R, int S_max){
     memset(Z, 0, sizeof *Z);
@@ -83,10 +93,43 @@ static int q35cu_batch_init(Q35CuBatch *Z, Q35Cu *G, Q35State *R, int S_max){
     Z->htB  = (float*)q35cu_host_alloc(D*4);
     Z->stB  = (float*)q35cu_alloc(D*4);
     Z->vram += (int64_t)D*4;
-    Z->hgB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
-    Z->huB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
+    /* the split-FFN scratch belongs to the dense path; a MoE model never enters it, and on
+     * this one d_ff is the DENSE width, so allocating it was both useless and large. */
+    if(!c->is_moe){
+        Z->hgB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
+        Z->huB  = (float*)q35cu_host_alloc((size_t)c->d_ff*S_max*4);
+    }
+    if(c->is_moe && G->moe){
+        const int F = c->d_ff_exp, E = c->n_expert;
+        Z->moe_logB  = (float*)q35cu_alloc((size_t)S_max*(E+1)*4);
+        Z->moe_gg    = (float*)q35cu_alloc((size_t)MOE_MAXG_B*F*4);
+        Z->moe_uu    = (float*)q35cu_alloc((size_t)MOE_MAXG_B*F*4);
+        Z->moe_odg   = (float*)q35cu_alloc((size_t)MOE_MAXG_B*c->d_model*4);
+        Z->moe_shB   = (float*)q35cu_alloc(D*4);
+        Z->moe_wdev  = (float*)q35cu_alloc(MOE_MAXG_B*4);
+        Z->moe_tidev = (int*)  q35cu_alloc(MOE_MAXG_B*4);
+        Z->moe_pg    = q35cu_alloc(MOE_MAXG_B*sizeof(void*));
+        Z->moe_pu    = q35cu_alloc(MOE_MAXG_B*sizeof(void*));
+        Z->moe_pd    = q35cu_alloc(MOE_MAXG_B*sizeof(void*));
+        Z->vram += (int64_t)((size_t)S_max*(E+1) + 2*(size_t)MOE_MAXG_B*F
+                             + (size_t)MOE_MAXG_B*c->d_model + D + 2*MOE_MAXG_B)*4
+                 + 3*(int64_t)MOE_MAXG_B*(int64_t)sizeof(void*);
+        Z->moe_loghB = (float*)q35cu_host_alloc((size_t)S_max*(E+1)*4);
+        Z->moe_hwt   = (float*)q35cu_host_alloc(MOE_MAXG_B*4);
+        Z->moe_hti   = (int*)  q35cu_host_alloc(MOE_MAXG_B*4);
+        Z->moe_hpg   = (void**)q35cu_host_alloc(MOE_MAXG_B*sizeof(void*));
+        Z->moe_hpu   = (void**)q35cu_host_alloc(MOE_MAXG_B*sizeof(void*));
+        Z->moe_hpd   = (void**)q35cu_host_alloc(MOE_MAXG_B*sizeof(void*));
+        if(!Z->moe_logB || !Z->moe_gg || !Z->moe_uu || !Z->moe_odg || !Z->moe_shB
+           || !Z->moe_wdev || !Z->moe_tidev || !Z->moe_pg || !Z->moe_pu || !Z->moe_pd
+           || !Z->moe_loghB || !Z->moe_hwt || !Z->moe_hti
+           || !Z->moe_hpg || !Z->moe_hpu || !Z->moe_hpd){
+            fprintf(stderr, "qwen35_cu_spec: out of memory for the batched MoE (%s)\n", q35cu_error());
+            return 0;
+        }
+    }
     if(!Z->xB || !Z->xnB || !Z->tB || !Z->logitsB || !Z->snapS || !Z->snapConv
-       || !Z->hxnB || !Z->htB || !Z->hgB || !Z->huB || !Z->stB
+       || !Z->hxnB || !Z->htB || !Z->stB || (!c->is_moe && (!Z->hgB || !Z->huB))
        || (G->n_ffn_gpu && (!Z->gB || !Z->uB))){
         fprintf(stderr, "qwen35_cu_spec: out of memory (%s)\n", q35cu_error());
         return 0;
@@ -179,10 +222,126 @@ static int q35cu_ffn_split_b(Q35CuBatch *Z, int il, const float *xnB, float *tB,
     return 1;
 }
 
+/* ---------------- batched MoE ----------------
+ *
+ * This is what speculative decoding on this model actually needs, and what the batch path
+ * did not have: q35cu_ffn_b handled dense FFN only, so a draft could never be verified.
+ *
+ * The shape of the problem is different from the dense case. Each of the S tokens routes to
+ * its own K experts, so the layer is not S copies of one gemv but a set of (expert, token)
+ * PAIRS -- S*K of them. Two facts decide the layout:
+ *
+ *   - the pairs are sorted by expert, so that consecutive pairs read the same weights and the
+ *     repeats come out of L2. Measured on this model, a four-token window touches 21.4
+ *     distinct experts rather than 32, so a third of the weight traffic is repeats worth
+ *     catching.
+ *   - the bundled kernel indexes weights by blockIdx.y, and now takes an xidx array saying
+ *     which token row each pair reads. That is the whole mechanism: one launch covers every
+ *     pair regardless of which token it belongs to.
+ *
+ * The reduce then scatters back per token. Ordering by expert means the reduce has to scan
+ * the pair list, but S*K is 32 -- far cheaper than giving up the L2 reuse.
+ */
+static void q35cu_moe_layer_b(Q35CuBatch *Z, int il, const float *xnB, float *outB, int S){
+    Q35Cu *G = Z->G;
+    const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
+    const Q35Layer *L = &M->L[il];
+    const int D = c->d_model, F = c->d_ff_exp, E = c->n_expert, K = c->n_expert_used;
+    const int np_max = S*K;
+    if(np_max > MOE_MAXG_B) return;
+
+    /* route every token in one gemm, then top-k on the host per token */
+    q35cu_gemm(Z->moe_logB, xnB, G->moe_router_dev[il], L->ffn_gate_inp->type, D, E+1, S);
+    q35cu_d2h_compute(Z->moe_loghB, Z->moe_logB, (size_t)S*(E+1)*sizeof(float));
+    q35cu_sync();
+
+    const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
+    const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
+    const int64_t lub = (int64_t)F * kq_row_bytes(tu, D);
+    const int64_t ldb = (int64_t)D * kq_row_bytes(td, F);
+    const uint8_t *bgate = (const uint8_t*)q35_wdata(M, L->ffn_gate_exps);
+    const uint8_t *bup   = (const uint8_t*)q35_wdata(M, L->ffn_up_exps);
+    const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
+    const int resident = G->moe_rexp_g[il] != NULL;
+
+    /* collect the pairs, sorted by expert id: insertion sort over at most S*K entries */
+    int    pe[MOE_MAXG_B], pt[MOE_MAXG_B]; float pw[MOE_MAXG_B], shg[Q35_SPEC_SMAX];
+    int    np = 0;
+    for(int s = 0; s < S; s++){
+        const float *lg = Z->moe_loghB + (size_t)s*(E+1);
+        shg[s] = 1.f/(1.f+expf(-lg[E]));
+        int idx[64]; float wt[64];
+        q35_moe_topk(lg, E, K, idx, wt);
+        for(int k = 0; k < K; k++){
+            int j = np++;
+            while(j > 0 && pe[j-1] > idx[k]){ pe[j]=pe[j-1]; pt[j]=pt[j-1]; pw[j]=pw[j-1]; j--; }
+            pe[j] = idx[k]; pt[j] = s; pw[j] = wt[k];
+        }
+    }
+
+    /* resolve each pair to VRAM, streaming the misses on the copy stream as the single-token
+     * path does. Repeated experts resolve to the same slot, so the copy happens once. */
+    q35cu_copy_join(Q35_MOE_EV);
+    int nmiss = 0;
+    for(int j = 0; j < np; j++){
+        const int e = pe[j], gid = il*E + e;
+        const uint8_t *pg, *pu, *pd;
+        if(resident){
+            pg = (const uint8_t*)G->moe_rexp_g[il] + (size_t)e*lgb;
+            pu = (const uint8_t*)G->moe_rexp_u[il] + (size_t)e*lub;
+            pd = (const uint8_t*)G->moe_rexp_d[il] + (size_t)e*ldb;
+            G->moe_res++;
+        } else {
+            int slot = G->moe_nslot ? G->moe_map[gid] : -1;
+            if(slot >= 0){ G->moe_hit++; G->moe_slot_clk[slot] = ++G->moe_clk; }
+            else if(G->moe_nslot){
+                G->moe_miss++; nmiss++;
+                slot = q35cu_moe_evict(G);
+                if(G->moe_slot_gid[slot] >= 0) G->moe_map[G->moe_slot_gid[slot]] = -1;
+                G->moe_slot_gid[slot] = gid; G->moe_map[gid] = slot; G->moe_slot_clk[slot] = ++G->moe_clk;
+                q35cu_h2d_async(G->moe_gpool + (size_t)slot*G->moe_gb, bgate + (size_t)e*lgb, (size_t)lgb);
+                q35cu_h2d_async(G->moe_upool + (size_t)slot*G->moe_ub, bup   + (size_t)e*lub, (size_t)lub);
+                q35cu_h2d_async(G->moe_dpool + (size_t)slot*G->moe_db, bdown + (size_t)e*ldb, (size_t)ldb);
+            } else return;                       /* no cache: caller falls back */
+            pg = G->moe_gpool + (size_t)slot*G->moe_gb;
+            pu = G->moe_upool + (size_t)slot*G->moe_ub;
+            pd = G->moe_dpool + (size_t)slot*G->moe_db;
+        }
+        Z->moe_hpg[j] = (void*)pg; Z->moe_hpu[j] = (void*)pu; Z->moe_hpd[j] = (void*)pd;
+        Z->moe_hwt[j] = pw[j]; Z->moe_hti[j] = pt[j];
+    }
+    if(nmiss) q35cu_copy_mark(Q35_MOE_EV);
+
+    q35cu_h2d_compute(Z->moe_pg, Z->moe_hpg, (size_t)np*sizeof(void*));
+    q35cu_h2d_compute(Z->moe_pu, Z->moe_hpu, (size_t)np*sizeof(void*));
+    q35cu_h2d_compute(Z->moe_pd, Z->moe_hpd, (size_t)np*sizeof(void*));
+    q35cu_h2d_compute(Z->moe_wdev, Z->moe_hwt, (size_t)np*sizeof(float));
+    q35cu_h2d_compute(Z->moe_tidev, Z->moe_hti, (size_t)np*sizeof(int));
+
+    /* the shared expert is resident, so it runs while the misses are still in flight */
+    for(int s = 0; s < S; s++)
+        q35cu_moe_shared_gpu(G, xnB + (size_t)s*D, D, F,
+                             G->moe_shg[il], L->ffn_gate_shexp->type,
+                             G->moe_shu[il], L->ffn_up_shexp->type,
+                             G->moe_shd[il], L->ffn_down_shexp->type),
+        q35cu_d2d(Z->moe_shB + (size_t)s*D, G->moe_wd, sizeof(float)*D);
+    if(nmiss) q35cu_stream_join(Q35_MOE_EV);
+
+    q35cu_gemv_grp_x(Z->moe_gg, xnB, D, (const void* const*)Z->moe_pg, tg, D, F, np, (const int*)Z->moe_tidev);
+    q35cu_gemv_grp_x(Z->moe_uu, xnB, D, (const void* const*)Z->moe_pu, tu, D, F, np, (const int*)Z->moe_tidev);
+    q35cu_swiglu(Z->moe_gg, Z->moe_uu, np*F);
+    q35cu_gemv_grp(Z->moe_odg, Z->moe_gg, F, (const void* const*)Z->moe_pd, td, F, D, np);
+    q35cu_moe_reduce_b(outB, Z->moe_odg, Z->moe_wdev, (const int*)Z->moe_tidev, D, np, S);
+    for(int s = 0; s < S; s++)
+        q35cu_scale_add(outB + (size_t)s*D, Z->moe_shB + (size_t)s*D, shg[s], D);
+    if(nmiss) q35cu_compute_mark(Q35_MOE_EV);
+}
+
 static void q35cu_ffn_b(Q35CuBatch *Z, int il, const float *xnB, float *tB, int S){
     Q35Cu *G = Z->G;
     const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
     const Q35CuLayer *D = &G->L[il]; const Q35Layer *L = &M->L[il];
+    if(c->is_moe && G->moe){ q35cu_moe_layer_b(Z, il, xnB, tB, S); return; }
     if(D->ffn_gpu){
         q35cu_gemm(Z->gB, xnB, D->ffn_gate, L->ffn_gate->type, c->d_model, c->d_ff, S);
         q35cu_gemm(Z->uB, xnB, D->ffn_up,   L->ffn_up->type,   c->d_model, c->d_ff, S);

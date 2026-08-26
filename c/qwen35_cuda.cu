@@ -669,14 +669,15 @@ extern "C" int q35cu_gemm(float *y, const float *x, const void *W, int gt, int I
  * same input (gate/up over xn); xstride=I => each expert reads its own row (down over the
  * per-expert hidden vector). */
 __global__ static void k_gemv_q4k_grp(float *y, const float *x, int xstride,
-                                      const uint8_t * const *Wp, int I, int O, int n){
+                                      const uint8_t * const *Wp, int I, int O, int n,
+                                      const int *xidx){
     const int j = blockIdx.y; if(j >= n) return;
     const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x*NWARP + wid;
     if(row >= O) return;
     const int nsb = I >> 8;
     const uint8_t *w = Wp[j] + (size_t)row*(size_t)nsb*144;
-    const float *xj = x + (size_t)j*(size_t)xstride;
+    const float *xj = x + (size_t)(xidx ? xidx[j] : j)*(size_t)xstride;
     /* One byte per lane means a 32-byte load per warp instruction, and the memory system
      * wants far more in flight than that. A block's quants are exactly 128 bytes, so four
      * bytes per lane covers the whole block in ONE instruction -- and because those four
@@ -705,14 +706,15 @@ __global__ static void k_gemv_q4k_grp(float *y, const float *x, int xstride,
     if(lane == 0) y[(size_t)j*O + row] = t;
 }
 __global__ static void k_gemv_q6k_grp(float *y, const float *x, int xstride,
-                                      const uint8_t * const *Wp, int I, int O, int n){
+                                      const uint8_t * const *Wp, int I, int O, int n,
+                                      const int *xidx){
     const int j = blockIdx.y; if(j >= n) return;
     const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x*NWARP + wid;
     if(row >= O) return;
     const int nsb = I >> 8, is = lane >> 4;
     const uint8_t *w = Wp[j] + (size_t)row*(size_t)nsb*210;
-    const float *xj = x + (size_t)j*(size_t)xstride;
+    const float *xj = x + (size_t)(xidx ? xidx[j] : j)*(size_t)xstride;
     float acc = 0.f;
     for(int sb = 0; sb < nsb; ++sb){
         const b_q6_K *b = (const b_q6_K*)(w + (size_t)sb*210);
@@ -742,14 +744,36 @@ __global__ static void k_moe_reduce(float *out, const float *od, const float *w,
     for(int j = 0; j < n; ++j) acc += w[j] * od[(size_t)j*D + o];
     out[o] = acc;
 }
-extern "C" int q35cu_gemv_grp(float *y, const float *x, int xstride,
-                              const void * const *Wp, int gt, int I, int O, int n){
+extern "C" int q35cu_gemv_grp_x(float *y, const float *x, int xstride,
+                                const void * const *Wp, int gt, int I, int O, int n,
+                                const int *xidx){
     if(n <= 0) return 1;
     dim3 grid((unsigned)((O + NWARP - 1)/NWARP), (unsigned)n);
-    if(gt == CU_Q4_K)      k_gemv_q4k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n);
-    else if(gt == CU_Q6_K) k_gemv_q6k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n);
+    if(gt == CU_Q4_K)      k_gemv_q4k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n, xidx);
+    else if(gt == CU_Q6_K) k_gemv_q6k_grp<<<grid, NTHR, 0, g_s>>>(y, x, xstride, (const uint8_t* const*)Wp, I, O, n, xidx);
     else return 0;
     return 1;
+}
+extern "C" int q35cu_gemv_grp(float *y, const float *x, int xstride,
+                              const void * const *Wp, int gt, int I, int O, int n){
+    return q35cu_gemv_grp_x(y, x, xstride, Wp, gt, I, O, n, NULL);
+}
+
+/* out[s*D + o] = sum over the pairs routed to token s of w[j] * od[j*D + o].
+ * Pairs are ordered by EXPERT, not by token, so that consecutive j share weights and hit L2;
+ * the scan over np here is what pays for that, and np is S*K -- 32 for a four-token draft. */
+__global__ static void k_moe_reduce_b(float *out, const float *od, const float *w,
+                                      const int *ti, int D, int np, int S){
+    const int o = blockIdx.x*blockDim.x + threadIdx.x; if(o >= D) return;
+    const int s = blockIdx.y;
+    float acc = 0.f;
+    for(int j = 0; j < np; ++j) if(ti[j] == s) acc += w[j] * od[(size_t)j*D + o];
+    out[(size_t)s*D + o] = acc;
+}
+extern "C" void q35cu_moe_reduce_b(float *out, const float *od, const float *w,
+                                   const int *ti, int D, int np, int S){
+    dim3 grid((unsigned)((D+255)/256), (unsigned)S);
+    k_moe_reduce_b<<<grid, 256, 0, g_s>>>(out, od, w, ti, D, np, S);
 }
 extern "C" void q35cu_moe_reduce(float *out, const float *od, const float *w, int D, int n){
     k_moe_reduce<<<(D+255)/256, 256, 0, g_s>>>(out, od, w, D, n);
