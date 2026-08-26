@@ -108,6 +108,28 @@ typedef struct {
     double   t_cpu_side, t_gpu_side;
     int64_t  stream_bytes;
     int      stream_on, host_pinned;
+
+    /* ---- the hetero MoE expert cache (qwen35moe / Ornith) ----
+     * The routed experts are ~18 GiB and do not fit in VRAM. The hottest are cached on the card
+     * and run there at VRAM speed; a miss is streamed over PCIe into a slot (admit-on-use, LRU
+     * eviction) and also run on the GPU; once a per-layer PCIe budget is spent the remaining
+     * misses are computed on the CPU IN PARALLEL with the GPU queue, so RAM and VRAM bandwidth
+     * are both busy. moe_map/moe_slot are the cache directory; the three device arrays hold the
+     * slots' gate/up/down; the shared expert of every layer is pinned resident. */
+    int      moe;                          /* 1 for a MoE model */
+    int      moe_nslot;                    /* VRAM cache capacity, in experts */
+    int      moe_tg, moe_tu, moe_td;       /* expert gate/up/down quant types */
+    int64_t  moe_gb, moe_ub, moe_db;       /* bytes of one expert's gate/up/down slice */
+    uint8_t *moe_gpool, *moe_upool, *moe_dpool;   /* device: nslot * gb/ub/db */
+    int     *moe_slot_gid;                 /* [nslot] global expert id in each slot, -1 empty */
+    uint32_t*moe_slot_clk;                 /* [nslot] last-use tick (LRU) */
+    int     *moe_map;                      /* [n_layer*n_expert] -> slot, or -1 */
+    uint32_t moe_clk;                      /* global LRU tick */
+    int      moe_budget;                   /* max experts streamed to the GPU per layer */
+    float   *moe_wg, *moe_wu, *moe_wd;     /* device work: gate/up hidden [F], down out [D] */
+    float   *moe_acc_dev;                  /* device: the CPU tier's partial, after h2d */
+    void    *moe_shg[Q35_MAX_LAYER], *moe_shu[Q35_MAX_LAYER], *moe_shd[Q35_MAX_LAYER]; /* shared expert, resident */
+    uint64_t moe_hit, moe_miss, moe_cpu;   /* counters, for the report */
 } Q35Cu;
 
 /* ---------------- upload ---------------- */
@@ -230,6 +252,7 @@ static int q35cu_win_tokens(const Q35Cu *G, int64_t budget){
  *
  * Order matters: the compute tensors are mandatory and go first, so a capacity failure
  * happens here and loudly rather than as a mystery slowdown three layers into a token. */
+static int q35cu_moe_setup(Q35Cu *G);   /* hetero MoE expert cache; defined below */
 static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
     memset(G, 0, sizeof *G);
     G->M = M; G->ok = 1; G->kv_fmt = kv_fmt;
@@ -439,6 +462,8 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
     if(!G->hxn || !G->ht || !G->hqg || !G->ho || !G->hlse){
         fprintf(stderr, "qwen35_cuda: pinned host staging failed\n"); return 0;
     }
+    if(&M->c && M->c.is_moe && !q35cu_moe_setup(G)){
+        fprintf(stderr, "qwen35moe: expert-cache setup failed\n"); return 0; }
     if(!q35cu_sync()){ fprintf(stderr, "qwen35_cuda: %s\n", q35cu_error()); return 0; }
     return G->ok;
 }
@@ -447,7 +472,7 @@ static int q35cu_model_init(Q35Cu *G, const Q35Model *M, int n_ctx, int kv_fmt){
  * split is a loss. q35_reside_anon puts them all in one anonymous mapping, so this is one
  * call -- and it must happen after residency, not before. */
 static void q35cu_pin_weights(Q35Cu *G, Q35Model *M){
-    if(!G->stream_on || !M->anon || M->anon_bytes <= 0) return;
+    if((!G->stream_on && !G->moe) || !M->anon || M->anon_bytes <= 0) return;
     if(q35cu_host_register(M->anon, (size_t)M->anon_bytes)) G->host_pinned = 1;
     else {
         fprintf(stderr, "qwen35_cuda: cannot pin weights (%s) — streaming disabled,"
@@ -814,9 +839,186 @@ static void q35cu_attn_layer_x(Q35Cu *G, Q35State *R, int il, int slot, int pos,
     q35cu_gemv(out, G->o, D->wo, S->wo->type, (int)S->wo->ne[0], c->d_model); q35cu_mark("wo");
 }
 
+/* ---- hetero MoE: build the VRAM expert cache ----
+ * Called once, after the attention/GDN weights are on the card, for a MoE model. Uploads every
+ * layer's shared expert (used each token, so always resident — 40 * ~1.9 MiB), then carves the
+ * rest of free VRAM into as many expert-sized cache slots as fit. */
+static int q35cu_moe_setup(Q35Cu *G){
+    const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
+    if(!c->is_moe) return 1;
+    G->moe = 1;
+    const Q35Layer *L0 = &M->L[0];
+    const int D = c->d_model, F = c->d_ff_exp;
+    /* Q4_K_M is not uniform: the down projection is Q6_K in some layers and Q4_K in others, so
+     * the slot stride is the LARGEST any layer needs; each copy writes only that layer's bytes. */
+    (void)L0;
+    G->moe_gb = G->moe_ub = G->moe_db = 0;
+    for(int il = 0; il < c->n_layer; il++){
+        const Q35Layer *L = &M->L[il];
+        int64_t gb = (int64_t)F * kq_row_bytes(L->ffn_gate_exps->type, D);
+        int64_t ub = (int64_t)F * kq_row_bytes(L->ffn_up_exps->type,   D);
+        int64_t db = (int64_t)D * kq_row_bytes(L->ffn_down_exps->type, F);
+        if(gb > G->moe_gb) G->moe_gb = gb;
+        if(ub > G->moe_ub) G->moe_ub = ub;
+        if(db > G->moe_db) G->moe_db = db;
+    }
+
+    /* per-token work buffers */
+    G->moe_wg = q35cu_work(G, F); G->moe_wu = q35cu_work(G, F); G->moe_wd = q35cu_work(G, D);
+    G->moe_acc_dev = q35cu_work(G, D);
+    if(!G->moe_wg || !G->moe_wu || !G->moe_wd || !G->moe_acc_dev){ G->ok = 0; return 0; }
+
+    /* shared experts, one per layer, always resident */
+    for(int il = 0; il < c->n_layer; il++){
+        const Q35Layer *L = &M->L[il];
+        int64_t acc = 0;
+        G->moe_shg[il] = q35cu_up_t(G, M, L->ffn_gate_shexp, &acc);
+        G->moe_shu[il] = q35cu_up_t(G, M, L->ffn_up_shexp,   &acc);
+        G->moe_shd[il] = q35cu_up_t(G, M, L->ffn_down_shexp, &acc);
+        if(!G->ok) return 0;
+    }
+
+    /* the cache: whatever VRAM is left, minus a margin, split into expert-sized slots */
+    int64_t vfree = 0, vtot = 0; q35cu_mem(&vfree, &vtot);
+    int64_t budget = vfree - (320<<20);
+    { const char *ce = getenv("QWEN_MOE_CACHE_GB");
+      if(ce){ int64_t cap = (int64_t)(atof(ce)*1073741824.0); if(cap < budget) budget = cap; } }
+    const int64_t per = G->moe_gb + G->moe_ub + G->moe_db;
+    int nslot = per > 0 ? (int)(budget / per) : 0;
+    const int total = c->n_layer * c->n_expert;
+    if(nslot > total) nslot = total;
+    if(nslot < 1){ fprintf(stderr, "qwen35moe: no VRAM for an expert cache — experts on CPU\n"); G->moe_nslot = 0; }
+    else {
+        G->moe_gpool = (uint8_t*)q35cu_alloc((size_t)nslot*G->moe_gb);
+        G->moe_upool = (uint8_t*)q35cu_alloc((size_t)nslot*G->moe_ub);
+        G->moe_dpool = (uint8_t*)q35cu_alloc((size_t)nslot*G->moe_db);
+        if(!G->moe_gpool || !G->moe_upool || !G->moe_dpool){
+            fprintf(stderr, "qwen35moe: expert cache alloc failed — experts on CPU\n");
+            q35cu_free(G->moe_gpool); q35cu_free(G->moe_upool); q35cu_free(G->moe_dpool);
+            G->moe_gpool = G->moe_upool = G->moe_dpool = NULL; nslot = 0;
+        }
+    }
+    G->moe_nslot = nslot;
+    G->moe_slot_gid = (int*)malloc(sizeof(int)*(nslot>0?nslot:1));
+    G->moe_slot_clk = (uint32_t*)malloc(sizeof(uint32_t)*(nslot>0?nslot:1));
+    for(int i = 0; i < nslot; i++){ G->moe_slot_gid[i] = -1; G->moe_slot_clk[i] = 0; }
+    G->moe_map = (int*)malloc(sizeof(int)*(size_t)total);
+    for(int i = 0; i < total; i++) G->moe_map[i] = -1;
+    G->moe_clk = 1;
+    { const char *be = getenv("QWEN_MOE_STREAM"); G->moe_budget = be ? atoi(be) : c->n_expert_used; }
+    fprintf(stderr, "  moe cache: %d slots x %.2f MiB = %.2f GiB (%.0f%% of %d experts), stream<=%d/layer\n",
+            nslot, per/1048576.0, (double)nslot*per/1073741824.0,
+            100.0*nslot/(double)total, total, G->moe_budget);
+    return G->ok;
+}
+
+/* Compute one expert on the GPU from device weight pointers and accumulate w*expert(x) into
+ * out (device). The three gemvs and the swiglu ride the compute stream, so successive calls
+ * queue without a host sync — and the host is free to run CPU experts meanwhile. */
+static void q35cu_moe_expert_gpu(Q35Cu *G, const float *xn, int D, int F,
+                                 const void *g, int tg, const void *u, int tu,
+                                 const void *d, int td, float w, float *out){
+    q35cu_gemv(G->moe_wg, xn, g, tg, D, F);
+    q35cu_gemv(G->moe_wu, xn, u, tu, D, F);
+    q35cu_swiglu(G->moe_wg, G->moe_wu, F);
+    q35cu_gemv(G->moe_wd, G->moe_wg, d, td, F, D);
+    q35cu_scale_add(out, G->moe_wd, w, D);
+}
+
+/* Pick a cache slot for a miss: an empty one, else the least-recently-used. O(nslot), which is
+ * dwarfed by the gemvs it precedes. */
+static int q35cu_moe_evict(Q35Cu *G){
+    int best = 0; uint32_t oldest = 0xffffffffu;
+    for(int i = 0; i < G->moe_nslot; i++){
+        if(G->moe_slot_gid[i] < 0) return i;
+        if(G->moe_slot_clk[i] < oldest){ oldest = G->moe_slot_clk[i]; best = i; }
+    }
+    return best;
+}
+
+/* ---- hetero MoE: one layer, three tiers ----
+ * cached experts on the GPU (VRAM speed); misses streamed into cache slots and run on the GPU
+ * until the per-layer PCIe budget is spent; the rest on the CPU, concurrently with the GPU
+ * queue, so RAM and VRAM bandwidth are used at once. Everything device-side rides the compute
+ * stream g_s so it orders with the rest of the forward. The expert quant type is PER LAYER —
+ * Q4_K_M leaves some layers' down projection Q6_K and others Q4_K — so the slot stride is the
+ * per-model maximum while each copy and gemv uses this layer's own type and byte size. */
+static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, float *out){
+    const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
+    const Q35Layer *L = &M->L[il];
+    const int D = c->d_model, F = c->d_ff_exp, E = c->n_expert, K = c->n_expert_used;
+    if(K > 64) return;
+
+    q35cu_d2h_compute(G->hxn, xn, sizeof(float)*D);
+    q35cu_sync();                                  /* the router and CPU experts read xn on the host */
+
+    int idx[64]; float wt[64];
+    const float sh_gate = q35_moe_route(M, L, G->hxn, R->moe_rlog, idx, wt);
+
+    q35cu_zero(out, sizeof(float)*D);
+
+    /* this layer's expert types and byte sizes */
+    const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
+    const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
+    const int64_t lub = (int64_t)F * kq_row_bytes(tu, D);
+    const int64_t ldb = (int64_t)D * kq_row_bytes(td, F);
+    const uint8_t *bgate = (const uint8_t*)q35_wdata(M, L->ffn_gate_exps);
+    const uint8_t *bup   = (const uint8_t*)q35_wdata(M, L->ffn_up_exps);
+    const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
+
+    int cpu_e[64], ncpu = 0; float cpu_w[64];
+    int streamed = 0;
+    for(int j = 0; j < K; j++){
+        const int e = idx[j], gid = il*E + e;
+        int slot = G->moe_nslot ? G->moe_map[gid] : -1;
+        if(slot >= 0){                                   /* tier 1: cached, VRAM speed */
+            G->moe_hit++;
+            G->moe_slot_clk[slot] = ++G->moe_clk;
+            q35cu_moe_expert_gpu(G, xn, D, F,
+                                 G->moe_gpool + (size_t)slot*G->moe_gb, tg,
+                                 G->moe_upool + (size_t)slot*G->moe_ub, tu,
+                                 G->moe_dpool + (size_t)slot*G->moe_db, td, wt[j], out);
+        } else if(G->moe_nslot && streamed < G->moe_budget){   /* tier 2: stream into a slot + run on GPU */
+            G->moe_miss++; streamed++;
+            slot = q35cu_moe_evict(G);
+            if(G->moe_slot_gid[slot] >= 0) G->moe_map[G->moe_slot_gid[slot]] = -1;
+            G->moe_slot_gid[slot] = gid; G->moe_map[gid] = slot; G->moe_slot_clk[slot] = ++G->moe_clk;
+            uint8_t *sg = G->moe_gpool + (size_t)slot*G->moe_gb;
+            uint8_t *su = G->moe_upool + (size_t)slot*G->moe_ub;
+            uint8_t *sd = G->moe_dpool + (size_t)slot*G->moe_db;
+            q35cu_h2d_compute(sg, bgate + (size_t)e*lgb, (size_t)lgb);
+            q35cu_h2d_compute(su, bup   + (size_t)e*lub, (size_t)lub);
+            q35cu_h2d_compute(sd, bdown + (size_t)e*ldb, (size_t)ldb);
+            q35cu_moe_expert_gpu(G, xn, D, F, sg, tg, su, tu, sd, td, wt[j], out);
+        } else {                                         /* tier 3: CPU, concurrent with the GPU */
+            cpu_e[ncpu] = e; cpu_w[ncpu] = wt[j]; ncpu++;
+        }
+    }
+    /* shared expert, always resident on the GPU (its own per-layer types) */
+    q35cu_moe_expert_gpu(G, xn, D, F,
+                         G->moe_shg[il], L->ffn_gate_shexp->type,
+                         G->moe_shu[il], L->ffn_up_shexp->type,
+                         G->moe_shd[il], L->ffn_down_shexp->type, sh_gate, out);
+
+    /* tier 3 on the CPU while the GPU chews through the queue above */
+    if(ncpu){
+        G->moe_cpu += (uint64_t)ncpu;
+        for(int i = 0; i < D; i++) G->ht[i] = 0.f;
+        for(int cc = 0; cc < ncpu; cc++){
+            const int e = cpu_e[cc];
+            q35_swiglu_row(M, G->hxn, D, F, L->ffn_gate_exps, L->ffn_up_exps, L->ffn_down_exps,
+                           (size_t)e*lgb, (size_t)e*lub, (size_t)e*ldb, R->ffn_g, R->ffn_u, R->moe_od);
+            for(int i = 0; i < D; i++) G->ht[i] += cpu_w[cc] * R->moe_od[i];
+        }
+        q35cu_h2d_compute(G->moe_acc_dev, G->ht, sizeof(float)*D);
+        q35cu_add(out, G->moe_acc_dev, D);
+    }
+}
+
 static void q35cu_ffn_layer_x(Q35Cu *G, Q35State *R, int il, const float *xn, float *out){
     const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
     const Q35CuLayer *D = &G->L[il]; const Q35Layer *S = &M->L[il];
+    if(c->is_moe){ q35cu_moe_layer(G, R, il, xn, out); return; }
     if(D->ffn_gpu){
         q35cu_gemv(G->ffn_g, xn, D->ffn_gate, S->ffn_gate->type, c->d_model, c->d_ff);
         q35cu_gemv(G->ffn_u, xn, D->ffn_up,   S->ffn_up->type,   c->d_model, c->d_ff);

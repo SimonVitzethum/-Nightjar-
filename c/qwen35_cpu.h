@@ -273,34 +273,25 @@ static void q35_swiglu_row(const Q35Model *M, const float *xn, int D, int F,
     kq_gemv_fast(acc, gbuf, bd, Td->type, F, D);
 }
 
-/* ---------------- FFN: routed MoE (qwen35moe / Ornith), ONE token ----------------
- *
- * router -> softmax over all E experts -> top-K -> renormalize the K weights to sum 1
- * (norm_topk_prob) -> out = sum_k w_k * expert_k(x) + sigmoid(w_shexp . x) * shared_expert(x).
- *
- * State-free: every scratch buffer is the caller's, so the decode state (Q35State) and the
- * prefill batch both reach the same routing. rlog >= n_expert, gbuf/ubuf >= max(d_ff_exp,
- * d_ff_shexp), od >= d_model. The router weight is F32 and tiny, so its gemv is a plain dot
- * loop; each expert is a contiguous 2-D slice of a stacked [.,.,E] tensor read in place. */
-static void q35_moe_row(const Q35Model *M, const Q35Layer *L, const float *xn, float *out,
-                        float *rlog, float *gbuf, float *ubuf, float *od){
+/* Routing only: softmax over all E experts, take the top-K, renormalize their weights to sum
+ * 1 (norm_topk_prob). Fills idx[K], wt[K]; returns the shared expert's scalar sigmoid gate.
+ * The router weight is F32 and small, so this is a plain dot loop. Shared by the CPU FFN and
+ * the GPU hetero FFN — they route identically and only differ in where the experts run. */
+static float q35_moe_route(const Q35Model *M, const Q35Layer *L, const float *xn,
+                           float *rlog, int *idx, float *wt){
     const Q35Cfg *c = &M->c;
-    const int D = c->d_model, F = c->d_ff_exp, E = c->n_expert, K = c->n_expert_used;
-
+    const int D = c->d_model, E = c->n_expert, K = c->n_expert_used;
     const float *Wr = (const float*)q35_wdata(M, L->ffn_gate_inp);
     float mx = -1e30f;
     for(int e = 0; e < E; e++){
         const float *w = Wr + (size_t)e*D;
-        float acc = 0.f; for(int i = 0; i < D; i++) acc += w[i]*xn[i];
-        rlog[e] = acc; if(acc > mx) mx = acc;
+        float a = 0.f; for(int i = 0; i < D; i++) a += w[i]*xn[i];
+        rlog[e] = a; if(a > mx) mx = a;
     }
     float sum = 0.f;
     for(int e = 0; e < E; e++){ rlog[e] = expf(rlog[e]-mx); sum += rlog[e]; }
     const float inv = sum > 0.f ? 1.f/sum : 0.f;
     for(int e = 0; e < E; e++) rlog[e] *= inv;
-
-    int   idx[64]; float wt[64];
-    if(K > 64) return;
     float wsum = 0.f;
     for(int j = 0; j < K; j++){
         int best = -1; float bv = -1.f;
@@ -311,26 +302,37 @@ static void q35_moe_row(const Q35Model *M, const Q35Layer *L, const float *xn, f
         }
         idx[j] = best; wt[j] = bv; wsum += bv;
     }
-    const float rnorm = wsum > 0.f ? 1.f/wsum : 0.f;   /* norm_topk_prob */
+    const float rn = wsum > 0.f ? 1.f/wsum : 0.f;
+    for(int j = 0; j < K; j++) wt[j] *= rn;
+    const float *ws = L->ffn_gate_inp_shexp;
+    float g = 0.f; for(int i = 0; i < D; i++) g += ws[i]*xn[i];
+    return 1.f/(1.f+expf(-g));
+}
+
+/* ---------------- FFN: routed MoE (qwen35moe / Ornith), ONE token, all on the CPU ----------
+ * State-free (every scratch buffer is the caller's) so decode and the prefill batch share it.
+ * rlog >= n_expert, gbuf/ubuf >= max(d_ff_exp, d_ff_shexp), od >= d_model. */
+static void q35_moe_row(const Q35Model *M, const Q35Layer *L, const float *xn, float *out,
+                        float *rlog, float *gbuf, float *ubuf, float *od){
+    const Q35Cfg *c = &M->c;
+    const int D = c->d_model, F = c->d_ff_exp, K = c->n_expert_used;
+    int idx[64]; float wt[64];
+    if(K > 64) return;
+    const float sg_gate = q35_moe_route(M, L, xn, rlog, idx, wt);
 
     for(int i = 0; i < D; i++) out[i] = 0.f;
-
     const int64_t sg = (int64_t)F * kq_row_bytes(L->ffn_gate_exps->type, D);
     const int64_t su = (int64_t)F * kq_row_bytes(L->ffn_up_exps->type,   D);
     const int64_t sd = (int64_t)D * kq_row_bytes(L->ffn_down_exps->type, F);
     for(int j = 0; j < K; j++){
-        const int e = idx[j]; const float w = wt[j]*rnorm;
+        const int e = idx[j];
         q35_swiglu_row(M, xn, D, F, L->ffn_gate_exps, L->ffn_up_exps, L->ffn_down_exps,
                        (size_t)e*sg, (size_t)e*su, (size_t)e*sd, gbuf, ubuf, od);
-        for(int i = 0; i < D; i++) out[i] += w * od[i];
+        for(int i = 0; i < D; i++) out[i] += wt[j] * od[i];
     }
-
-    const float *ws = L->ffn_gate_inp_shexp;
-    float g = 0.f; for(int i = 0; i < D; i++) g += ws[i]*xn[i];
-    g = 1.f/(1.f+expf(-g));
     q35_swiglu_row(M, xn, D, c->d_ff_shexp, L->ffn_gate_shexp, L->ffn_up_shexp, L->ffn_down_shexp,
                    0, 0, 0, gbuf, ubuf, od);
-    for(int i = 0; i < D; i++) out[i] += g * od[i];
+    for(int i = 0; i < D; i++) out[i] += sg_gate * od[i];
 }
 
 static void q35_ffn_moe(Q35State *R, const Q35Layer *L, const float *xn, float *out){

@@ -414,6 +414,11 @@ int main(int argc, char **argv){
     if(use_spec){ q35_mtp_free(&P); q35cu_batch_free(&Z); }
     if(use_gpu) q35cu_model_free(&G);
 #endif
+#ifndef QWEN_NO_CUDA
+    if(use_gpu && G.moe){ const uint64_t h=G.moe_hit,m=G.moe_miss,cp=G.moe_cpu,tot=h+m+cp;
+        if(tot) fprintf(stderr,"  moe experts: %.0f%% VRAM-hit, %.0f%% streamed, %.0f%% CPU  (%llu total)\n",
+            100.0*h/tot,100.0*m/tot,100.0*cp/tot,(unsigned long long)tot); }
+#endif
     q35_state_free(&R);
     q35_close(&M);
     return 0;
