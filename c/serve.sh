@@ -81,11 +81,21 @@ mkdir -p "$KV_SPILL" "$(dirname "$LOG")"
 # MemorySwapMax=0 because the weights are pinned anyway: swapping the rest buys nothing and
 # turns a fast failure into ten minutes of thrashing first.
 #   MEMMAX=20G make serve
+# NO SWAP. The engine runs in its own systemd scope with MemorySwapMax=0, so its pages can
+# never be pushed to disk — a swapped-out weight is not a slow weight, it is a stalled token,
+# and this box was measured with 4.8 GiB already in swap while the model sat in the page cache.
+# The page-cache mmap is reclaimable (not swap), so this does not fight residency; it only stops
+# the anon weights and the KV tier from swapping. MemoryMax is added on top only if asked for.
+# (System-wide swap is the user's to disable with `sudo swapoff -a`; this scope covers the
+# engine without root.)
 LAUNCH=""
-if [ -n "${MEMMAX:-}" ] && command -v systemd-run >/dev/null 2>&1; then
-    LAUNCH="systemd-run --user --scope --quiet --collect \
-            -p MemoryMax=$MEMMAX -p MemorySwapMax=0 --"
-    echo "  memory-capped at $MEMMAX (own cgroup; an overrun kills the engine, nothing else)"
+if command -v systemd-run >/dev/null 2>&1; then
+    SWAP_CAP="-p MemorySwapMax=0"
+    [ -n "${MEMMAX:-}" ] && SWAP_CAP="-p MemoryMax=$MEMMAX $SWAP_CAP"
+    LAUNCH="systemd-run --user --scope --quiet --collect $SWAP_CAP --"
+    echo "  no swap for the engine (own cgroup, MemorySwapMax=0)${MEMMAX:+, capped at $MEMMAX}"
+else
+    echo "  note: systemd-run not found — cannot fence swap; consider 'sudo swapoff -a'" >&2
 fi
 setsid $LAUNCH env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-4}" \
     "$HERE/qwen35_server" --model "ornith:$ORNITH" --model "qwen3.5-27b:$MODEL" \

@@ -1076,6 +1076,15 @@ extern "C" int q35cu_d2d(void *dst, const void *src, size_t n){
  * Pageable H2D measured 6.8 GB/s on this machine, pinned 27.7 — a 4x difference, and the
  * whole streaming design depends on the second number. The weights already live in one
  * anonymous mapping, so it is one registration, not one per tensor. */
+extern "C" int q35cu_host_register_ro(void *p, size_t n){
+    /* Read-only registration accepts a file-backed PROT_READ mmap that the default flag
+     * rejects with "invalid argument" — exactly the expert page cache we want pinned for DMA. */
+    cudaError_t e = cudaHostRegister(p, n, cudaHostRegisterReadOnly);
+    if(e == cudaErrorNotSupported || e == cudaErrorInvalidValue)
+        e = cudaHostRegister(p, n, cudaHostRegisterReadOnly | cudaHostRegisterPortable);
+    if(e != cudaSuccess){ seterr("cudaHostRegister(ro)", cudaGetErrorString(e)); return 0; }
+    return 1;
+}
 extern "C" int q35cu_host_register(void *p, size_t n){
     cudaError_t e = cudaHostRegister(p, n, cudaHostRegisterPortable);
     if(e == cudaErrorHostMemoryAlreadyRegistered) return 1;

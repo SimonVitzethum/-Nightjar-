@@ -1719,6 +1719,13 @@ int main(int argc, char **argv){
                         "     run and change anything this user can. **\n");
 
     g_argv = argv;
+    /* Best-effort: keep our own pages out of swap. RLIMIT_MEMLOCK is usually tiny (8 MiB here),
+     * so this mostly fails and the systemd scope (serve.sh, MemorySwapMax=0) is the real fence;
+     * it still helps where the limit was raised. */
+    { struct rlimit rl; if(!getrlimit(RLIMIT_MEMLOCK, &rl) && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (1ULL<<34)){
+          rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_MEMLOCK, &rl); }
+      if(mlockall(MCL_CURRENT | MCL_FUTURE) != 0 && g_verbose)
+          fprintf(stderr, "  note: mlockall failed (%s) — relying on the cgroup swap fence\n", strerror(errno)); }
     fix_omp_env(argv);
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);

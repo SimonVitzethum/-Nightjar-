@@ -58,6 +58,7 @@ int q35cu_h2d_async(void *dst, const void *src, size_t n);   /* on the copy stre
 int q35cu_d2h_async(void *dst, const void *src, size_t n);
 int q35cu_copy_sync(void);
 int  q35cu_host_register(void *p, size_t n);
+int  q35cu_host_register_ro(void *p, size_t n);   /* for a read-only file mmap */
 void q35cu_host_unregister(void *p);
 int  q35cu_h2d_compute(void *d, const void *s, size_t n);
 int  q35cu_h2d_2d_async(void *dst, size_t dpitch, const void *src, size_t spitch,
