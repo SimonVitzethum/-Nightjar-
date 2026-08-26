@@ -65,6 +65,7 @@ c/bench/
 c/qwen35_run
 c/qwen35_server
 c/qwen35_cuda.o
+c/qwen35_cupti.o
 c/server.log
 c/tests/*
 !c/tests/*.c

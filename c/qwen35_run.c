@@ -32,6 +32,7 @@
 #ifndef QWEN_NO_CUDA
 #include "qwen35_cu_spec.h"
 #endif
+#include "qwen35_cupti.h"
 #include "tok.h"
 #include "tok_gguf.h"
 
@@ -129,6 +130,7 @@ static void sfmt(Str *s, const char *fmt, ...){
 }
 
 int main(int argc, char **argv){
+    q35cupti_init();               /* before any CUDA context exists, so nothing is missed */
     if(getenv("QWEN_PROFILE")) g_q35_stage_timing = 1;
     const char *path = NULL, *prompt = NULL, *sysmsg = NULL;
     int n_pred = 256, top_k = -1, n_ctx = 0, raw = 0, cpu_only = 0, stats = 0, no_think = 0;
@@ -337,6 +339,7 @@ int main(int argc, char **argv){
         if(nt > 8) fprintf(stderr, "\r%*s\r", 48, "");
 
         const double td0 = now();
+        q35cupti_reset();          /* window the timeline to decode: prefill is a different regime */
         int ngen = 0;
 #ifndef QWEN_NO_CUDA
         if(use_spec){
@@ -394,6 +397,7 @@ int main(int argc, char **argv){
             pos++;
         }
         const double tdec = now()-td0;
+        q35cupti_report(ngen);
         printf("\n");
         fprintf(stderr, "  [prefill %d tok in %.2fs = %.1f tok/s | decode %d tok in %.2fs = %.2f tok/s | ctx %d]\n",
                 nt, tprefill, nt/tprefill, ngen, tdec, ngen > 0 ? ngen/tdec : 0.0, pos);

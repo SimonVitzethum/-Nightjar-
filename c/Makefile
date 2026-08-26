@@ -41,6 +41,17 @@ CULIBS  ?= -L$(CUDA_HOME)/lib64 -lcudart -lstdc++
 
 HAVE_CUDA := $(shell command -v $(NVCC) >/dev/null 2>&1 && echo 1)
 
+# CUPTI is the library nsys records with. nsys itself is not installed here, but the library
+# is, so QWEN_CUPTI=1 gets the exact GPU timeline (kernel/copy durations, overlap, bubbles)
+# without it. Optional: absent CUPTI, the hooks compile to nothing.
+CUPTI_DIR  ?= $(CUDA_HOME)/targets/x86_64-linux
+HAVE_CUPTI := $(shell test -e $(CUPTI_DIR)/lib/libcupti.so && echo 1)
+ifeq ($(HAVE_CUPTI),1)
+CUPTI_OBJ  := qwen35_cupti.o
+CUPTI_CF   := -DHAVE_CUPTI
+CUPTI_LIBS := -L$(CUPTI_DIR)/lib -lcupti
+endif
+
 MODEL ?= /home/simon/Models/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf
 # Everything the engine owns at runtime lives under one directory in $HOME, not inside this
 # checkout: projects the agent works in, the KV spill tier, logs. A coding agent whose
@@ -54,17 +65,17 @@ KV_SPILL    ?= $(ENGINE_HOME)/kvspill
 
 HDRS = qwen35.h qwen35_plan.h qwen35_cpu.h qwen35_batch.h qwen35_mtp.h kv_tier.h kv_tier_simd.h \
        kquant_simd.h kquant.h gguf.h iq_grids.h tok.h tok_gguf.h tok_unicode.h \
-       json.h strbuf.h harness.h
-CUHDRS = qwen35_cuda.h qwen35_hetero.h qwen35_cu_spec.h
+       json.h strbuf.h harness.h qwen35_sample.h
+CUHDRS = qwen35_cuda.h qwen35_hetero.h qwen35_cu_spec.h qwen35_cupti.h
 
-CPU_TESTS = tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
+CPU_TESTS = tests/qwen35_sample_test tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
             tests/qwen35_batch_test tests/qwen35_mtp_test tests/qwen35_sparsity_test \
             tests/harness_test
 CU_TESTS  = tests/qwen35_cuda_test tests/qwen35_hetero_test tests/qwen35_cu_fwd_test \
             tests/qwen35_cu_spec_test tests/qwen35_cu_split_test
 
 ifeq ($(HAVE_CUDA),1)
-ALL = qwen35_cuda.o $(CPU_TESTS) $(CU_TESTS) qwen35_run qwen35_server
+ALL = qwen35_cuda.o $(CUPTI_OBJ) $(CPU_TESTS) $(CU_TESTS) qwen35_run qwen35_server
 else
 ALL = $(CPU_TESTS) qwen35_run qwen35_server
 endif
@@ -74,6 +85,9 @@ all: $(ALL)
 qwen35_cuda.o: qwen35_cuda.cu qwen35_cuda.h
 	$(NVCC) $(CUFLAGS) -I. -c $< -o $@
 
+qwen35_cupti.o: qwen35_cupti.cu qwen35_cupti.h
+	$(NVCC) $(CUFLAGS) -I. -I$(CUPTI_DIR)/include -c $< -o $@
+
 # CPU-only tests link nothing from CUDA.
 $(CPU_TESTS): tests/%: tests/%.c $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
@@ -82,10 +96,10 @@ $(CU_TESTS): tests/%: tests/%.c $(HDRS) $(CUHDRS) qwen35_cuda.o
 	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
 
 ifeq ($(HAVE_CUDA),1)
-qwen35_run: qwen35_run.c $(HDRS) $(CUHDRS) qwen35_cuda.o
-	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
-qwen35_server: qwen35_server.c $(HDRS) $(CUHDRS) qwen35_cuda.o
-	$(CC) $(CFLAGS) -I. -o $@ $< qwen35_cuda.o $(LDFLAGS) $(CULIBS)
+qwen35_run: qwen35_run.c $(HDRS) $(CUHDRS) qwen35_cuda.o $(CUPTI_OBJ)
+	$(CC) $(CFLAGS) $(CUPTI_CF) -I. -o $@ $< qwen35_cuda.o $(CUPTI_OBJ) $(LDFLAGS) $(CULIBS) $(CUPTI_LIBS)
+qwen35_server: qwen35_server.c $(HDRS) $(CUHDRS) qwen35_cuda.o $(CUPTI_OBJ)
+	$(CC) $(CFLAGS) $(CUPTI_CF) -I. -o $@ $< qwen35_cuda.o $(CUPTI_OBJ) $(LDFLAGS) $(CULIBS) $(CUPTI_LIBS)
 else
 qwen35_run: qwen35_run.c $(HDRS)
 	$(CC) $(CFLAGS) -DQWEN_NO_CUDA -I. -o $@ $< $(LDFLAGS)
@@ -165,7 +179,7 @@ mtp: tests/qwen35_mtp_test
 	QWEN_RESERVE_GB=4 OMP_NUM_THREADS=16 ./tests/qwen35_mtp_test "$(MODEL)" 24
 
 clean:
-	rm -f $(CPU_TESTS) $(CU_TESTS) qwen35_cuda.o qwen35_run qwen35_server
+	rm -f $(CPU_TESTS) $(CU_TESTS) qwen35_cuda.o qwen35_cupti.o qwen35_run qwen35_server
 
 PORT      ?= 8080
 CTX       ?= 8192
