@@ -129,6 +129,7 @@ static void sfmt(Str *s, const char *fmt, ...){
 }
 
 int main(int argc, char **argv){
+    if(getenv("QWEN_PROFILE")) g_q35_stage_timing = 1;
     const char *path = NULL, *prompt = NULL, *sysmsg = NULL;
     int n_pred = 256, top_k = -1, n_ctx = 0, raw = 0, cpu_only = 0, stats = 0, no_think = 0;
     int spec = 1;
