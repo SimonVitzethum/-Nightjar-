@@ -1,6 +1,10 @@
-.PHONY: all glm portable test check cuda-test clean serve stop gates run tools abort bench fwd batch mtp
+.PHONY: all glm deepseek-v4 portable test check cuda-test clean install uninstall \
+        nightjar nightjar-test nightjar-serve nightjar-stop nightjar-run nightjar-clean \
+        nightjar-gates nightjar-bench nightjar-tools
 
-# `serve`, `stop`, `gates`, `run` and friends belong to the qwen3.5 engine; the rest are
-# the original GLM-5.2 targets. Both live in c/.
-all glm portable test check cuda-test clean serve stop gates run tools abort bench fwd batch mtp:
+# The Colibri engines and Nightjar (qwen35/qwen35moe) both live in c/ and both want targets
+# called all, test and clean, so Nightjar's are namespaced. See c/Makefile.nightjar.
+all glm deepseek-v4 portable test check cuda-test clean install uninstall \
+nightjar nightjar-test nightjar-serve nightjar-stop nightjar-run nightjar-clean \
+nightjar-gates nightjar-bench nightjar-tools:
 	$(MAKE) -C c $@

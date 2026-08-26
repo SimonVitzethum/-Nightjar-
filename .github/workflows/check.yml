@@ -1,0 +1,105 @@
+# CI: run the repo's own dependency-free gate (`make check` = clean + portable
+# CPU build + C unit suites + Python stdlib tests) on the three claimed
+# platforms. No model downloads, no CUDA, no external deps — by design (#140).
+name: check
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: make check
+        run: make -C c check
+
+  windows:
+    # The job that would have caught #68/#137 pre-merge: native MinGW-w64
+    # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.
+    name: Windows UCRT64
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: make check
+        run: make -C c check
+
+      # The Windows engine as this branch builds it. Small, and it makes an
+      # antivirus false-positive report (#527) verifiable on a PR instead of
+      # only after a release is tagged and published.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: colibri-windows-exe
+          path: c/colibri.exe
+
+  k3-tiny:
+    name: Linux (generated tiny K3 vendor oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-kimi-k3-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-kimi-k3-tiny.txt
+      - name: Generate fixture and run vendor oracle
+        run: make -C c kimi-k3-tiny-check
+
+  v4-tiny:
+    name: Linux (generated tiny V4 target oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Generate fixture and run target oracle
+        run: make -C c deepseek-v4-tiny-check
+
+  macos:
+    # clang; libomp for the threaded path (Makefile falls back to
+    # single-threaded automatically if it's ever missing).
+    name: macOS (colibri + V4 platform gate)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libomp
+        run: brew install libomp
+      - name: make check (V4 execution gated off)
+        run: make -C c check
