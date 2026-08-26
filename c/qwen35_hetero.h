@@ -54,6 +54,11 @@ typedef struct {
  * is how you find out where the time goes, so it stays -- behind a switch. */
 static int g_q35_stage_timing = 0;
 static int g_q35_preroute = 0;   /* QWEN_MOE_PREROUTE=1: score routing on the pre-attention state */
+/* QWEN_HOSTPROF=1: where the HOST's time in a forward goes. Graph capture only pays if the
+ * host is on the critical path; at 92% GPU occupancy it may simply be running ahead. */
+static int    g_q35_hostprof = 0;
+static double g_hp_fwd = 0, g_hp_sync = 0, g_hp_route = 0, g_hp_issue = 0;
+static uint64_t g_hp_n = 0;
 #define MOE_MAXG 16   /* n_expert_used + shared, with headroom */
 #define Q35_MOE_EV 2  /* copy/compute event slot; 0 and 1 belong to the dense split */
 
@@ -1101,9 +1106,26 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
      * actually happen (budget below K). */
     q35cu_gemv(G->moe_logits_dev, xn, G->moe_router_dev[il], L->ffn_gate_inp->type, D, E+1);
     const int need_hxn = (G->moe_budget < K);
+    /* Hoisted above the sync on purpose. Between the sync returning and the FFN kernels being
+     * issued, the GPU has nothing queued -- that window is the only host time that costs GPU
+     * time at all (0.47 ms/token of an 18 ms token; the host spends the other 14 ms blocked
+     * waiting for the GPU). None of this depends on the routing result, so none of it belongs
+     * inside the window. */
+    const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
+    const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
+    const int64_t lub = (int64_t)F * kq_row_bytes(tu, D);
+    const int64_t ldb = (int64_t)D * kq_row_bytes(td, F);
+    const uint8_t *bgate = (const uint8_t*)q35_wdata(M, L->ffn_gate_exps);
+    const uint8_t *bup   = (const uint8_t*)q35_wdata(M, L->ffn_up_exps);
+    const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
+    const int resident = G->moe_rexp_g[il] != NULL;
+    q35cu_copy_join(Q35_MOE_EV);   /* the copy stream's guard, also independent of routing */
     q35cu_d2h_compute(G->moe_logits_host, G->moe_logits_dev, sizeof(float)*(E+1));
     if(need_hxn) q35cu_d2h_compute(G->hxn, xn, sizeof(float)*D);
-    q35cu_sync();
+    { const double ts = g_q35_hostprof ? q35_clk() : 0;
+      q35cu_sync();
+      if(g_q35_hostprof) g_hp_sync += q35_clk()-ts; }
+    const double t_route = g_q35_hostprof ? q35_clk() : 0;
 
     int idx[64]; float wt[64];
     const float sh_gate = 1.f/(1.f+expf(-G->moe_logits_host[E]));
@@ -1127,14 +1149,8 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
         }
     }
 
-    const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
-    const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
-    const int64_t lub = (int64_t)F * kq_row_bytes(tu, D);
-    const int64_t ldb = (int64_t)D * kq_row_bytes(td, F);
-    const uint8_t *bgate = (const uint8_t*)q35_wdata(M, L->ffn_gate_exps);
-    const uint8_t *bup   = (const uint8_t*)q35_wdata(M, L->ffn_up_exps);
-    const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
-    const int resident = G->moe_rexp_g[il] != NULL;
+    if(g_q35_hostprof) g_hp_route += q35_clk()-t_route;
+    const double t_issue = g_q35_hostprof ? q35_clk() : 0;
 
     /* Hits and misses are split, and hits are ordered FIRST, because that ordering is the
      * whole optimization: a miss's weights are still crossing PCIe when this loop ends, so
@@ -1153,7 +1169,6 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
      * the sync above already guarantees that; this makes the dependency explicit so it
      * survives the sync's removal, which is the next step. The same hazard, unguarded, is
      * what made a 145 MiB slice disagree with a 104 MiB one. */
-    q35cu_copy_join(Q35_MOE_EV);
 
     for(int j = 0; j < K; j++){
         const int e = idx[j], gid = il*E + e;
@@ -1205,6 +1220,7 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
     }
 
     if(ng > 0) q35cu_h2d_compute(G->moe_pblk, G->moe_hpblk, G->moe_ptr_bytes);
+    if(g_q35_hostprof) g_hp_issue += q35_clk()-t_issue;
 
     /* --- the transfer window: everything here reads only weights already in VRAM --- */
     if(nhit > 0){
@@ -1286,6 +1302,7 @@ static void q35cu_ffn_layer(Q35Cu *G, Q35State *R, int il){
 
 static void q35_forward_cu(Q35Cu *G, Q35State *R, int tok, int pos, float *logits){
     const Q35Model *M = G->M; const Q35Cfg *c = &M->c;
+    const double t_fwd = g_q35_hostprof ? q35_clk() : 0;
 
     {   const double t0 = g_q35_stage_timing ? q35_clk() : 0;
         q35_embed(R, tok, R->x);                       /* one row of a 0.67 GiB table */
@@ -1340,6 +1357,7 @@ static void q35_forward_cu(Q35Cu *G, Q35State *R, int tok, int pos, float *logit
      * 18% loss. */
     q35cu_d2h(R->x, G->x, sizeof(float)*c->d_model);
     R->pos = pos + 1;
+    if(g_q35_hostprof){ g_hp_fwd += q35_clk()-t_fwd; g_hp_n++; }
 }
 
 #endif

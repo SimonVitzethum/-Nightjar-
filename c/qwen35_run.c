@@ -99,6 +99,7 @@ static void sfmt(Str *s, const char *fmt, ...){
 int main(int argc, char **argv){
     q35cupti_init();               /* before any CUDA context exists, so nothing is missed */
     if(getenv("QWEN_PROFILE")) g_q35_stage_timing = 1;
+    if(getenv("QWEN_HOSTPROF")) g_q35_hostprof = 1;
     const char *path = NULL, *prompt = NULL, *sysmsg = NULL;
     int n_pred = 256, top_k = -1, n_ctx = 0, raw = 0, cpu_only = 0, stats = 0, no_think = 0;
     int spec = 1;
@@ -383,6 +384,10 @@ int main(int argc, char **argv){
 
     free(logits); free(cbuf); free(toks); free(hist.buf);
 #ifndef QWEN_NO_CUDA
+    if(g_q35_hostprof && g_hp_n)
+        fprintf(stderr, "  [host per token: forward %.2f ms | of which sync %.2f, topk %.2f,"
+                " issue %.2f]\n", 1e3*g_hp_fwd/g_hp_n, 1e3*g_hp_sync/g_hp_n,
+                1e3*g_hp_route/g_hp_n, 1e3*g_hp_issue/g_hp_n);
     if(use_gpu && G.moe && G.moe_pre_tot)
         fprintf(stderr, "  moe pre-route: %.1f%% of the guess is truly routed (%llu probes)\n",
                 100.0*G.moe_pre_hit/G.moe_pre_tot, (unsigned long long)G.moe_pre_tot);
