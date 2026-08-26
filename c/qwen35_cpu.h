@@ -277,17 +277,12 @@ static void q35_swiglu_row(const Q35Model *M, const float *xn, int D, int F,
  * 1 (norm_topk_prob). Fills idx[K], wt[K]; returns the shared expert's scalar sigmoid gate.
  * The router weight is F32 and small, so this is a plain dot loop. Shared by the CPU FFN and
  * the GPU hetero FFN — they route identically and only differ in where the experts run. */
-static float q35_moe_route(const Q35Model *M, const Q35Layer *L, const float *xn,
-                           float *rlog, int *idx, float *wt){
-    const Q35Cfg *c = &M->c;
-    const int D = c->d_model, E = c->n_expert, K = c->n_expert_used;
-    const float *Wr = (const float*)q35_wdata(M, L->ffn_gate_inp);
+/* softmax over E router logits -> top-K -> renormalize (norm_topk_prob). Modifies rlog in
+ * place. Shared by the CPU router and the GPU-routed decode path (which precomputes rlog on
+ * the card). */
+static void q35_moe_topk(float *rlog, int E, int K, int *idx, float *wt){
     float mx = -1e30f;
-    for(int e = 0; e < E; e++){
-        const float *w = Wr + (size_t)e*D;
-        float a = 0.f; for(int i = 0; i < D; i++) a += w[i]*xn[i];
-        rlog[e] = a; if(a > mx) mx = a;
-    }
+    for(int e = 0; e < E; e++) if(rlog[e] > mx) mx = rlog[e];
     float sum = 0.f;
     for(int e = 0; e < E; e++){ rlog[e] = expf(rlog[e]-mx); sum += rlog[e]; }
     const float inv = sum > 0.f ? 1.f/sum : 0.f;
@@ -304,6 +299,18 @@ static float q35_moe_route(const Q35Model *M, const Q35Layer *L, const float *xn
     }
     const float rn = wsum > 0.f ? 1.f/wsum : 0.f;
     for(int j = 0; j < K; j++) wt[j] *= rn;
+}
+static float q35_moe_route(const Q35Model *M, const Q35Layer *L, const float *xn,
+                           float *rlog, int *idx, float *wt){
+    const Q35Cfg *c = &M->c;
+    const int D = c->d_model, E = c->n_expert, K = c->n_expert_used;
+    const float *Wr = (const float*)q35_wdata(M, L->ffn_gate_inp);
+    for(int e = 0; e < E; e++){
+        const float *w = Wr + (size_t)e*D;
+        float a = 0.f; for(int i = 0; i < D; i++) a += w[i]*xn[i];
+        rlog[e] = a;
+    }
+    q35_moe_topk(rlog, E, K, idx, wt);
     const float *ws = L->ffn_gate_inp_shexp;
     float g = 0.f; for(int i = 0; i < D; i++) g += ws[i]*xn[i];
     return 1.f/(1.f+expf(-g));

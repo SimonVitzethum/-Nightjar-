@@ -143,6 +143,10 @@ typedef struct {
     float   *moe_gg, *moe_uu, *moe_odg, *moe_wdev;
     void    *moe_pg, *moe_pu, *moe_pd;
     void   **moe_hpg, **moe_hpu, **moe_hpd; float *moe_hwt;
+    /* router on the GPU: per-layer weight (E experts + the shared gate as row E) uploaded to
+     * VRAM, so decode does the 524K-MAC route on the card instead of on one idle CPU thread. */
+    void    *moe_router_dev[Q35_MAX_LAYER];
+    float   *moe_logits_dev, *moe_logits_host;
 } Q35Cu;
 
 /* ---------------- upload ---------------- */
@@ -907,6 +911,21 @@ static int q35cu_moe_setup(Q35Cu *G){
         if(!G->ok) return 0;
     }
 
+    /* GPU router: [E experts ; shared gate] as (E+1) F32 rows, per layer */
+    { const int Ec = c->n_expert;
+      G->moe_logits_dev  = q35cu_work(G, Ec+1);
+      G->moe_logits_host = (float*)q35cu_host_alloc((size_t)(Ec+1)*sizeof(float));
+      if(!G->moe_logits_dev || !G->moe_logits_host){ G->ok = 0; return 0; }
+      for(int il = 0; il < c->n_layer; il++){
+          const Q35Layer *L = &M->L[il];
+          G->moe_router_dev[il] = q35cu_work(G, (int64_t)(Ec+1)*D);
+          if(!G->moe_router_dev[il]){ G->ok = 0; return 0; }
+          q35cu_h2d((float*)G->moe_router_dev[il], (const float*)q35_wdata(M, L->ffn_gate_inp),
+                    (size_t)Ec*D*sizeof(float));
+          q35cu_h2d((float*)G->moe_router_dev[il] + (size_t)Ec*D, L->ffn_gate_inp_shexp,
+                    (size_t)D*sizeof(float));
+      } }
+
     /* RESIDENT EXPERT LAYERS: whole gate/up/down tensors kept permanently in VRAM for the
      * first few layers. Those layers never stream — but the real reason is that they are then
      * EXCLUDED from RAM residency (q35cu_mark_resident_elsewhere + q35_reside_anon). Dropping
@@ -1010,11 +1029,18 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
     const int D = c->d_model, F = c->d_ff_exp, E = c->n_expert, K = c->n_expert_used;
     if(K > MOE_MAXG - 1) return;
 
-    q35cu_d2h_compute(G->hxn, xn, sizeof(float)*D);
-    q35cu_sync();                                  /* the router reads xn on the host */
+    /* route on the GPU: one gemv gives all E expert logits plus the shared gate (row E), so
+     * the CPU only does the tiny softmax/top-K. xn goes to the host only when a CPU tier can
+     * actually happen (budget below K). */
+    q35cu_gemv(G->moe_logits_dev, xn, G->moe_router_dev[il], L->ffn_gate_inp->type, D, E+1);
+    const int need_hxn = (G->moe_budget < K);
+    q35cu_d2h_compute(G->moe_logits_host, G->moe_logits_dev, sizeof(float)*(E+1));
+    if(need_hxn) q35cu_d2h_compute(G->hxn, xn, sizeof(float)*D);
+    q35cu_sync();
 
     int idx[64]; float wt[64];
-    const float sh_gate = q35_moe_route(M, L, G->hxn, R->moe_rlog, idx, wt);
+    const float sh_gate = 1.f/(1.f+expf(-G->moe_logits_host[E]));
+    q35_moe_topk(G->moe_logits_host, E, K, idx, wt);
 
     const int tg = L->ffn_gate_exps->type, tu = L->ffn_up_exps->type, td = L->ffn_down_exps->type;
     const int64_t lgb = (int64_t)F * kq_row_bytes(tg, D);
