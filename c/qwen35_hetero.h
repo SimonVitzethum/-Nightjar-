@@ -129,7 +129,12 @@ typedef struct {
     float   *moe_wg, *moe_wu, *moe_wd;     /* device work: gate/up hidden [F], down out [D] */
     float   *moe_acc_dev;                  /* device: the CPU tier's partial, after h2d */
     void    *moe_shg[Q35_MAX_LAYER], *moe_shu[Q35_MAX_LAYER], *moe_shd[Q35_MAX_LAYER]; /* shared expert, resident */
-    uint64_t moe_hit, moe_miss, moe_cpu;   /* counters, for the report */
+    uint64_t moe_hit, moe_miss, moe_cpu, moe_res;   /* counters, for the report */
+    /* Whole expert tensors kept permanently in VRAM for some layers, so those layers never
+     * stream and — crucially — are EXCLUDED from RAM residency, which is what lets the ~13 GiB
+     * of remaining experts fit in RAM and be pinned. NULL => this layer streams/caches. */
+    void    *moe_rexp_g[Q35_MAX_LAYER], *moe_rexp_u[Q35_MAX_LAYER], *moe_rexp_d[Q35_MAX_LAYER];
+    int      moe_nresident;
 } Q35Cu;
 
 /* ---------------- upload ---------------- */
@@ -516,8 +521,10 @@ static void q35cu_mark_resident_elsewhere(Q35Cu *G){
     flag = (uint8_t*)calloc((size_t)M->m.n_tensors, 1);
     if(!flag) return;
     for(int il = 0; il < M->c.n_layer; il++){
-        if(!G->L[il].ffn_gpu) continue;
-        const gguf_tensor *g[3] = { M->L[il].ffn_gate, M->L[il].ffn_up, M->L[il].ffn_down };
+        const gguf_tensor *g[3] = {0,0,0};
+        if(G->L[il].ffn_gpu){ g[0]=M->L[il].ffn_gate; g[1]=M->L[il].ffn_up; g[2]=M->L[il].ffn_down; }
+        else if(G->moe && G->moe_rexp_g[il]){                 /* whole expert tensors are in VRAM */
+            g[0]=M->L[il].ffn_gate_exps; g[1]=M->L[il].ffn_up_exps; g[2]=M->L[il].ffn_down_exps; }
         for(int k = 0; k < 3; k++){
             if(!g[k]) continue;
             const int i = (int)(g[k] - M->m.t);
@@ -878,6 +885,39 @@ static int q35cu_moe_setup(Q35Cu *G){
         if(!G->ok) return 0;
     }
 
+    /* RESIDENT EXPERT LAYERS: whole gate/up/down tensors kept permanently in VRAM for the
+     * first few layers. Those layers never stream — but the real reason is that they are then
+     * EXCLUDED from RAM residency (q35cu_mark_resident_elsewhere + q35_reside_anon). Dropping
+     * ~5 GiB from the residency target is what lets the remaining ~13 GiB of experts fit in RAM
+     * and be pinned, so the streamed tier for the OTHER layers runs at ~27 GB/s instead of the
+     * ~10 GB/s pageable copy. QWEN_MOE_RESIDENT_GB overrides the ~5 GiB default (0 disables). */
+    {
+        size_t rvf=0, rvt=0; q35cu_mem(&rvf, &rvt);
+        double rgb = 0.0;   /* opt-in: the big dynamic cache beats fixed layers when VRAM is the bottleneck */
+        { const char *re = getenv("QWEN_MOE_RESIDENT_GB"); if(re) rgb = atof(re); }
+        int64_t rbudget = (int64_t)(rgb*1073741824.0);
+        const int64_t keep = 1200LL<<20;                 /* leave VRAM for the dynamic cache + work */
+        if(rbudget > (int64_t)rvf - keep) rbudget = (int64_t)rvf - keep;
+        int64_t used = 0;
+        for(int il = 0; il < c->n_layer && G->ok && rbudget > 0; il++){
+            const Q35Layer *L = &M->L[il];
+            const int64_t need = L->ffn_gate_exps->bytes + L->ffn_up_exps->bytes + L->ffn_down_exps->bytes;
+            if(used + need > rbudget) break;
+            int64_t acc = 0;
+            G->moe_rexp_g[il] = q35cu_up_t(G, M, L->ffn_gate_exps, &acc);
+            G->moe_rexp_u[il] = q35cu_up_t(G, M, L->ffn_up_exps,   &acc);
+            G->moe_rexp_d[il] = q35cu_up_t(G, M, L->ffn_down_exps, &acc);
+            if(!G->ok || !G->moe_rexp_g[il] || !G->moe_rexp_u[il] || !G->moe_rexp_d[il]){
+                q35cu_free(G->moe_rexp_g[il]); q35cu_free(G->moe_rexp_u[il]); q35cu_free(G->moe_rexp_d[il]);
+                G->moe_rexp_g[il] = G->moe_rexp_u[il] = G->moe_rexp_d[il] = NULL; G->ok = 1; break;
+            }
+            used += acc; G->moe_nresident++;
+        }
+        if(G->moe_nresident)
+            fprintf(stderr, "  moe resident: %d whole layers in VRAM (%.2f GiB), excluded from RAM\n",
+                    G->moe_nresident, used/1073741824.0);
+    }
+
     /* the cache: whatever VRAM is left, minus a margin, split into expert-sized slots */
     int64_t vfree = 0, vtot = 0; q35cu_mem(&vfree, &vtot);
     int64_t budget = vfree - (320<<20);
@@ -965,6 +1005,23 @@ static void q35cu_moe_layer(Q35Cu *G, Q35State *R, int il, const float *xn, floa
     const uint8_t *bgate = (const uint8_t*)q35_wdata(M, L->ffn_gate_exps);
     const uint8_t *bup   = (const uint8_t*)q35_wdata(M, L->ffn_up_exps);
     const uint8_t *bdown = (const uint8_t*)q35_wdata(M, L->ffn_down_exps);
+
+    /* resident layer: every expert is already whole in VRAM — compute the eight straight from
+     * the resident tensor, no cache lookup, no streaming, no CPU. */
+    if(G->moe_rexp_g[il]){
+        for(int j = 0; j < K; j++){
+            const int e = idx[j]; G->moe_res++;
+            q35cu_moe_expert_gpu(G, xn, D, F,
+                                 (const uint8_t*)G->moe_rexp_g[il] + (size_t)e*lgb, tg,
+                                 (const uint8_t*)G->moe_rexp_u[il] + (size_t)e*lub, tu,
+                                 (const uint8_t*)G->moe_rexp_d[il] + (size_t)e*ldb, td, wt[j], out);
+        }
+        q35cu_moe_expert_gpu(G, xn, D, F,
+                             G->moe_shg[il], L->ffn_gate_shexp->type,
+                             G->moe_shu[il], L->ffn_up_shexp->type,
+                             G->moe_shd[il], L->ffn_down_shexp->type, sh_gate, out);
+        return;
+    }
 
     int cpu_e[64], ncpu = 0; float cpu_w[64];
     int streamed = 0;
