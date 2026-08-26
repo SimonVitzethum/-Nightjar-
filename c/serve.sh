@@ -97,7 +97,7 @@ if command -v systemd-run >/dev/null 2>&1; then
 else
     echo "  note: systemd-run not found — cannot fence swap; consider 'sudo swapoff -a'" >&2
 fi
-setsid $LAUNCH env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-4}" \
+setsid $LAUNCH env QWEN_KV_SPILL="$KV_SPILL" QWEN_RESERVE_GB="${RESERVE:-2}" \
     "$HERE/qwen35_server" --model "ornith:$ORNITH" --model "qwen3.5-27b:$MODEL" \
     --default "$DEFMODEL" --port "$PORT" --ctx "$CTX" "$@" \
     >> "$LOG" 2>&1 < /dev/null &
