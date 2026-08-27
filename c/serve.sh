@@ -14,7 +14,18 @@ MODEL="${MODEL:-"$MODELS_DIR"/Qwen3.8-27B/Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K
 ORNITH="${ORNITH:-"$MODELS_DIR"/Ornith-1.5-35B-A3B/Ornith-1.5-35B-A3B-Abliterated-Q4_K_M.gguf}"
 DEFMODEL="${DEFMODEL:-ornith}"
 PORT="${PORT:-8080}"
-CTX="${CTX:-8192}"      # the context still grows past this; see qwen35_server.c
+# 256k, because the KV tier makes it nearly free on this architecture and 8192 was costing
+# far more than it saved. Only 10 of the 40 layers are attention -- the 30 gated-delta-net
+# layers keep a state that is CONSTANT in context length -- so the KV is 10.6 KiB/token, and
+# 265k tokens fit in a 2.69 GiB hot tier in RAM with the rest spilling to disk. The VRAM
+# window stays at 8192 either way, so the card pays nothing for the larger number.
+#
+# The old 8192 was not a memory decision, it was a default nobody revisited, and it was the
+# expensive kind: the prefix cache is capped at the context, so an agent whose conversation
+# outgrew it re-prefilled from a checkpoint every step. Measured in this engine's own log:
+#     19504 prompt (8192 cached) in 1497.43s
+# Twenty-five minutes per step, to save 1.3 GiB of RAM that was never scarce.
+CTX="${CTX:-262144}"
 ENGINE_HOME="${ENGINE_HOME:-$HOME/.nightjar}"
 LOG="${LOG:-$ENGINE_HOME/logs/server.log}"
 KV_SPILL="${KV_SPILL:-$ENGINE_HOME/kvspill}"
