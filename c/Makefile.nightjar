@@ -19,6 +19,19 @@ NJ_CUDA := $(patsubst %/lib64/..,%,$(NJ_CUDA))
 # /usr/local/cuda/bin/nvcc, so on a machine that keeps it elsewhere `command -v` finds
 # nothing, HAVE_CUDA comes out empty, and the engine builds -DQWEN_NO_CUDA -- silently, as a
 # CPU build that merely looks slow. Accept an absolute NVCC only if it exists.
+# Fallbacks for the toolchain variables this file uses but no longer defines: when included
+# from c/Makefile they come from there, and `?=` leaves those alone. Standalone -- which is how
+# anyone debugging this engine will invoke it -- they would otherwise be empty, and an empty
+# CUDA_ARCH produces "-arch=" with no value and a build failure that names the Makefile line
+# rather than the missing variable.
+CC        ?= gcc
+NVCC      ?= nvcc
+CUDA_ARCH ?= sm_120
+ARCH      ?= native
+CFLAGS    ?= -O3 -march=$(ARCH) -fopenmp -Wall -Wextra \
+             -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation
+LDFLAGS   ?= -lm -fopenmp -lpthread -lutil
+
 NJ_NVCC := $(strip $(if $(wildcard $(NVCC)),$(NVCC),\
              $(firstword $(wildcard $(NJ_CUDA)/bin/nvcc) $(shell command -v nvcc 2>/dev/null))))
 

@@ -830,6 +830,47 @@ document.addEventListener('click', e => {
 
 /* ---------- chat rendering ---------- */
 let pinned = true;
+/* API key, when the server was started with --api-key.
+ *
+ * The server refuses to bind anywhere but loopback while the tool layer is on and no key is
+ * set, and it is right to: whoever reaches the port can run commands on that machine. But the
+ * page had no way to send one, so the only options were "no tools" or "loopback only".
+ *
+ * Wrapping fetch rather than editing 23 call sites is deliberate. A header added in 23 places
+ * is a header forgotten in one of them, and the one that gets forgotten is whichever call is
+ * added next. Same-origin only, so the key never leaves this server. */
+(function(){
+  const KEY = 'nightjar.apikey';
+  const orig = window.fetch.bind(window);
+  const sameOrigin = u => {
+    try { return new URL(u, location.href).origin === location.origin; } catch { return false; }
+  };
+  let asking = null;
+  const ask = msg => asking || (asking = Promise.resolve().then(() => {
+    const k = window.prompt(msg, localStorage.getItem(KEY) || '');
+    asking = null;
+    if (k === null) return null;
+    localStorage.setItem(KEY, k);
+    return k;
+  }));
+  window.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!sameOrigin(url)) return orig(input, init);
+    const send = k => {
+      const o = Object.assign({}, init);
+      o.headers = new Headers((init && init.headers) || (input && input.headers) || {});
+      if (k) o.headers.set('Authorization', 'Bearer ' + k);
+      return orig(typeof input === 'string' ? input : input.url, o);
+    };
+    let r = await send(localStorage.getItem(KEY));
+    if (r.status === 401){
+      const k = await ask('Dieser Server verlangt einen API-Schlüssel:');
+      if (k) r = await send(k);
+    }
+    return r;
+  };
+})();
+
 /* Report the page's own stalls to the server log.
  *
  * "This page is slowing down Firefox" is invisible from the server side, and reading the

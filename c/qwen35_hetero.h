@@ -53,6 +53,8 @@ typedef struct {
  * actually needs, and each one is ~15 us of the CPU spinning instead of running the FFN. It
  * is how you find out where the time goes, so it stays -- behind a switch. */
 static int g_q35_stage_timing = 0;
+/* Set before model init when a draft path is wanted, so q35cu_moe_setup leaves it room. */
+static int64_t g_q35_spec_reserve = 0;
 static int g_q35_preroute = 0;   /* QWEN_MOE_PREROUTE=1: score routing on the pre-attention state */
 /* QWEN_HOSTPROF=1: where the HOST's time in a forward goes. Graph capture only pays if the
  * host is on the critical path; at 92% GPU occupancy it may simply be running ahead. */
@@ -995,6 +997,18 @@ static int q35cu_moe_setup(Q35Cu *G){
     int64_t budget = vfree - (320<<20);
     { const char *ce = getenv("QWEN_MOE_CACHE_GB");
       if(ce){ int64_t cap = (int64_t)(atof(ce)*1073741824.0); if(cap < budget) budget = cap; } }
+    /* The expert cache takes whatever VRAM is left, which is right until something else still
+     * needs some. Speculative decoding allocates its batch scratch AFTER this, and on a card
+     * with room for a large cache it therefore always failed: 13.28 GiB of experts, 0.28 GiB
+     * free, and a verify path wanting 0.32 -- "out of memory", then a silent fall back to
+     * plain decode. The bigger the card, the more certain the failure, which is the wrong way
+     * round. Hold the scratch back before the cache is sized. */
+    if(g_q35_spec_reserve > 0){
+        budget -= g_q35_spec_reserve;
+        if(budget < 0) budget = 0;
+        fprintf(stderr, "  reserving %.2f GiB of VRAM for the speculative verify path\n",
+                g_q35_spec_reserve/1073741824.0);
+    }
     const int64_t per = G->moe_gb + G->moe_ub + G->moe_db;
     int nslot = per > 0 ? (int)(budget / per) : 0;
     const int total = c->n_layer * c->n_expert;

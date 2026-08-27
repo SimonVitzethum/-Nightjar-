@@ -1226,7 +1226,14 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
         sock_str(fd, "HTTP/1.1 204 No Content\r\n" CORS "Content-Length: 0\r\nConnection: close\r\n\r\n");
         s_free(&req); return 0;
     }
-    if(g_api_key){
+    /* The page itself is not behind the key, everything it talks to is.
+     *
+     * Otherwise the key is unreachable: the prompt that asks for it lives IN the page, so a
+     * browser that must present the key to fetch the page can never obtain one. It is a
+     * chicken-and-egg that shows up only over the network, because on loopback nobody sets a
+     * key at all. Serving the HTML costs nothing -- it holds no data, only the code that then
+     * has to authenticate for every /v1 call. */
+    if(g_api_key && !path_is(path, "/") && !path_is(path, "/index.html")){
         const char *a = memmem(req.p, hdr_end, "Bearer ", 7);
         if(!a || strncmp(a + 7, g_api_key, strlen(g_api_key))){
             http_err(fd, 401, "Unauthorized", "invalid api key"); s_free(&req); return 0;
@@ -1706,12 +1713,33 @@ int main(int argc, char **argv){
                         "     run and change anything this user can. **\n");
 
     g_argv = argv;
-    /* Best-effort: keep our own pages out of swap. RLIMIT_MEMLOCK is usually tiny (8 MiB here),
-     * so this mostly fails and the systemd scope (serve.sh, MemorySwapMax=0) is the real fence;
-     * it still helps where the limit was raised. */
+    /* Best-effort: keep our own pages out of swap. The systemd scope (serve.sh,
+     * MemorySwapMax=0) is the real fence; this helps where the limit was raised.
+     *
+     * MCL_FUTURE is the dangerous half and has to be earned. It locks every LATER mapping
+     * too, including the model, so a limit that is generous but still smaller than the GGUF
+     * turns the model's mmap into EAGAIN -- and the failure lands on the machine with the
+     * HIGHER limit, because a small limit makes mlockall fail outright and MCL_FUTURE never
+     * takes effect. Measured: 8 MiB limit locally, model maps, server runs. 13.75 GiB limit
+     * on a 110 GiB box, mlockall succeeds, and a 19.71 GiB model cannot be mapped at all.
+     *
+     * So: ask for MCL_FUTURE only when the limit can actually cover the models we are about
+     * to open. Otherwise MCL_CURRENT, which locks what exists and leaves the mapping alone. */
     { struct rlimit rl; if(!getrlimit(RLIMIT_MEMLOCK, &rl) && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (1ULL<<34)){
           rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_MEMLOCK, &rl); }
-      if(mlockall(MCL_CURRENT | MCL_FUTURE) != 0 && g_verbose)
+      uint64_t biggest = 0;
+      for(int i = 0; i < g_nmodels; i++){
+          struct stat mst;
+          if(!stat(g_models[i].path, &mst) && (uint64_t)mst.st_size > biggest) biggest = (uint64_t)mst.st_size;
+      }
+      int flags = MCL_CURRENT;
+      if(!getrlimit(RLIMIT_MEMLOCK, &rl) &&
+         (rl.rlim_cur == RLIM_INFINITY || (biggest && rl.rlim_cur > biggest + (1ULL<<30))))
+          flags |= MCL_FUTURE;
+      else if(g_verbose && biggest)
+          fprintf(stderr, "  note: RLIMIT_MEMLOCK %.2f GiB cannot cover a %.2f GiB model — "
+                          "locking current pages only\n", rl.rlim_cur/1073741824.0, biggest/1073741824.0);
+      if(mlockall(flags) != 0 && g_verbose)
           fprintf(stderr, "  note: mlockall failed (%s) — relying on the cgroup swap fence\n", strerror(errno)); }
     fix_omp_env(argv);
     signal(SIGINT, on_sig);

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -182,7 +183,7 @@ static int gguf_load_shard(gguf_model *m, const char *path, int want_kv){
     gguf_shard *sh = &m->shard[m->n_shards];
 
     sh->fd = open(path, O_RDONLY);
-    if(sh->fd < 0){ fprintf(stderr, "gguf: cannot open %s\n", path); return 0; }
+    if(sh->fd < 0){ fprintf(stderr, "gguf: cannot open %s: %s\n", path, strerror(errno)); return 0; }
     struct stat st;
     if(fstat(sh->fd, &st) != 0){ close(sh->fd); return 0; }
     sh->size = (size_t)st.st_size;
@@ -193,7 +194,11 @@ static int gguf_load_shard(gguf_model *m, const char *path, int want_kv){
      * we want the page cache, not 90 GB of resident pages. */
     sh->map = (uint8_t*)mmap(NULL, sh->size, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, sh->fd, 0);
     if(sh->map == MAP_FAILED){
-        fprintf(stderr, "gguf: mmap failed for %s\n", path);
+        /* The errno is the whole message. "mmap failed" alone sent one debugging session
+         * through the file, the filesystem, the ulimits and a standalone probe that all
+         * worked, because the reason was never in the sentence. */
+        fprintf(stderr, "gguf: mmap failed for %s (%.2f GiB): %s\n",
+                path, sh->size/1073741824.0, strerror(errno));
         close(sh->fd); return 0;
     }
     /* The header is walked once, front to back; the expert region is not touched here

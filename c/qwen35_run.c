@@ -142,6 +142,9 @@ static void sfmt(Str *s, const char *fmt, ...){
 
 int main(int argc, char **argv){
     q35cupti_init();               /* before any CUDA context exists, so nothing is missed */
+    /* Claimed before the model loads, because the expert cache sizes itself against whatever
+     * VRAM is free at that moment and would otherwise take all of it. */
+    if(!getenv("QWEN_NO_SPEC")) g_q35_spec_reserve = 512ll<<20;
     if(getenv("QWEN_PROFILE")) g_q35_stage_timing = 1;
     if(getenv("QWEN_HOSTPROF")) g_q35_hostprof = 1;
     const char *path = NULL, *prompt = NULL, *sysmsg = NULL;
