@@ -51,6 +51,28 @@ five-token window still touches 3.14x the experts of one token.
 This is architectural. On an attention-only model the same machinery should pay; here it does
 not, which is why it ships off by default and switchable per request.
 
+## Prefill, and a correction
+
+Prefill runs at **33-38 tok/s**, flat in prompt length: 689 tokens at 33.2, 2714 at 38.1,
+10514 at 35.4. The prefix cache works as arithmetic says it should — a turn that genuinely
+extends the previous one reuses it, measured `330 prompt (310 cached) in 0.32s`.
+
+The correction is worth recording because the wrong number came from this repository. Earlier
+commentary in the source quotes 8-12 tok/s prefill (`19504 prompt (8192 cached) in 1497.43s`),
+and that figure was repeated here without being re-measured. It predates the work in this
+document, and the current engine is three to four times faster than it. Two other numbers were
+taken the same way and were also wrong: a 600 GB/s card that delivers 283, and a markdown
+parser blamed for a hang it did not cause.
+
+A cached prefix only helps when the request EXTENDS the previous one exactly. Changing the
+middle of a prompt discards it, and correctly so: the recurrent half of this architecture
+cannot be rewound, only replayed from a checkpoint. Checkpoints are written every 512 tokens,
+so a prompt shorter than that has none to fall back on.
+
+What still costs is the first request of a conversation, which has nothing to extend, and the
+first request after a model switch, which pays residency (`ram residency 5.30s`) and a cold
+expert cache on top -- measured at 1.66 tok/s decode while warming, against 45 warm.
+
 ## Known open: nondeterminism in the MoE path
 
 Two runs of the same binary at `--temp 0` with the same prompt diverge, and one degenerated
