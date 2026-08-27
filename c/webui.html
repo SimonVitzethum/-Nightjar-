@@ -800,8 +800,22 @@ function md(src){
     if (/^\s*---+\s*$/.test(L)){ out.push('<hr>'); i++; continue; }
     if (!L.trim()){ i++; continue; }
     const buf = [];
+    /* The guard is the whole point: this loop refuses lines that belong to another block, so
+     * if the line that got us here matched one of those patterns and yet no branch above
+     * claimed it, nothing consumes it and the outer while spins forever.
+     *
+     * A table header does exactly that. The table branch demands a separator row underneath,
+     * and while an answer is streaming the header arrives FIRST -- "| Modell | tok/s |" with
+     * nothing yet below it. So every table this model writes hangs the page for a moment, and
+     * for good if the stream ends there. Firefox reports that as "this page is slowing down"
+     * and then stops responding, which is what it looked like from the outside.
+     *
+     * Take the line as prose rather than trying to enumerate the cases: a half-written table
+     * rendered as text for one frame is invisible, an infinite loop is not. */
+    const at = i;
     while (i < lines.length && lines[i].trim() && !/^```|^#{1,3}\s|^\s*([-*+]|\d+\.)\s|^>|^\|/.test(lines[i]))
       buf.push(lines[i++]);
+    if (i === at) buf.push(lines[i++]);
     out.push('<p>'+inline(buf.join('\n')).replace(/\n/g,'<br>')+'</p>');
   }
   return out.join('');
