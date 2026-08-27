@@ -1424,14 +1424,14 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
                 s_free(&mj);
             }
             free(arena); free(body);
-            if(ok) http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 13);
+            if(ok) http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 11);
             else   http_err(fd, 400, "Bad Request", "could not store the chat");
         } else if(path_is(path, "/v1/live/cancel")){
             /* The explicit stop, which is now the ONLY thing that ends a resumable turn. */
             pthread_mutex_lock(&g_live.mu);
             g_live.cancel = 1;
             pthread_mutex_unlock(&g_live.mu);
-            http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 13);
+            http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 11);
         } else if(path_is(path, "/v1/model/select")){
             /* Switch the loaded model. The reply goes out FIRST, because model_switch re-execs
              * and never returns; the page then polls /health and reloads when the server is back. */
@@ -1472,6 +1472,14 @@ static int serve(int fd){   /* returns 1 if the fd was handed off and must not b
             free(body);
             http_send(fd, 200, "OK", "application/json",
                       ok ? "{\"ok\":true}" : "{\"ok\":false}", ok ? 13 : 14);
+        } else if(path_is(path, "/v1/clientlog")){
+
+            /* The browser reporting its own stalls. A page that "slows down Firefox" is
+             * invisible from this side, and guessing at it from the source has a poor record
+             * -- the first guess this session was the markdown parser, which measured 23 ms
+             * per 900 tokens and was innocent. This lets the page name the long task instead. */
+            fprintf(stderr, "  [client] %.*s\n", (int)(clen > 400 ? 400 : clen), req.p + hdr_end);
+            http_send(fd, 200, "OK", "application/json", "{\"ok\":true}", 11);
         } else if(path_is(path, "/v1/tools/exec") || path_is(path, "/tools/exec")){
             /* Deliberately NOT on the engine thread. A tool call holds no model state, so
              * running it here lets the page fetch, list and grep while a generation streams —

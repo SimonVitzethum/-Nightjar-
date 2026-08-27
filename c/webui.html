@@ -816,6 +816,31 @@ document.addEventListener('click', e => {
 
 /* ---------- chat rendering ---------- */
 let pinned = true;
+/* Report the page's own stalls to the server log.
+ *
+ * "This page is slowing down Firefox" is invisible from the server side, and reading the
+ * source for the cause has a poor record: the first guess was the markdown parser, which
+ * measured 23 ms per 900 tokens and was innocent. PerformanceObserver names the actual long
+ * task, with the DOM size at the time, so the next occurrence is evidence rather than a
+ * theory. Costs nothing when nothing is slow. */
+try {
+  let reported = 0;
+  new PerformanceObserver(list => {
+    for (const e of list.getEntries()){
+      if (e.duration < 120 || reported > 40) continue;
+      reported++;
+      const attr = (e.attribution || []).map(a => a.name + ':' + a.containerType).join(',');
+      fetch('/v1/clientlog', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ longtask: Math.round(e.duration), at: Math.round(e.startTime),
+                               nodes: document.getElementsByTagName('*').length,
+                               chars: chat ? chat.textContent.length : 0,
+                               term: ($('#tout')||{textContent:''}).textContent.length,
+                               msgs: (typeof messages !== 'undefined' ? messages.length : -1),
+                               attr }) }).catch(()=>{});
+    }
+  }).observe({ entryTypes:['longtask'] });
+} catch(e){}
+
 main.addEventListener('scroll', () => {
   pinned = main.scrollHeight - main.scrollTop - main.clientHeight < 90;
 });
@@ -1032,6 +1057,14 @@ async function termTick(){
         b.className = 'p'; b.textContent = part;
         out.appendChild(b);
       } else if (part) out.append(part);
+    }
+    /* Nothing trimmed this. A long agent session appends terminal output forever, and the
+     * pane keeps every character as live DOM -- the browser pays for it on every layout, and
+     * it never gets cheaper again. Keep the tail; that is all anyone reads. */
+    const TERM_MAX = 200000;
+    if (out.textContent.length > TERM_MAX){
+      const keep = out.textContent.slice(-TERM_MAX/2);
+      out.textContent = '… älterer Teil verworfen …\n' + keep;
     }
     if (atBottom) out.scrollTop = out.scrollHeight;
   }
