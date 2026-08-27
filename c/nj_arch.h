@@ -18,6 +18,7 @@ typedef enum {
     NJ_ARCH_UNKNOWN = 0,
     NJ_ARCH_QWEN35,        /* dense hybrid GDN/attention  — Qwen 3.8 27B */
     NJ_ARCH_QWEN35MOE,     /* the same trunk, sparse FFN  — Ornith 1.5 35B-A3B */
+    NJ_ARCH_QWEN4EXP,      /* Qwen4 preview               — Qwen3.8 Flash Next, 512x56B */
     NJ_ARCH_GLM5,          /* GLM 5.2 744B                — Colibri engine */
     NJ_ARCH_KIMI,          /* Kimi K3 2.8T                — Colibri engine */
     NJ_ARCH_DSV4           /* DeepSeek V4 Flash 284B      — Colibri engine */
@@ -26,6 +27,7 @@ typedef enum {
 static const struct { const char *key; NjArch arch; const char *engine; } NJ_ARCHS[] = {
     { "qwen35",    NJ_ARCH_QWEN35,    "nightjar" },
     { "qwen35moe", NJ_ARCH_QWEN35MOE, "nightjar" },
+    { "qwen4exp",  NJ_ARCH_QWEN4EXP,  "nightjar" },
     { "glm5",      NJ_ARCH_GLM5,      "colibri"  },
     { "glm5moe",   NJ_ARCH_GLM5,      "colibri"  },
     { "kimi",      NJ_ARCH_KIMI,      "colibri"  },

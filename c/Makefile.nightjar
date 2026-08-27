@@ -105,7 +105,7 @@ HDRS = qwen35.h qwen35_plan.h qwen35_cpu.h qwen35_batch.h qwen35_mtp.h kv_tier.h
        json.h strbuf.h harness.h qwen35_sample.h
 CUHDRS = qwen35_cuda.h qwen35_hetero.h qwen35_cu_spec.h qwen35_cupti.h
 
-CPU_TESTS = tests/qwen35_sample_test tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
+CPU_TESTS = tests/kquant_iq4nl_test tests/qwen35_sample_test tests/qwen35_test tests/qwen35_fwd_test tests/kvtier_test tests/kquant_simd_test \
             tests/qwen35_batch_test tests/qwen35_mtp_test tests/qwen35_sparsity_test \
             tests/harness_test
 CU_TESTS  = tests/qwen35_cuda_test tests/qwen35_hetero_test tests/qwen35_cu_fwd_test \

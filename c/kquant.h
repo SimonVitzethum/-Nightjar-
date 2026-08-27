@@ -76,6 +76,11 @@ typedef struct {                       /* 210 B / 256 w = 6.5625 bpw */
     uint16_t d;
 } kq_q6_K;
 
+typedef struct {                       /* 18 B / 32 w = 4.5 bpw */
+    uint16_t d;                        /* fp16 */
+    uint8_t  qs[16];                   /* 32 4-bit indices into kvalues_iq4nl */
+} kq_iq4_nl;
+
 typedef struct {                       /* 136 B / 256 w = 4.25 bpw */
     uint16_t d;
     uint16_t scales_h;
@@ -112,10 +117,10 @@ typedef struct {                       /* 98 B / 256 w = 3.0625 bpw  <- down_exp
  * handful of layers bumped to IQ4_XS/Q3_K/Q2_K where the imatrix says it matters.
  * That per-layer mixing IS what "Dynamic" means. */
 enum { KQ_F32=0, KQ_F16=1, KQ_Q8_0=8, KQ_Q2_K=10, KQ_Q3_K=11, KQ_Q4_K=12, KQ_Q5_K=13,
-       KQ_Q6_K=14, KQ_IQ2_XS=17, KQ_IQ3_XXS=18, KQ_IQ4_XS=23, KQ_BF16=30 };
+       KQ_Q6_K=14, KQ_IQ2_XS=17, KQ_IQ3_XXS=18, KQ_IQ4_NL=20, KQ_IQ4_XS=23, KQ_BF16=30 };
 
 static inline int kq_blocksize(int t){
-    switch(t){ case KQ_Q8_0: return 32;
+    switch(t){ case KQ_Q8_0: case KQ_IQ4_NL: return 32;
                case KQ_Q2_K: case KQ_Q3_K: case KQ_Q4_K: case KQ_Q5_K: case KQ_Q6_K:
                case KQ_IQ2_XS: case KQ_IQ3_XXS: case KQ_IQ4_XS: return KQ_QK_K;
                default: return 1; }
@@ -130,6 +135,7 @@ static inline int kq_typesize(int t){
                case KQ_Q6_K:    return (int)sizeof(kq_q6_K);
                case KQ_IQ2_XS:  return (int)sizeof(kq_iq2_xs);
                case KQ_IQ3_XXS: return (int)sizeof(kq_iq3_xxs);
+               case KQ_IQ4_NL:  return (int)sizeof(kq_iq4_nl);
                case KQ_IQ4_XS:  return (int)sizeof(kq_iq4_xs);
                default: return 0; }
 }
@@ -139,7 +145,7 @@ static const char *kq_name(int t){
                case KQ_Q8_0:return "Q8_0"; case KQ_Q2_K:return "Q2_K"; case KQ_Q3_K:return "Q3_K";
                case KQ_Q4_K:return "Q4_K"; case KQ_Q5_K:return "Q5_K"; case KQ_Q6_K:return "Q6_K";
                case KQ_IQ2_XS:return "IQ2_XS"; case KQ_IQ3_XXS:return "IQ3_XXS";
-               case KQ_IQ4_XS:return "IQ4_XS"; default:return "?"; }
+               case KQ_IQ4_NL:return "IQ4_NL"; case KQ_IQ4_XS:return "IQ4_XS"; default:return "?"; }
 }
 /* bytes for n weights of type t (n must be a multiple of the block size) */
 static inline int64_t kq_row_bytes(int t,int64_t n){
@@ -247,6 +253,23 @@ static void kq_deq_q3_K(const void *vx,float *y,int64_t k){
 
 /* IQ4_XS: 4-bit index into a 16-entry NON-uniform value table (kvalues_iq4nl), with a
  * 6-bit scale per 32 weights split across scales_l (low 4) and scales_h (high 2). */
+/* IQ4_NL is IQ4_XS without the superblock: 32 weights, one fp16 scale, no sub-scales, the
+ * same non-uniform 16-entry table. Qwen4's per-layer embedding table ships in it, which is
+ * why it is here -- the engine could read every other tensor in that model and stopped at
+ * one. */
+static void kq_deq_iq4_nl(const void *vx,float *y,int64_t k){
+    const kq_iq4_nl *x=(const kq_iq4_nl*)vx;
+    for(int64_t i=0;i<k/32;i++){
+        const float d=kq_half(x[i].d);
+        const uint8_t *qs=x[i].qs;
+        for(int j=0;j<16;j++){
+            y[j+ 0]=d*(float)kvalues_iq4nl[qs[j]&0xF];
+            y[j+16]=d*(float)kvalues_iq4nl[qs[j]>>4];
+        }
+        y+=32;
+    }
+}
+
 static void kq_deq_iq4_xs(const void *vx,float *y,int64_t k){
     const kq_iq4_xs *x=(const kq_iq4_xs*)vx;
     for(int64_t i=0;i<k/KQ_QK_K;i++){
@@ -359,6 +382,7 @@ static int kq_dequant_row(int t,const void *src,float *dst,int64_t n){
         case KQ_Q6_K: kq_deq_q6_K(src,dst,n);          return 1;
         case KQ_IQ2_XS:  kq_deq_iq2_xs(src,dst,n);     return 1;
         case KQ_IQ3_XXS: kq_deq_iq3_xxs(src,dst,n);    return 1;
+        case KQ_IQ4_NL:  kq_deq_iq4_nl(src,dst,n);     return 1;
         case KQ_IQ4_XS:  kq_deq_iq4_xs(src,dst,n);     return 1;
         default: return 0;
     }
