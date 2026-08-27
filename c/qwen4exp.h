@@ -13,22 +13,41 @@
  *
  * WHAT IS NEW IS STRUCTURAL, NOT ARITHMETIC
  *
- * Four mechanisms have no counterpart here, and all four are small in bytes and large in
- * control flow — which is the opposite of the work this engine has been tuned for:
+ * Four mechanisms have no counterpart here. All four are small in bytes and large in control
+ * flow, which is the opposite of the work this engine has been tuned for. The descriptions
+ * below are taken from the llama.cpp port (ggml-org/llama.cpp#27742), not inferred from the
+ * tensor names -- guessing at a formulation from its parameter shapes has a poor record.
  *
- *   hc_*      Hyper-connections. The residual stream is replaced by `hyper_connection.count`
- *             = 4 parallel streams mixed through a low-rank (320) projection. Every `x = x + t`
- *             in the forward pass becomes a mix, and there is one at each of two points per
- *             block plus once at the output.
- *   indexer.* Sparse attention. A 4-head indexer scores keys and the attention then runs over
- *             the top `indexer.top_k` = 2048 of them. Below 2048 positions it selects
- *             everything, so it degenerates to dense attention — which is the opening: the
- *             rest can be built and tested first, at short context, against the dense path.
- *   ple_*     Per-layer embeddings. A separate per_layer_token_embd table, an n-gram (size 3)
- *             convolution and a key/value mix feed each block its own view of the input.
- *   rope.dimension_sections  Multi-section RoPE rather than one contiguous rotation.
+ *   hc_*   HYPER-CONNECTIONS. The residual stream is hc_count = 4 times as wide:
+ *          n_embd_out_impl = hc_count * n_embd, laid out [n_embd, hc, n_tokens]. Each mixer is
+ *          a low-rank down / silu / up sigmoid gate (rank 320) and then collapses the four
+ *          streams by a PLAIN MEAN. There is no output_norm in this model at all -- the final
+ *          mixer's hc_norm is the last norm before the LM head, which is a thing to get right
+ *          rather than discover.
  *
- * So the honest shape of the port is: the kernels are reusable, the schedule is not.
+ *   ple_*  PER-LAYER EMBEDDINGS. per_layer_token_embd is a hash table, 51.2 BILLION elements
+ *          (97.7 GiB unquantised; it is IQ4_NL in the Q4_K_XL build, which is why that type
+ *          had to exist first). Each token is hashed together with its ngram_size-1 = 2
+ *          predecessors, host-side, with 64-bit multipliers around 2.4e13 and an xor -- they
+ *          do not fit in int32, which is worth knowing before writing the hash. The rows are
+ *          gathered and combined as a sum of shifted, per-channel-scaled copies, then run
+ *          through ple_conv1d.
+ *
+ *          Note what this means for streaming: it is a row gather, a few rows per token per
+ *          layer out of an enormous table. Random access, but tiny and bounded -- which is
+ *          the friendly case for a disk tier, not the hostile one.
+ *
+ *   indexer.*  SPARSE ATTENTION (QSA). The indexer scores one mean-pooled key per block of
+ *          compress_ratio tokens and keeps a budget of indexer.top_k = 2048. The opening is
+ *          exact rather than approximate: below indexer_top_k + compress_ratio - 1 cached
+ *          tokens EVERY block fits in the budget, so the result is not merely close to dense
+ *          attention, it is bit-identical to it. The whole model can therefore be built and
+ *          verified at short context against the dense path already in this engine, and the
+ *          selection added afterwards.
+ *
+ *   rope   Interleaved mRoPE, partial rotary 64 of 256.
+ *
+ * So the honest shape of the port: the kernels are reusable, the schedule is not.
  *
  * This header does the part that can be settled against the file rather than argued about —
  * read the config, bind the tensors, and say precisely what is present and what is missing.
